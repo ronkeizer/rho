@@ -1,0 +1,1913 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use chrono::{DateTime, Local};
+use iced::alignment::Horizontal;
+use iced::keyboard::{self, key::Named, Key, Modifiers};
+use iced::widget::{
+    button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+};
+use iced::{
+    time, window, Border, Color, Element, Font, Length, Padding, Shadow, Size,
+    Subscription, Task, Theme, Vector,
+};
+use serde::Deserialize;
+
+const PROMPT_ID: &str = "prompt";
+const SETTINGS_FILENAME: &str = ".fm.yaml";
+const STATE_FILENAME: &str = ".fm-state.yaml";
+
+// ---------------------------------------------------------------------------
+// Configuration (~/.fm.yaml)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct Config {
+    row_height_px: f32,
+    row_font_size: u16,
+    header_font_size: u16,
+    size_column_px: f32,
+    modified_column_px: f32,
+    window_width: f32,
+    window_rows: u32,
+    mono_glyph_px: f32,
+    /// Optional `#rrggbb` overrides; `None` means "derive from theme".
+    stripe_color: Option<String>,
+    cursor_color: Option<String>,
+    mark_color: Option<String>,
+    folder_color: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            row_height_px: 19.0,
+            row_font_size: 13,
+            header_font_size: 11,
+            size_column_px: 80.0,
+            modified_column_px: 140.0,
+            window_width: 1100.0,
+            window_rows: 35,
+            mono_glyph_px: 7.5,
+            stripe_color: None,
+            cursor_color: None,
+            mark_color: None,
+            folder_color: Some("#6db4ff".to_string()),
+        }
+    }
+}
+
+impl Config {
+    /// Read the file if present; never writes. Missing file → defaults.
+    /// Parse errors are logged and fall back to defaults so a bad save doesn't
+    /// brick the running app during hot reload.
+    fn load() -> Self {
+        let path = settings_path();
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match serde_yaml::from_str::<Self>(&contents) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to parse {}: {} — keeping previous settings",
+                    path.display(),
+                    e
+                );
+                Self::default()
+            }
+        }
+    }
+
+    fn row_padding_y(&self) -> u16 {
+        let text_h = self.row_font_size as f32 * 1.3;
+        let pad = ((self.row_height_px - text_h) / 2.0).max(0.0);
+        pad.round() as u16
+    }
+
+    fn window_size(&self) -> Size {
+        let chrome = 90.0;
+        let height = chrome + self.window_rows as f32 * self.row_height_px;
+        Size::new(self.window_width, height)
+    }
+}
+
+fn settings_path() -> PathBuf {
+    home_dir().join(SETTINGS_FILENAME)
+}
+
+// ---------------------------------------------------------------------------
+// Per-pane folder persistence (~/.fm-state.yaml)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SavedState {
+    left: PathBuf,
+    right: PathBuf,
+    #[serde(default = "default_active_side")]
+    active: Side,
+}
+
+fn default_active_side() -> Side {
+    Side::Left
+}
+
+fn state_path() -> PathBuf {
+    home_dir().join(STATE_FILENAME)
+}
+
+/// Best-effort read. Missing file, parse errors, or vanished paths all just
+/// fall back to the home directory — we never want a stale state file to
+/// block startup.
+fn load_saved_state() -> Option<SavedState> {
+    let contents = std::fs::read_to_string(state_path()).ok()?;
+    serde_yaml::from_str(&contents).ok()
+}
+
+fn save_state_to_disk(state: &SavedState) {
+    if let Ok(yaml) = serde_yaml::to_string(state) {
+        let _ = std::fs::write(state_path(), yaml);
+    }
+}
+
+/// Create the settings file with a starter template if it doesn't exist yet.
+/// Called from `main()` and before opening the file in the editor (Cmd+,).
+fn ensure_settings_file() {
+    let path = settings_path();
+    if !path.exists() {
+        let _ = std::fs::write(&path, default_template_yaml());
+    }
+}
+
+fn default_template_yaml() -> &'static str {
+    "# fm configuration file — edits are picked up live (no restart needed).\n\
+     row_height_px: 19.0\n\
+     row_font_size: 13\n\
+     header_font_size: 11\n\
+     size_column_px: 80.0\n\
+     modified_column_px: 140.0\n\
+     window_width: 1100.0\n\
+     window_rows: 35\n\
+     mono_glyph_px: 7.5\n\
+     # Optional color overrides (#rrggbb). Comment out to derive from theme.\n\
+     folder_color: \"#6db4ff\"\n\
+     # stripe_color: \"#1c1d1f\"\n\
+     # cursor_color: \"#3a80c8\"\n\
+     # mark_color: \"#2a4a6a\"\n"
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RowColors {
+    cursor: Option<Color>,
+    mark: Option<Color>,
+    stripe: Option<Color>,
+    folder: Option<Color>,
+}
+
+fn row_colors_from(config: &Config) -> RowColors {
+    RowColors {
+        cursor: config.cursor_color.as_deref().and_then(parse_hex_color),
+        mark: config.mark_color.as_deref().and_then(parse_hex_color),
+        stripe: config.stripe_color.as_deref().and_then(parse_hex_color),
+        folder: config.folder_color.as_deref().and_then(parse_hex_color),
+    }
+}
+
+fn parse_hex_color(s: &str) -> Option<Color> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()? as f32 / 255.0;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()? as f32 / 255.0;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()? as f32 / 255.0;
+    Some(Color { r, g, b, a: 1.0 })
+}
+
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r * (1.0 - t) + b.r * t,
+        g: a.g * (1.0 - t) + b.g * t,
+        b: a.b * (1.0 - t) + b.b * t,
+        a: 1.0,
+    }
+}
+
+/// Pull a color closer to the background so hidden entries (`.foo`) read as
+/// muted compared to a "regular" file. Used both for the name widget (which
+/// may have a folder-color override) and for the row's default text color.
+fn dim(c: Color) -> Color {
+    Color { r: c.r * 0.55, g: c.g * 0.55, b: c.b * 0.55, a: c.a }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+fn main() -> iced::Result {
+    ensure_settings_file();
+    let config = Config::load();
+    let window_size = config.window_size();
+    iced::application("fm", App::update, App::view)
+        .subscription(App::subscription)
+        .theme(|_| Theme::Dark)
+        .window_size(window_size)
+        .run_with(move || App::new(config))
+}
+
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Side {
+    Left,
+    Right,
+}
+
+impl Side {
+    fn other(self) -> Self {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortBy {
+    Name,
+    Size,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    fn toggled(self) -> Self {
+        match self {
+            SortDir::Asc => SortDir::Desc,
+            SortDir::Desc => SortDir::Asc,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Entry {
+    name: String,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RowVisual {
+    None,
+    Cursor,
+    Marked,
+}
+
+/// The three modal flavors. Each carries the data the modal needs.
+#[derive(Debug, Clone)]
+enum Prompt {
+    Open { input: String },
+    Copy { input: String },
+    Delete { paths: Vec<PathBuf>, focus: DeleteFocus },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteFocus {
+    Cancel,
+    Confirm,
+}
+
+impl DeleteFocus {
+    fn toggle(self) -> Self {
+        match self {
+            DeleteFocus::Cancel => DeleteFocus::Confirm,
+            DeleteFocus::Confirm => DeleteFocus::Cancel,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GitInfo {
+    branch: String,
+    uncommitted: usize,
+    ahead: usize,
+    behind: usize,
+}
+
+#[derive(Debug)]
+struct Pane {
+    path: PathBuf,
+    entries: Vec<Entry>,
+    /// Indices into `entries` that pass the current filter, in display order.
+    /// Row 0 is the ".." entry; rows 1..=visible_indices.len() map to
+    /// `entries[visible_indices[i - 1]]`.
+    visible_indices: Vec<usize>,
+    /// Current type-to-filter query. Empty = all entries visible.
+    filter: String,
+    selected: usize,
+    /// Anchor for shift-extended range selection.
+    anchor: usize,
+    sort_by: SortBy,
+    sort_dir: SortDir,
+    scroll_y: f32,
+    viewport_height: Option<f32>,
+    loading: bool,
+    /// Bumped on every navigate. Streaming load tasks tag each chunk with the
+    /// generation that started them, so chunks that finish late after the user
+    /// has already moved on get dropped.
+    load_generation: u64,
+    /// Result of the async git probe, if this directory is inside a git repo.
+    git_info: Option<GitInfo>,
+}
+
+impl Pane {
+    fn empty(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: Vec::new(),
+            visible_indices: Vec::new(),
+            filter: String::new(),
+            selected: 0,
+            anchor: 0,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
+            scroll_y: 0.0,
+            viewport_height: None,
+            loading: true,
+            load_generation: 0,
+            git_info: None,
+        }
+    }
+
+    /// Reset the pane to "about to load `path`". Returns the new generation
+    /// that the matching load_dir_task should tag chunks with.
+    fn navigate(&mut self, path: PathBuf) -> u64 {
+        self.path = path;
+        self.entries.clear();
+        self.visible_indices.clear();
+        self.filter.clear();
+        self.selected = 0;
+        self.anchor = 0;
+        self.loading = true;
+        self.load_generation += 1;
+        self.git_info = None;
+        self.load_generation
+    }
+
+    fn append_chunk(&mut self, mut chunk: Vec<Entry>) {
+        if chunk.is_empty() {
+            return;
+        }
+        let prior = self.cursor_name();
+        self.entries.append(&mut chunk);
+        sort_entries(&mut self.entries, self.sort_by, self.sort_dir);
+        self.recompute_visible(prior.as_deref());
+    }
+
+    /// Rebuild `visible_indices` from `entries` and the current filter, then
+    /// either restore the cursor onto the entry that was selected before
+    /// (if it's still visible) or clamp it into range.
+    fn recompute_visible(&mut self, preserve_name: Option<&str>) {
+        self.visible_indices = if self.filter.is_empty() {
+            (0..self.entries.len()).collect()
+        } else {
+            match regex::RegexBuilder::new(&self.filter)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => (0..self.entries.len())
+                    .filter(|&i| re.is_match(&self.entries[i].name))
+                    .collect(),
+                Err(_) => {
+                    // Partial input that isn't a valid regex yet — fall back
+                    // to a case-insensitive substring match so the user sees
+                    // sensible results while typing things like "(".
+                    let needle = self.filter.to_lowercase();
+                    (0..self.entries.len())
+                        .filter(|&i| {
+                            self.entries[i].name.to_lowercase().contains(&needle)
+                        })
+                        .collect()
+                }
+            }
+        };
+
+        let new_selected = match preserve_name {
+            Some(name) => self
+                .visible_indices
+                .iter()
+                .position(|&i| {
+                    self.entries.get(i).map(|e| e.name.as_str()) == Some(name)
+                })
+                .map(|p| p + 1)
+                .unwrap_or(0),
+            None => {
+                let max = self.visible_indices.len();
+                self.selected.min(max)
+            }
+        };
+        self.selected = new_selected;
+        self.anchor = new_selected;
+    }
+
+    fn cursor_name(&self) -> Option<String> {
+        if self.selected == 0 {
+            return None;
+        }
+        self.visible_indices
+            .get(self.selected - 1)
+            .and_then(|&i| self.entries.get(i))
+            .map(|e| e.name.clone())
+    }
+
+    fn entry_at(&self, row_index: usize) -> Option<&Entry> {
+        if row_index == 0 {
+            return None;
+        }
+        self.visible_indices
+            .get(row_index - 1)
+            .and_then(|&i| self.entries.get(i))
+    }
+
+    fn move_to(&mut self, target: i32, extend: bool) {
+        let max = self.visible_indices.len() as i32;
+        let next = target.clamp(0, max) as usize;
+        if !extend {
+            self.anchor = next;
+        }
+        self.selected = next;
+    }
+
+    fn move_by(&mut self, delta: i32, extend: bool) {
+        let target = self.selected as i32 + delta;
+        self.move_to(target, extend);
+    }
+
+    fn mark_range(&self) -> (usize, usize) {
+        if self.anchor < self.selected {
+            (self.anchor, self.selected)
+        } else {
+            (self.selected, self.anchor)
+        }
+    }
+
+    fn is_marked(&self, row_index: usize) -> bool {
+        let (lo, hi) = self.mark_range();
+        row_index >= lo && row_index <= hi
+    }
+
+    fn marked_paths(&self) -> Vec<PathBuf> {
+        let (lo, hi) = self.mark_range();
+        (lo..=hi)
+            .filter_map(|i| self.entry_at(i))
+            .map(|e| self.path.join(&e.name))
+            .collect()
+    }
+
+    fn toggle_sort(&mut self, by: SortBy) {
+        let prior = self.cursor_name();
+        if self.sort_by == by {
+            self.sort_dir = self.sort_dir.toggled();
+        } else {
+            self.sort_by = by;
+            self.sort_dir = SortDir::Asc;
+        }
+        sort_entries(&mut self.entries, self.sort_by, self.sort_dir);
+        self.recompute_visible(prior.as_deref());
+    }
+}
+
+fn sort_entries(entries: &mut [Entry], by: SortBy, dir: SortDir) {
+    entries.sort_by(|a, b| {
+        let dir_cmp = b.is_dir.cmp(&a.is_dir);
+        if dir_cmp != std::cmp::Ordering::Equal {
+            return dir_cmp;
+        }
+        let ord = match by {
+            SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortBy::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+            SortBy::Modified => a.modified.cmp(&b.modified),
+        };
+        match dir {
+            SortDir::Asc => ord,
+            SortDir::Desc => ord.reverse(),
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum Message {
+    ShiftChanged(bool),
+    Activate(Side),
+    RowClicked(Side, usize),
+    GoUpActive,
+    MoveSelection(i32, bool),
+    PageMove(i32, bool),
+    SwitchSide,
+    ActivateSelection,
+    ToggleSort(Side, SortBy),
+    Scrolled(Side, f32, f32),
+    OpenPrompt,
+    OpenCopyPrompt,
+    OpenDeletePrompt,
+    SwitchPromptFocus,
+    OpenSettingsFile,
+    FilterAppend(String),
+    CheckSettings,
+    PromptChanged(String),
+    PromptSubmit,
+    PromptCancel,
+    EntriesChunk(Side, u64, Vec<Entry>),
+    EntriesDone(Side, u64),
+    GitInfoLoaded(Side, u64, Option<GitInfo>),
+    OpenFile,
+    CopyFinished(Vec<(PathBuf, Result<(), String>)>),
+    DeleteFinished(Vec<(PathBuf, Result<(), String>)>),
+    Resized(Size),
+    NoOp,
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
+struct App {
+    config: Config,
+    left: Pane,
+    right: Pane,
+    active: Side,
+    prompt: Option<Prompt>,
+    shift_held: bool,
+    window_size: Size,
+    settings_mtime: Option<SystemTime>,
+    /// (count, dest) while a copy task is in flight.
+    copy_in_progress: Option<(usize, PathBuf)>,
+    /// File count while a delete task is in flight.
+    delete_in_progress: Option<usize>,
+}
+
+impl App {
+    fn new(config: Config) -> (Self, Task<Message>) {
+        let home = home_dir();
+        let window_size = config.window_size();
+        let settings_mtime = std::fs::metadata(settings_path())
+            .and_then(|m| m.modified())
+            .ok();
+
+        // Restore last-used folders + active side. Any saved path that no
+        // longer exists falls back to the home directory.
+        let saved = load_saved_state();
+        let left_path = saved
+            .as_ref()
+            .map(|s| s.left.clone())
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| home.clone());
+        let right_path = saved
+            .as_ref()
+            .map(|s| s.right.clone())
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| home.clone());
+        let active = saved.as_ref().map(|s| s.active).unwrap_or(Side::Left);
+
+        let app = Self {
+            config,
+            left: Pane::empty(left_path.clone()),
+            right: Pane::empty(right_path.clone()),
+            active,
+            prompt: None,
+            shift_held: false,
+            window_size,
+            settings_mtime,
+            copy_in_progress: None,
+            delete_in_progress: None,
+        };
+        // Pane::empty starts at load_generation 0; the initial loads tag
+        // their chunks the same way so they're accepted.
+        let init = Task::batch([
+            loading_tasks(Side::Left, left_path, 0),
+            loading_tasks(Side::Right, right_path, 0),
+        ]);
+        (app, init)
+    }
+
+    fn save_state(&self) {
+        save_state_to_disk(&SavedState {
+            left: self.left.path.clone(),
+            right: self.right.path.clone(),
+            active: self.active,
+        });
+    }
+
+    fn pane(&self, side: Side) -> &Pane {
+        match side {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        }
+    }
+
+    fn pane_mut(&mut self, side: Side) -> &mut Pane {
+        match side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        }
+    }
+
+    fn navigate(&mut self, side: Side, path: PathBuf) -> Task<Message> {
+        let generation = self.pane_mut(side).navigate(path.clone());
+        self.save_state();
+        Task::batch([
+            loading_tasks(side, path, generation),
+            self.ensure_active_visible(),
+        ])
+    }
+
+    fn page_size(&self) -> i32 {
+        let vh = self
+            .pane(self.active)
+            .viewport_height
+            .unwrap_or_else(|| viewport_height_estimate(self.window_size.height));
+        let rows = (vh / self.config.row_height_px).floor() as i32 - 1;
+        rows.max(1)
+    }
+
+    fn ensure_active_visible(&mut self) -> Task<Message> {
+        let side = self.active;
+        let fallback_vh = viewport_height_estimate(self.window_size.height);
+        let stride = self.config.row_height_px;
+        let pane = self.pane_mut(side);
+        let vh = pane.viewport_height.unwrap_or(fallback_vh);
+        let row_top = pane.selected as f32 * stride;
+        let row_bottom = row_top + stride;
+        let view_top = pane.scroll_y;
+        let view_bottom = view_top + vh;
+
+        let target = if row_top < view_top {
+            Some(row_top)
+        } else if row_bottom > view_bottom {
+            Some((row_bottom - vh).max(0.0))
+        } else {
+            None
+        };
+
+        if let Some(y) = target {
+            pane.scroll_y = y;
+            scrollable::scroll_to(
+                scroll_id(side),
+                scrollable::AbsoluteOffset { x: 0.0, y },
+            )
+        } else {
+            Task::none()
+        }
+    }
+
+    fn reload_both_panes(&mut self) -> Task<Message> {
+        let left_path = self.left.path.clone();
+        let right_path = self.right.path.clone();
+        let left_gen = self.left.navigate(left_path.clone());
+        let right_gen = self.right.navigate(right_path.clone());
+        Task::batch([
+            loading_tasks(Side::Left, left_path, left_gen),
+            loading_tasks(Side::Right, right_path, right_gen),
+        ])
+    }
+
+    fn update(&mut self, msg: Message) -> Task<Message> {
+        // The delete confirmation modal has no text_input, so navigation keys
+        // fall through to top-level messages. Rewrite them to focus-aware
+        // actions so the user can drive the dialog with the keyboard alone:
+        // Enter activates whichever button is focused, Tab/←/→ flip focus.
+        let msg = if let Some(Prompt::Delete { focus, .. }) = &self.prompt {
+            let focus = *focus;
+            match msg {
+                Message::ActivateSelection => match focus {
+                    DeleteFocus::Confirm => Message::PromptSubmit,
+                    DeleteFocus::Cancel => Message::PromptCancel,
+                },
+                Message::SwitchSide => Message::SwitchPromptFocus,
+                _ => msg,
+            }
+        } else {
+            msg
+        };
+
+        // While *any* modal is open, suppress pane-nav keys that text_input
+        // didn't capture (Tab, F-keys, arrows-in-no-input).
+        if self.prompt.is_some() {
+            match &msg {
+                Message::MoveSelection(..)
+                | Message::PageMove(..)
+                | Message::ActivateSelection
+                | Message::SwitchSide
+                | Message::GoUpActive
+                | Message::OpenFile
+                | Message::OpenCopyPrompt
+                | Message::OpenDeletePrompt
+                | Message::FilterAppend(..) => return Task::none(),
+                _ => {}
+            }
+        }
+
+        match msg {
+            Message::ShiftChanged(state) => {
+                self.shift_held = state;
+            }
+            Message::Activate(side) => {
+                if self.active != side {
+                    self.active = side;
+                    self.save_state();
+                }
+            }
+            Message::RowClicked(side, row_index) => {
+                let active_changed = self.active != side;
+                self.active = side;
+                let extend = self.shift_held;
+                self.pane_mut(side).move_to(row_index as i32, extend);
+                if active_changed {
+                    self.save_state();
+                }
+                return self.ensure_active_visible();
+            }
+            Message::GoUpActive => {
+                let side = self.active;
+                // If a filter is active, Backspace edits the filter instead
+                // of leaving the current directory.
+                {
+                    let pane = self.pane_mut(side);
+                    if !pane.filter.is_empty() {
+                        let prior = pane.cursor_name();
+                        pane.filter.pop();
+                        pane.recompute_visible(prior.as_deref());
+                        return Task::none();
+                    }
+                }
+                if let Some(parent) =
+                    self.pane(side).path.parent().map(|p| p.to_path_buf())
+                {
+                    return self.navigate(side, parent);
+                }
+            }
+            Message::MoveSelection(delta, extend) => {
+                let side = self.active;
+                self.pane_mut(side).move_by(delta, extend);
+                return self.ensure_active_visible();
+            }
+            Message::PageMove(dir, extend) => {
+                let page = self.page_size();
+                let side = self.active;
+                self.pane_mut(side).move_by(dir * page, extend);
+                return self.ensure_active_visible();
+            }
+            Message::SwitchSide => {
+                self.active = self.active.other();
+                self.save_state();
+                return self.ensure_active_visible();
+            }
+            Message::ActivateSelection => {
+                let side = self.active;
+                let target = if self.pane(side).selected == 0 {
+                    self.pane(side).path.parent().map(|p| p.to_path_buf())
+                } else {
+                    let pane = self.pane(side);
+                    pane.entry_at(pane.selected).and_then(|e| {
+                        if e.is_dir {
+                            Some(pane.path.join(&e.name))
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(target) = target {
+                    return self.navigate(side, target);
+                }
+            }
+            Message::ToggleSort(side, by) => {
+                self.active = side;
+                self.pane_mut(side).toggle_sort(by);
+                return self.ensure_active_visible();
+            }
+            Message::Scrolled(side, scroll_y, vh) => {
+                let pane = self.pane_mut(side);
+                pane.scroll_y = scroll_y;
+                pane.viewport_height = Some(vh);
+            }
+            Message::OpenPrompt => {
+                let current = self.pane(self.active).path.display().to_string();
+                self.prompt = Some(Prompt::Open { input: current });
+                return text_input::focus(text_input::Id::new(PROMPT_ID));
+            }
+            Message::OpenCopyPrompt => {
+                let other = self.active.other();
+                let dest = self.pane(other).path.display().to_string();
+                self.prompt = Some(Prompt::Copy { input: dest });
+                return text_input::focus(text_input::Id::new(PROMPT_ID));
+            }
+            Message::OpenDeletePrompt => {
+                let paths = self.pane(self.active).marked_paths();
+                if !paths.is_empty() {
+                    // Default focus on Cancel: a stray Enter shouldn't delete.
+                    self.prompt = Some(Prompt::Delete {
+                        paths,
+                        focus: DeleteFocus::Cancel,
+                    });
+                }
+            }
+            Message::SwitchPromptFocus => {
+                if let Some(Prompt::Delete { focus, .. }) = self.prompt.as_mut() {
+                    *focus = focus.toggle();
+                }
+            }
+            Message::OpenSettingsFile => {
+                ensure_settings_file();
+                let path = settings_path();
+                if let Err(e) = open::that_detached(&path) {
+                    eprintln!("failed to open {}: {}", path.display(), e);
+                }
+            }
+            Message::CheckSettings => {
+                let current = std::fs::metadata(settings_path())
+                    .and_then(|m| m.modified())
+                    .ok();
+                if current != self.settings_mtime {
+                    self.settings_mtime = current;
+                    self.config = Config::load();
+                }
+            }
+            Message::PromptChanged(value) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    match prompt {
+                        Prompt::Open { input } | Prompt::Copy { input } => {
+                            *input = value;
+                        }
+                        Prompt::Delete { .. } => {}
+                    }
+                }
+            }
+            Message::PromptSubmit => {
+                if let Some(prompt) = self.prompt.take() {
+                    match prompt {
+                        Prompt::Open { input } => {
+                            let path = PathBuf::from(expand_tilde(input.trim()));
+                            if path.is_dir() {
+                                return self.navigate(self.active, path);
+                            }
+                        }
+                        Prompt::Copy { input } => {
+                            let dest = PathBuf::from(expand_tilde(input.trim()));
+                            if dest.is_dir() {
+                                let srcs = self.pane(self.active).marked_paths();
+                                if !srcs.is_empty() {
+                                    self.copy_in_progress =
+                                        Some((srcs.len(), dest.clone()));
+                                    return copy_task(srcs, dest);
+                                }
+                            }
+                        }
+                        Prompt::Delete { paths, .. } => {
+                            if !paths.is_empty() {
+                                self.delete_in_progress = Some(paths.len());
+                                return delete_task(paths);
+                            }
+                        }
+                    }
+                }
+            }
+            Message::PromptCancel => {
+                if self.prompt.is_some() {
+                    self.prompt = None;
+                } else {
+                    // No modal — Esc clears the active pane's filter.
+                    let side = self.active;
+                    let pane = self.pane_mut(side);
+                    if !pane.filter.is_empty() {
+                        let prior = pane.cursor_name();
+                        pane.filter.clear();
+                        pane.recompute_visible(prior.as_deref());
+                    }
+                }
+            }
+            Message::FilterAppend(s) => {
+                let side = self.active;
+                let pane = self.pane_mut(side);
+                let prior = pane.cursor_name();
+                pane.filter.push_str(&s);
+                pane.recompute_visible(prior.as_deref());
+            }
+            Message::EntriesChunk(side, generation, chunk) => {
+                let pane = self.pane_mut(side);
+                if pane.load_generation == generation {
+                    pane.append_chunk(chunk);
+                    return self.ensure_active_visible();
+                }
+            }
+            Message::EntriesDone(side, generation) => {
+                let pane = self.pane_mut(side);
+                if pane.load_generation == generation {
+                    pane.loading = false;
+                }
+            }
+            Message::GitInfoLoaded(side, generation, info) => {
+                let pane = self.pane_mut(side);
+                if pane.load_generation == generation {
+                    pane.git_info = info;
+                }
+            }
+            Message::OpenFile => {
+                let pane = self.pane(self.active);
+                if let Some(entry) = pane.entry_at(pane.selected) {
+                    let path = pane.path.join(&entry.name);
+                    if let Err(e) = open::that_detached(&path) {
+                        eprintln!("failed to open {}: {}", path.display(), e);
+                    }
+                }
+            }
+            Message::CopyFinished(results) => {
+                self.copy_in_progress = None;
+                for (src, res) in &results {
+                    if let Err(e) = res {
+                        eprintln!("copy {} failed: {}", src.display(), e);
+                    }
+                }
+                return self.reload_both_panes();
+            }
+            Message::DeleteFinished(results) => {
+                self.delete_in_progress = None;
+                for (src, res) in &results {
+                    if let Err(e) = res {
+                        eprintln!("delete {} failed: {}", src.display(), e);
+                    }
+                }
+                return self.reload_both_panes();
+            }
+            Message::Resized(size) => {
+                self.window_size = size;
+            }
+            Message::NoOp => {}
+        }
+        Task::none()
+    }
+
+    /// Returns a transient status string when something async is happening.
+    /// Priority is copy > delete > load (copy/delete usually start *after*
+    /// the panes have loaded, so this ordering surfaces the user-initiated
+    /// action over background loading noise).
+    fn status_text(&self) -> Option<String> {
+        if let Some((count, dest)) = &self.copy_in_progress {
+            let noun = if *count == 1 { "file" } else { "files" };
+            return Some(format!(
+                "Copying {} {} to {}…",
+                count,
+                noun,
+                dest.display()
+            ));
+        }
+        if let Some(count) = self.delete_in_progress {
+            let noun = if count == 1 { "file" } else { "files" };
+            return Some(format!("Deleting {} {}…", count, noun));
+        }
+        if self.left.loading || self.right.loading {
+            let loading_side =
+                if self.left.loading { Side::Left } else { Side::Right };
+            let p = self.pane(loading_side);
+            return Some(format!("Loading {}…", p.path.display()));
+        }
+        None
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let colors = row_colors_from(&self.config);
+        let name_max = name_max_chars(self.window_size.width, &self.config);
+        let panes = row![
+            view_pane(
+                Side::Left,
+                &self.left,
+                self.active == Side::Left,
+                name_max,
+                &self.config,
+                colors,
+            ),
+            view_pane(
+                Side::Right,
+                &self.right,
+                self.active == Side::Right,
+                name_max,
+                &self.config,
+                colors,
+            ),
+        ]
+        .spacing(8)
+        .height(Length::Fill);
+
+        let marks = {
+            let p = self.pane(self.active);
+            let n = p.marked_paths().len();
+            if n > 1 { format!("{} marked", n) } else { String::new() }
+        };
+        let hints = text(format!(
+            "Active: {}{}{}   ·   ⌘P go to folder  ·  ⌘, settings  ·  F4 open  ·  F5 copy  ·  Delete  ·  ↑↓/PgUp/PgDn (+Shift extend)  ·  Tab switch  ·  Backspace up",
+            match self.active {
+                Side::Left => "left",
+                Side::Right => "right",
+            },
+            if marks.is_empty() { "" } else { "   ·   " },
+            marks,
+        ))
+        .size(11);
+
+        let status_bar: Element<'_, Message> = match self.status_text() {
+            Some(msg) => container(text(msg).size(11))
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fill)
+                .style(|theme: &Theme| {
+                    let palette = theme.extended_palette();
+                    container::Style {
+                        background: Some(palette.primary.weak.color.into()),
+                        text_color: Some(palette.primary.weak.text),
+                        ..Default::default()
+                    }
+                })
+                .into(),
+            None => container(text("Ready").size(11))
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fill)
+                .style(|theme: &Theme| {
+                    let palette = theme.extended_palette();
+                    container::Style {
+                        background: Some(palette.background.weak.color.into()),
+                        text_color: Some(palette.background.weak.text),
+                        ..Default::default()
+                    }
+                })
+                .into(),
+        };
+
+        let base: Element<'_, Message> =
+            container(column![panes, hints, status_bar].spacing(6))
+                .padding(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+
+        if let Some(prompt) = &self.prompt {
+            stack![base, view_modal(prompt)].into()
+        } else {
+            base
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let key_press = keyboard::on_key_press(|key, mods: Modifiers| {
+            if let Key::Named(Named::Shift) = key {
+                return Some(Message::ShiftChanged(true));
+            }
+            match key {
+                Key::Character(ref c) if mods.command() && c.eq_ignore_ascii_case("p") => {
+                    Some(Message::OpenPrompt)
+                }
+                Key::Character(ref c) if mods.command() && c.as_str() == "," => {
+                    Some(Message::OpenSettingsFile)
+                }
+                Key::Named(Named::Escape) => Some(Message::PromptCancel),
+                Key::Named(Named::ArrowUp) => {
+                    Some(Message::MoveSelection(-1, mods.shift()))
+                }
+                Key::Named(Named::ArrowDown) => {
+                    Some(Message::MoveSelection(1, mods.shift()))
+                }
+                Key::Named(Named::PageUp) => Some(Message::PageMove(-1, mods.shift())),
+                Key::Named(Named::PageDown) => Some(Message::PageMove(1, mods.shift())),
+                // ←/→ are only meaningful inside the Delete modal; in main
+                // view the SwitchPromptFocus handler is a no-op.
+                Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowRight) => {
+                    Some(Message::SwitchPromptFocus)
+                }
+                Key::Named(Named::Enter) => Some(Message::ActivateSelection),
+                Key::Named(Named::Tab) => Some(Message::SwitchSide),
+                Key::Named(Named::Backspace) => Some(Message::GoUpActive),
+                Key::Named(Named::Delete) => Some(Message::OpenDeletePrompt),
+                Key::Named(Named::F4) => Some(Message::OpenFile),
+                Key::Named(Named::F5) => Some(Message::OpenCopyPrompt),
+                // Plain character keys (no Ctrl/Cmd/Alt) feed the type-to-filter.
+                // The earlier Cmd+P / Cmd+, guards have already matched before
+                // we get here, so unmodified characters fall through to this.
+                Key::Character(c)
+                    if !mods.command() && !mods.control() && !mods.alt() =>
+                {
+                    Some(Message::FilterAppend(c.to_string()))
+                }
+                _ => None,
+            }
+        });
+
+        let key_release = keyboard::on_key_release(|key, _mods| match key {
+            Key::Named(Named::Shift) => Some(Message::ShiftChanged(false)),
+            _ => None,
+        });
+
+        let resizes = window::resize_events().map(|(_, size)| Message::Resized(size));
+
+        let settings_poll =
+            time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
+
+        Subscription::batch([key_press, key_release, resizes, settings_poll])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async tasks
+// ---------------------------------------------------------------------------
+
+/// Both side-loads (directory entries + git info) for a single pane.
+fn loading_tasks(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
+    Task::batch([
+        load_dir_task(side, path.clone(), generation),
+        git_info_task(side, path, generation),
+    ])
+}
+
+/// Read `path` in a blocking thread and stream batches of `Entry` back to the
+/// app as `EntriesChunk` messages, followed by a final `EntriesDone`. The
+/// `generation` tag lets the receiver discard chunks from a load that's been
+/// superseded by a later navigation.
+fn load_dir_task(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
+    use iced::futures::stream::{self, StreamExt};
+
+    const CHUNK_SIZE: usize = 64;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Entry>>(8);
+    let path_for_io = path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let iter = match std::fs::read_dir(&path_for_io) {
+            Ok(it) => it,
+            Err(_) => return,
+        };
+        let mut batch: Vec<Entry> = Vec::with_capacity(CHUNK_SIZE);
+        for entry in iter.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let metadata = entry.metadata().ok();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = metadata.as_ref().and_then(|m| {
+                if m.is_file() {
+                    Some(m.len())
+                } else {
+                    None
+                }
+            });
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+            batch.push(Entry { name, is_dir, size, modified });
+            if batch.len() >= CHUNK_SIZE {
+                let chunk = std::mem::replace(
+                    &mut batch,
+                    Vec::with_capacity(CHUNK_SIZE),
+                );
+                // If the receiver was dropped (e.g. a newer load superseded
+                // this one), bail out — no point reading the rest.
+                if tx.blocking_send(chunk).is_err() {
+                    return;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let _ = tx.blocking_send(batch);
+        }
+        // Sender dropped here; receiver gets None and the stream terminates.
+    });
+
+    let chunks = stream::unfold(rx, move |mut rx| async move {
+        rx.recv().await.map(|chunk| {
+            (Message::EntriesChunk(side, generation, chunk), rx)
+        })
+    });
+    let done = stream::once(async move { Message::EntriesDone(side, generation) });
+
+    Task::stream(chunks.chain(done))
+}
+
+fn copy_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                srcs.into_iter()
+                    .map(|src| {
+                        let name = match src.file_name() {
+                            Some(n) => n.to_owned(),
+                            None => {
+                                return (
+                                    src.clone(),
+                                    Err("source has no file name".to_string()),
+                                )
+                            }
+                        };
+                        let target = dest_dir.join(name);
+                        let res =
+                            copy_recursive(&src, &target).map_err(|e| e.to_string());
+                        (src, res)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        },
+        Message::CopyFinished,
+    )
+}
+
+fn delete_task(paths: Vec<PathBuf>) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let res = delete_path(&path).map_err(|e| e.to_string());
+                        (path, res)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        },
+        Message::DeleteFinished,
+    )
+}
+
+fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(src)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let entry_name = entry.file_name();
+            copy_recursive(&entry_path, &dst.join(entry_name))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+fn delete_path(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Probe the directory for git status. Returns None when `path` isn't inside
+/// a git repository (or when `git` is missing from PATH).
+fn git_info_task(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || gather_git_info(&path))
+                .await
+                .unwrap_or(None)
+        },
+        move |info| Message::GitInfoLoaded(side, generation, info),
+    )
+}
+
+fn gather_git_info(path: &Path) -> Option<GitInfo> {
+    // First call doubles as the "are we in a repo?" probe — `git branch
+    // --show-current` returns a non-zero status outside repos and returns an
+    // empty stdout when HEAD is detached.
+    let branch_out = run_git(path, &["branch", "--show-current"])?;
+    let branch = if branch_out.trim().is_empty() {
+        "(detached)".to_string()
+    } else {
+        branch_out.trim().to_string()
+    };
+
+    let status =
+        run_git(path, &["status", "--porcelain"]).unwrap_or_default();
+    let uncommitted = status.lines().filter(|l| !l.is_empty()).count();
+
+    // Ahead/behind requires an upstream — fall back to (0, 0) if it isn't set.
+    let (ahead, behind) =
+        run_git(path, &["rev-list", "--count", "--left-right", "HEAD...@{u}"])
+            .and_then(|s| {
+                let mut parts = s.split_whitespace();
+                let a: usize = parts.next()?.parse().ok()?;
+                let b: usize = parts.next()?.parse().ok()?;
+                Some((a, b))
+            })
+            .unwrap_or((0, 0));
+
+    Some(GitInfo { branch, uncommitted, ahead, behind })
+}
+
+fn run_git(path: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// View helpers
+// ---------------------------------------------------------------------------
+
+fn view_pane<'a>(
+    side: Side,
+    pane: &'a Pane,
+    active: bool,
+    name_max_chars: usize,
+    config: &Config,
+    colors: RowColors,
+) -> Element<'a, Message> {
+    let path_header = text(pane.path.display().to_string())
+        .font(Font::MONOSPACE)
+        .size(config.row_font_size);
+
+    let column_header = container(
+        row![
+            header_cell(side, "Name", SortBy::Name, pane, Length::Fill, Horizontal::Left, config),
+            header_cell(
+                side,
+                "Size",
+                SortBy::Size,
+                pane,
+                Length::Fixed(config.size_column_px),
+                Horizontal::Right,
+                config,
+            ),
+            header_cell(
+                side,
+                "Modified",
+                SortBy::Modified,
+                pane,
+                Length::Fixed(config.modified_column_px),
+                Horizontal::Left,
+                config,
+            ),
+        ]
+        .spacing(8),
+    )
+    .padding(Padding::from([0, 8]))
+    .style(|theme: &Theme| container::Style {
+        background: Some(theme.extended_palette().background.weak.color.into()),
+        ..Default::default()
+    });
+
+    let pad_y = config.row_padding_y();
+
+    // ".." row — treated as a directory for color purposes, never dimmed.
+    let up_visual = row_visual(pane, 0);
+    let up_name_color = folder_name_color(true, up_visual, active, colors);
+    let up = build_row(
+        0,
+        "..".to_string(),
+        String::new(),
+        String::new(),
+        Message::RowClicked(side, 0),
+        up_visual,
+        active,
+        config,
+        colors,
+        pad_y,
+        up_name_color,
+        false,
+    );
+
+    let mut list = column![up].spacing(0);
+    for (visible_pos, &entry_idx) in pane.visible_indices.iter().enumerate() {
+        let row_index = visible_pos + 1;
+        let entry = match pane.entries.get(entry_idx) {
+            Some(e) => e,
+            None => continue,
+        };
+        let raw_name = if entry.is_dir {
+            format!("{}/", entry.name)
+        } else {
+            entry.name.clone()
+        };
+        let name = truncate_with_ellipsis(&raw_name, name_max_chars);
+        let size_str = entry.size.map(format_size).unwrap_or_default();
+        let mod_str = entry.modified.map(format_modified).unwrap_or_default();
+        let visual = row_visual(pane, row_index);
+        let name_color = folder_name_color(entry.is_dir, visual, active, colors);
+        let in_selection =
+            active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
+        let dim_row = entry.name.starts_with('.') && !in_selection;
+        list = list.push(build_row(
+            row_index,
+            name,
+            size_str,
+            mod_str,
+            Message::RowClicked(side, row_index),
+            visual,
+            active,
+            config,
+            colors,
+            pad_y,
+            name_color,
+            dim_row,
+        ));
+    }
+
+    // Show a placeholder only when we have nothing to display yet. Once the
+    // first streamed chunk arrives we switch to the scrollable so the user
+    // sees entries appear progressively even if more are still loading.
+    let body: Element<'a, Message> = if pane.loading && pane.entries.is_empty() {
+        container(text("Loading…").size(config.row_font_size))
+            .padding(16)
+            .width(Length::Fill)
+            .into()
+    } else {
+        scrollable(list)
+            .id(scroll_id(side))
+            .height(Length::Fill)
+            .on_scroll(move |viewport| {
+                Message::Scrolled(
+                    side,
+                    viewport.absolute_offset().y,
+                    viewport.bounds().height,
+                )
+            })
+            .into()
+    };
+
+    let mut inner_col = column![path_header, column_header, body].spacing(4);
+    if !pane.filter.is_empty() {
+        inner_col = inner_col.push(filter_bar(pane, config));
+    }
+    if let Some(info) = &pane.git_info {
+        inner_col = inner_col.push(git_info_bar(info, config));
+    }
+    let inner = container(inner_col).padding(6);
+
+    let bordered = container(inner)
+        .style(move |theme: &Theme| {
+            let palette = theme.extended_palette();
+            let border_color = if active {
+                palette.primary.strong.color
+            } else {
+                palette.background.strong.color
+            };
+            container::Style {
+                border: Border {
+                    color: border_color,
+                    width: if active { 2.0 } else { 1.0 },
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .width(Length::FillPortion(1))
+        .height(Length::Fill);
+
+    mouse_area(bordered).on_press(Message::Activate(side)).into()
+}
+
+fn git_info_bar<'a>(info: &GitInfo, config: &Config) -> Element<'a, Message> {
+    let mut parts: Vec<String> = vec![format!("branch: {}", info.branch)];
+    if info.uncommitted > 0 {
+        let noun = if info.uncommitted == 1 { "change" } else { "changes" };
+        parts.push(format!("{} uncommitted {}", info.uncommitted, noun));
+    }
+    if info.ahead > 0 || info.behind > 0 {
+        parts.push(format!("↑{} ↓{} vs upstream", info.ahead, info.behind));
+    } else {
+        // Best-effort hint when there's no divergence — but also no upstream
+        // configured, you'll see exactly "↑0 ↓0" suppressed (this line stays
+        // empty). Skipping it keeps the bar quieter for "clean" repos.
+    }
+    let label = parts.join("   ·   ");
+
+    container(
+        text(label)
+            .font(Font::MONOSPACE)
+            .size(config.header_font_size),
+    )
+    .padding(Padding::from([2, 8]))
+    .width(Length::Fill)
+    .style(|theme: &Theme| {
+        let palette = theme.extended_palette();
+        container::Style {
+            background: Some(palette.success.weak.color.into()),
+            text_color: Some(palette.success.weak.text),
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+fn filter_bar<'a>(pane: &Pane, config: &Config) -> Element<'a, Message> {
+    let label = format!(
+        "filter: /{}/   ({} of {})",
+        pane.filter,
+        pane.visible_indices.len(),
+        pane.entries.len()
+    );
+    container(
+        text(label)
+            .font(Font::MONOSPACE)
+            .size(config.header_font_size),
+    )
+    .padding(Padding::from([4, 8]))
+    .width(Length::Fill)
+    .style(|theme: &Theme| {
+        let palette = theme.extended_palette();
+        container::Style {
+            background: Some(palette.primary.weak.color.into()),
+            text_color: Some(palette.primary.weak.text),
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+/// Folder color applies only when the row is *not* part of the active pane's
+/// selection — otherwise the cursor/mark text color would clash with it.
+fn folder_name_color(
+    is_dir: bool,
+    visual: RowVisual,
+    pane_active: bool,
+    colors: RowColors,
+) -> Option<Color> {
+    let in_selection =
+        pane_active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
+    if !in_selection && is_dir {
+        colors.folder
+    } else {
+        None
+    }
+}
+
+fn row_visual(pane: &Pane, row_index: usize) -> RowVisual {
+    if pane.selected == row_index {
+        RowVisual::Cursor
+    } else if pane.is_marked(row_index) {
+        RowVisual::Marked
+    } else {
+        RowVisual::None
+    }
+}
+
+fn header_cell<'a>(
+    side: Side,
+    label: &'a str,
+    column: SortBy,
+    pane: &Pane,
+    width: Length,
+    align: Horizontal,
+    config: &Config,
+) -> Element<'a, Message> {
+    let arrow = if pane.sort_by == column {
+        match pane.sort_dir {
+            SortDir::Asc => " ↑",
+            SortDir::Desc => " ↓",
+        }
+    } else {
+        ""
+    };
+    let label_full = format!("{}{}", label, arrow);
+    button(
+        text(label_full)
+            .size(config.header_font_size)
+            .width(Length::Fill)
+            .align_x(align),
+    )
+    .width(width)
+    .padding(Padding::from([2, 4]))
+    .style(button::text)
+    .on_press(Message::ToggleSort(side, column))
+    .into()
+}
+
+fn build_row<'a>(
+    row_index: usize,
+    name: String,
+    size: String,
+    modified: String,
+    msg: Message,
+    visual: RowVisual,
+    pane_active: bool,
+    config: &Config,
+    colors: RowColors,
+    pad_y: u16,
+    name_color: Option<Color>,
+    dim_row: bool,
+) -> Element<'a, Message> {
+    let font_size = config.row_font_size;
+    let name_widget = text(name)
+        .font(Font::MONOSPACE)
+        .size(font_size)
+        .width(Length::Fill)
+        .style(move |theme: &Theme| {
+            // Resolve the final name color:
+            //   - explicit override (e.g. folder_color) wins over theme default
+            //   - dim_row pulls whichever color we'd use toward the background
+            let resolved = match (name_color, dim_row) {
+                (Some(c), true) => Some(dim(c)),
+                (Some(c), false) => Some(c),
+                (None, true) => {
+                    Some(dim(theme.extended_palette().background.base.text))
+                }
+                (None, false) => None,
+            };
+            iced::widget::text::Style { color: resolved }
+        });
+
+    let content = row![
+        name_widget,
+        text(size)
+            .font(Font::MONOSPACE)
+            .size(font_size)
+            .width(Length::Fixed(config.size_column_px))
+            .align_x(Horizontal::Right),
+        text(modified)
+            .font(Font::MONOSPACE)
+            .size(font_size)
+            .width(Length::Fixed(config.modified_column_px)),
+    ]
+    .spacing(8);
+
+    button(content)
+        .on_press(msg)
+        .width(Length::Fill)
+        .padding(Padding::from([pad_y, 8]))
+        .style(move |theme: &Theme, status: button::Status| {
+            compute_row_style(
+                theme, status, visual, pane_active, row_index, colors, dim_row,
+            )
+        })
+        .into()
+}
+
+fn compute_row_style(
+    theme: &Theme,
+    _status: button::Status,
+    visual: RowVisual,
+    pane_active: bool,
+    row_index: usize,
+    colors: RowColors,
+    dim_row: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+    // dim_row affects the row's default text color (i.e. the Size and Modified
+    // columns). The name widget handles its own dimming above so it can
+    // combine with the folder-color override.
+    let text_default = if dim_row {
+        dim(palette.background.base.text)
+    } else {
+        palette.background.base.text
+    };
+
+    // Note: hover state intentionally ignored — rows shouldn't light up under
+    // the cursor; the only emphasis is the active pane's selection.
+    let (background, text_color) = match (visual, pane_active) {
+        (RowVisual::Cursor, true) => {
+            let pair = palette.primary.strong;
+            let bg = colors.cursor.unwrap_or(pair.color);
+            let fg = if colors.cursor.is_some() { Color::WHITE } else { pair.text };
+            (Some(bg.into()), fg)
+        }
+        (RowVisual::Marked, true) => {
+            let pair = palette.primary.weak;
+            let bg = colors.mark.unwrap_or(pair.color);
+            let fg = if colors.mark.is_some() { Color::WHITE } else { pair.text };
+            (Some(bg.into()), fg)
+        }
+        _ => {
+            if row_index % 2 == 1 {
+                let stripe = colors.stripe.unwrap_or_else(|| {
+                    blend(
+                        palette.background.base.color,
+                        palette.background.weak.color,
+                        0.15,
+                    )
+                });
+                (Some(stripe.into()), text_default)
+            } else {
+                (None, text_default)
+            }
+        }
+    };
+
+    button::Style {
+        background,
+        text_color,
+        border: Border::default(),
+        shadow: Shadow::default(),
+    }
+}
+
+fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
+    let dialog_inner = container(match prompt {
+        Prompt::Open { input } | Prompt::Copy { input } => {
+            let (title, placeholder, hint) = match prompt {
+                Prompt::Open { .. } => (
+                    "Go to folder",
+                    "/path/to/folder",
+                    "Enter to open  ·  Esc or click outside to cancel",
+                ),
+                Prompt::Copy { .. } => (
+                    "Copy selected to",
+                    "/path/to/destination",
+                    "Enter to copy  ·  Esc or click outside to cancel",
+                ),
+                Prompt::Delete { .. } => unreachable!(),
+            };
+            column![
+                text(title).size(15),
+                text_input(placeholder, input)
+                    .id(text_input::Id::new(PROMPT_ID))
+                    .on_input(Message::PromptChanged)
+                    .on_submit(Message::PromptSubmit)
+                    .padding(8),
+                text(hint).size(11),
+            ]
+            .spacing(10)
+        }
+        Prompt::Delete { paths, focus } => {
+            let question = if paths.len() == 1 {
+                let name = paths[0]
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| paths[0].display().to_string());
+                format!("Do you really want to delete \"{}\"?", name)
+            } else {
+                format!("Do you really want to delete {} files?", paths.len())
+            };
+
+            // Focused button gets a prominent style; unfocused stays subdued.
+            // Same fn-pointer type, so the conditional resolves to a single
+            // `fn(&Theme, button::Status) -> button::Style` for `.style()`.
+            let cancel_style: fn(&Theme, button::Status) -> button::Style =
+                if *focus == DeleteFocus::Cancel {
+                    button::primary
+                } else {
+                    button::secondary
+                };
+            let confirm_style: fn(&Theme, button::Status) -> button::Style =
+                if *focus == DeleteFocus::Confirm {
+                    button::danger
+                } else {
+                    button::secondary
+                };
+
+            let actions = row![
+                button(text("Cancel"))
+                    .on_press(Message::PromptCancel)
+                    .padding(Padding::from([6, 16]))
+                    .style(cancel_style),
+                button(text("Delete"))
+                    .on_press(Message::PromptSubmit)
+                    .padding(Padding::from([6, 16]))
+                    .style(confirm_style),
+            ]
+            .spacing(10);
+            column![
+                text("Confirm delete").size(15),
+                text(question),
+                actions,
+                text("Tab or ←/→ switch  ·  Enter activate  ·  Esc cancel").size(11),
+            ]
+            .spacing(10)
+        }
+    })
+    .padding(16)
+    .width(Length::Fixed(440.0))
+    .style(modal_style);
+
+    let dialog = mouse_area(dialog_inner).on_press(Message::NoOp);
+
+    let backdrop = mouse_area(
+        container(text(""))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(backdrop_style),
+    )
+    .on_press(Message::PromptCancel);
+
+    let centered = container(dialog)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+
+    stack![backdrop, centered].into()
+}
+
+fn modal_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.background.base.color.into()),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: Vector::new(0.0, 6.0),
+            blur_radius: 24.0,
+        },
+        ..Default::default()
+    }
+}
+
+fn backdrop_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+        ..Default::default()
+    }
+}
+
+fn scroll_id(side: Side) -> scrollable::Id {
+    match side {
+        Side::Left => scrollable::Id::new("scroll-left"),
+        Side::Right => scrollable::Id::new("scroll-right"),
+    }
+}
+
+fn name_max_chars(window_width: f32, config: &Config) -> usize {
+    let outer_padding = 8.0 * 2.0;
+    let gap_between_panes = 8.0;
+    let pane_width = (window_width - outer_padding - gap_between_panes) / 2.0;
+
+    let pane_border_padding = 6.0 * 2.0 + 2.0;
+    let row_horizontal_padding = 8.0 * 2.0;
+    let row_gaps = 8.0 * 2.0;
+    let scrollbar = 16.0;
+
+    let name_px = pane_width
+        - pane_border_padding
+        - row_horizontal_padding
+        - row_gaps
+        - config.size_column_px
+        - config.modified_column_px
+        - scrollbar;
+
+    ((name_px / config.mono_glyph_px).max(8.0)) as usize
+}
+
+fn viewport_height_estimate(window_height: f32) -> f32 {
+    (window_height - 110.0).max(100.0)
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let len = s.chars().count();
+    if len <= max_chars {
+        s.to_string()
+    } else if max_chars == 0 {
+        String::new()
+    } else {
+        let mut out: String = s.chars().take(max_chars - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if bytes < KB {
+        format!("{} B", bytes)
+    } else if bytes < MB {
+        format!("{} KB", bytes / KB)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    }
+}
+
+fn format_modified(t: SystemTime) -> String {
+    let dt: DateTime<Local> = t.into();
+    dt.format("%-m/%-d/%y %-I:%M %p").to_string()
+}
+
+fn home_dir() -> PathBuf {
+    #[allow(deprecated)]
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix('~') {
+        return format!("{}{}", home_dir().display(), rest);
+    }
+    p.to_string()
+}

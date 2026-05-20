@@ -1,0 +1,13 @@
+[package]
+name = "fm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt", "sync"] }
+open = "5"
+regex = "1"
