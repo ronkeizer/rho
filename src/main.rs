@@ -145,6 +145,57 @@ fn ensure_settings_file() {
     }
 }
 
+/// Open `path` in a code editor. Honors `$VISUAL` then `$EDITOR`; otherwise
+/// uses the platform's default text-editor opener (`open -t` on macOS).
+fn open_in_editor(path: &Path) -> std::io::Result<()> {
+    let env_editor = std::env::var_os("VISUAL")
+        .or_else(|| std::env::var_os("EDITOR"))
+        .filter(|s| !s.is_empty());
+    if let Some(editor) = env_editor {
+        let editor = editor.to_string_lossy().into_owned();
+        let mut parts = editor.split_whitespace();
+        if let Some(prog) = parts.next() {
+            let args: Vec<&str> = parts.collect();
+            return std::process::Command::new(prog)
+                .args(args)
+                .arg(path)
+                .spawn()
+                .map(|_| ());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-t")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        open::that_detached(path).map(|_| ())
+    }
+}
+
+/// Spawn a Quick Look preview window for `path` (macOS only; no-op elsewhere).
+fn quick_look(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("qlmanage")
+            .arg("-p")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn default_template_yaml() -> &'static str {
     "# fm configuration file — edits are picked up live (no restart needed).\n\
      row_height_px: 19.0\n\
@@ -638,7 +689,8 @@ enum Message {
     EntriesChunk(Side, u64, Vec<Entry>),
     EntriesDone(Side, u64),
     GitInfoLoaded(Side, u64, Option<GitInfo>),
-    OpenFile,
+    EditFile,
+    QuickLook,
     CopyFinished(Vec<(PathBuf, Result<(), String>)>),
     DeleteFinished(Vec<(PathBuf, Result<(), String>)>),
     Resized(Size),
@@ -870,7 +922,8 @@ impl App {
                 | Message::ActivateSelection
                 | Message::SwitchSide
                 | Message::GoUpActive
-                | Message::OpenFile
+                | Message::EditFile
+                | Message::QuickLook
                 | Message::OpenCopyPrompt
                 | Message::OpenDeletePrompt
                 | Message::OpenCommandPalette
@@ -934,20 +987,21 @@ impl App {
             }
             Message::ActivateSelection => {
                 let side = self.active;
-                let target = if self.pane(side).selected == 0 {
-                    self.pane(side).path.parent().map(|p| p.to_path_buf())
-                } else {
-                    let pane = self.pane(side);
-                    pane.entry_at(pane.selected).and_then(|e| {
-                        if e.is_dir {
-                            Some(pane.path.join(&e.name))
-                        } else {
-                            None
-                        }
-                    })
-                };
-                if let Some(target) = target {
-                    return self.navigate(side, target);
+                if self.pane(side).selected == 0 {
+                    if let Some(parent) = self.pane(side).path.parent().map(|p| p.to_path_buf()) {
+                        return self.navigate(side, parent);
+                    }
+                    return Task::none();
+                }
+                let pane = self.pane(side);
+                if let Some(entry) = pane.entry_at(pane.selected) {
+                    let path = pane.path.join(&entry.name);
+                    if entry.is_dir {
+                        return self.navigate(side, path);
+                    }
+                    if let Err(e) = open::that_detached(&path) {
+                        eprintln!("failed to open {}: {}", path.display(), e);
+                    }
                 }
             }
             Message::ToggleSort(side, by) => {
@@ -1116,12 +1170,24 @@ impl App {
                     pane.git_info = info;
                 }
             }
-            Message::OpenFile => {
+            Message::EditFile => {
+                let pane = self.pane(self.active);
+                if let Some(entry) = pane.entry_at(pane.selected) {
+                    if entry.is_dir {
+                        return Task::none();
+                    }
+                    let path = pane.path.join(&entry.name);
+                    if let Err(e) = open_in_editor(&path) {
+                        eprintln!("failed to edit {}: {}", path.display(), e);
+                    }
+                }
+            }
+            Message::QuickLook => {
                 let pane = self.pane(self.active);
                 if let Some(entry) = pane.entry_at(pane.selected) {
                     let path = pane.path.join(&entry.name);
-                    if let Err(e) = open::that_detached(&path) {
-                        eprintln!("failed to open {}: {}", path.display(), e);
+                    if let Err(e) = quick_look(&path) {
+                        eprintln!("failed to preview {}: {}", path.display(), e);
                     }
                 }
             }
@@ -1370,7 +1436,8 @@ impl App {
                 Key::Named(Named::Tab) => Some(Message::SwitchSide),
                 Key::Named(Named::Backspace) => Some(Message::GoUpActive),
                 Key::Named(Named::Delete) => Some(Message::OpenDeletePrompt),
-                Key::Named(Named::F4) => Some(Message::OpenFile),
+                Key::Named(Named::F4) => Some(Message::EditFile),
+                Key::Named(Named::Space) => Some(Message::QuickLook),
                 Key::Named(Named::F5) => Some(Message::OpenCopyPrompt),
                 // Plain character keys (no Ctrl/Cmd/Alt) feed the type-to-filter.
                 // The earlier Cmd+P / Cmd+, guards have already matched before
@@ -1888,12 +1955,14 @@ fn view_pane<'a>(
             Some(e) => e,
             None => continue,
         };
-        let raw_name = if entry.is_dir {
-            format!("{}/", entry.name)
+        let name = if entry.is_dir {
+            // Reserve one slot for the trailing '/' so dir names never exceed
+            // name_max_chars after the suffix is appended.
+            let budget = name_max_chars.saturating_sub(1).max(1);
+            format!("{}/", truncate_with_ellipsis(&entry.name, budget))
         } else {
-            entry.name.clone()
+            truncate_with_ellipsis(&entry.name, name_max_chars)
         };
-        let name = truncate_with_ellipsis(&raw_name, name_max_chars);
         let size_str = entry.size.map(format_size).unwrap_or_default();
         let mod_str = entry.modified.map(format_modified).unwrap_or_default();
         let visual = row_visual(pane, row_idx);
@@ -2126,6 +2195,7 @@ fn build_row<'a>(
         .font(Font::MONOSPACE)
         .size(font_size)
         .width(Length::Fill)
+        .wrapping(iced::widget::text::Wrapping::None)
         .style(move |theme: &Theme| {
             // Resolve the final name color:
             //   - explicit override (e.g. folder_color) wins over theme default
@@ -2149,18 +2219,22 @@ fn build_row<'a>(
             .font(Font::MONOSPACE)
             .size(font_size)
             .width(Length::Fixed(config.size_column_px))
-            .align_x(Horizontal::Right),
+            .align_x(Horizontal::Right)
+            .wrapping(iced::widget::text::Wrapping::None),
         text(modified)
             .font(Font::MONOSPACE)
             .size(font_size)
-            .width(Length::Fixed(config.modified_column_px)),
+            .width(Length::Fixed(config.modified_column_px))
+            .wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(8);
 
     button(content)
         .on_press(msg)
         .width(Length::Fill)
+        .height(Length::Fixed(config.row_height_px))
         .padding(Padding::from([pad_y, 8]))
+        .clip(true)
         .style(move |theme: &Theme, status: button::Status| {
             compute_row_style(
                 theme,
@@ -2475,11 +2549,20 @@ fn name_max_chars(window_width: f32, config: &Config) -> usize {
     let row_horizontal_padding = 8.0 * 2.0;
     let row_gaps = 8.0 * 2.0;
     let scrollbar = 16.0;
+    // The name column also contains a git-modified marker (width = font_size)
+    // plus 4px spacing before the name text itself.
+    let git_marker_with_gap = config.row_font_size as f32 + 4.0;
+    // A couple of glyphs of breathing room: cosmic-text's measured glyph width
+    // is rarely exactly mono_glyph_px, and we'd rather ellipsize one char too
+    // early than have the name overflow into a second visual line.
+    let safety_px = config.mono_glyph_px * 2.0;
 
     let name_px = pane_width
         - pane_border_padding
         - row_horizontal_padding
         - row_gaps
+        - git_marker_with_gap
+        - safety_px
         - config.size_column_px
         - config.modified_column_px
         - scrollbar;
