@@ -39,6 +39,7 @@ selection just means "this row".
 | `F4` | Edit the cursor row's file in `$VISUAL` / `$EDITOR` (falls back to `open -t` on macOS) |
 | `Space` | Quick Look preview the cursor row's file (macOS only; no-op elsewhere) |
 | `F5` | Open the copy modal (destination defaults to the other pane's directory) |
+| `F10` | Quit the app immediately. Works even with a modal open — no confirmation. |
 | `Delete` | Open the delete-confirm modal for the current mark |
 
 Copy and delete operate on the **mark**, not just the cursor row. With no

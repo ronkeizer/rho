@@ -119,6 +119,8 @@ enum Message {
     AppsListLoaded(Result<Vec<Application>, String>),
     /// User clicked Launch on an app row — `open` the bundle.
     LaunchApp(PathBuf),
+    /// Global "quit the app" — currently bound to F10.
+    ExitApp,
     NoOp,
 }
 
@@ -929,6 +931,9 @@ impl App {
                     eprintln!("launch {} failed: {}", path.display(), e);
                 }
             }
+            Message::ExitApp => {
+                return window::get_oldest().and_then(window::close);
+            }
             Message::ProcessToggleSort(column) => {
                 if let Some(Prompt::Processes {
                     state,
@@ -1173,6 +1178,7 @@ impl App {
                 Key::Named(Named::F4) => Some(Message::EditFile),
                 Key::Named(Named::Space) => Some(Message::QuickLook),
                 Key::Named(Named::F5) => Some(Message::OpenCopyPrompt),
+                Key::Named(Named::F10) => Some(Message::ExitApp),
                 // Plain character keys (no Ctrl/Cmd/Alt) feed the type-to-filter.
                 // The earlier Cmd+P / Cmd+, guards have already matched before
                 // we get here, so unmodified characters fall through to this.
