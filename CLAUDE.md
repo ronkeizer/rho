@@ -18,7 +18,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cargo build --release` — release binary
 - `cargo test` — 94 unit tests across `config`, `domain`, `fs_ops`, plus view-helper tests in `main`
 
-No lint config or CI yet.
+CI (`.github/workflows/`):
+- `ci.yml` runs `cargo test` on every push and PR.
+- `docs.yml` builds the mdBook under `docs/` on every PR and deploys to GitHub Pages on push to `main` (https://ronkeizer.github.io/rho/).
+
+No lint config (rustfmt / clippy) yet.
+
+## Contributing changes
+
+Every behavior change ships with tests **and** docs. Treat these as part of the change, not follow-ups.
+
+**Tests.** Add unit tests in the same module as the code under test:
+- Pure logic (sort/filter/selection math, color parsing, config defaults, copy/delete primitives) goes in `config`, `domain`, or `fs_ops` — the existing test modules are the template, no iced runtime required.
+- View / `update()` glue is harder to test directly; when possible, pull the logic into a pure helper (a free function or a method on `Pane`) and test that. Don't ship behavior changes that can't be reached by a test without first explaining why in the PR description.
+
+**Docs.** Update `docs/src/` for anything user-visible:
+- New or changed keybinding → `docs/src/keybindings.md`.
+- New or changed `~/.fm.yaml` field → `docs/src/configuration.md` (and the in-tree starter template in `config.rs::default_template_yaml`).
+- New modal / subsystem → architecture note in `docs/src/architecture.md`, plus a chapter if it warrants one (add to `SUMMARY.md`).
+- New `~/.fm-state.yaml` field → `docs/src/session-state.md`.
+
+The docs CI catches broken refs on every PR. Refactors that don't change behavior don't need new docs, but if the existing docs become inaccurate as a result, update them in the same PR.
 
 ## iced feature flag (load-bearing)
 
