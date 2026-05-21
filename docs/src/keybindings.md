@@ -73,7 +73,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -85,13 +85,18 @@ Inside a modal, the navigation keys behave differently:
 | Copy (text input only) | `Enter` submit, `Esc` cancel |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
-| Docker containers | Mouse-only in v1 — click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
+| Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
+| Processes | Type to filter (substring against name). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
 
 ### Docker containers modal
 
 Picking **Docker containers** from the command palette runs `docker ps`
 and shows each running container as a row with name, image, status, and
-two buttons:
+two buttons. A filter input at the top narrows the list as you type —
+substring match against name + image, case-insensitive. The Name /
+Image / Status column headers are clickable: the first click sorts by
+that column ascending; clicking the active column again flips direction.
+Default sort is Name ascending.
 
 - **Kill** — runs `docker kill <id>`. The list re-fetches on completion so
   the killed container disappears (or sticks around with a refreshed
@@ -111,3 +116,26 @@ Platform notes for the **Shell** button:
 
 If Docker isn't installed (no `docker` binary on PATH), the modal shows
 an explanatory message instead of an empty list.
+
+### Processes modal
+
+Picking **Processes** from the command palette runs
+`ps -axo pid=,pcpu=,pmem=,comm=` and shows each process as a row with
+name, PID, CPU%, and MEM%. A filter input at the top narrows by process
+name (substring, case-insensitive). Default sort is CPU descending so the
+heaviest processes are at the top; click any column header to switch —
+numeric columns (PID / CPU / MEM) start descending on first click, Name
+starts ascending. Clicking the active column flips direction.
+
+- **Kill** — sends `SIGTERM` via `kill <pid>`. Re-fetches the list on
+  completion. No confirmation is shown: be deliberate about which row
+  you click, especially with system processes. Users who want SIGKILL
+  should run `kill -9` from a real terminal.
+
+The CPU% / MEM% values are snapshots from the moment of the `ps` call —
+they don't auto-refresh. Dismiss and reopen the modal to refresh.
+
+The modal is Unix-only in v1 (macOS + Linux). On other platforms it
+displays an explanatory message instead of a list — wiring up `tasklist`
++ `taskkill` on Windows is left for a future change.
+

@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use iced::{Subscription, Task};
 
-use crate::domain::{parse_docker_ps, DockerContainer, Entry, GitInfo, Side};
+use crate::domain::{
+    parse_docker_ps, parse_ps_output, DockerContainer, Entry, GitInfo, Process, Side,
+};
 use crate::Message;
 
 /// Both side-loads (directory entries + git info) for a single pane.
@@ -492,6 +494,83 @@ pub fn docker_shell(id: &str) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn shell_quote(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+// ---------------------------------------------------------------------------
+// Processes
+// ---------------------------------------------------------------------------
+
+/// Snapshot of currently-running processes via `ps -axo pid=,pcpu=,pmem=,comm=`.
+/// Unix-only — Windows would need `tasklist`/WMIC and a different parser.
+pub fn ps_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(run_ps)
+                .await
+                .unwrap_or_else(|e| Err(format!("ps task panicked: {}", e)))
+        },
+        Message::ProcessesListLoaded,
+    )
+}
+
+#[cfg(unix)]
+fn run_ps() -> Result<Vec<Process>, String> {
+    let output = std::process::Command::new("ps")
+        // `=` empty header suppresses the header row. Order is load-bearing:
+        // the variable-width `comm` column must come last so embedded spaces
+        // in a Mac-style command name don't break the parser.
+        .args(["-axo", "pid=,pcpu=,pmem=,comm="])
+        .output()
+        .map_err(|e| format!("failed to run `ps`: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`ps` exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(parse_ps_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(not(unix))]
+fn run_ps() -> Result<Vec<Process>, String> {
+    Err("Process listing isn't supported on this platform yet (needs tasklist/WMIC plumbing).".to_string())
+}
+
+/// Send SIGTERM (`kill <pid>`) to the given process. Unix-only.
+pub fn kill_process_task(pid: u32) -> Task<Message> {
+    Task::perform(
+        async move {
+            let res = tokio::task::spawn_blocking(move || run_kill(pid))
+                .await
+                .unwrap_or_else(|e| Err(format!("kill task panicked: {}", e)));
+            (pid, res)
+        },
+        |(pid, res)| Message::ProcessKillFinished(pid, res),
+    )
+}
+
+#[cfg(unix)]
+fn run_kill(pid: u32) -> Result<(), String> {
+    let output = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .output()
+        .map_err(|e| format!("failed to run `kill`: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`kill` exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_kill(_pid: u32) -> Result<(), String> {
+    Err("Killing processes isn't supported on this platform yet.".to_string())
 }
 
 #[cfg(test)]

@@ -94,9 +94,23 @@ pub enum Prompt {
     },
     /// "Docker containers" action. Shows the currently-running containers
     /// from `docker ps`, each with Kill and Shell buttons. The state goes
-    /// Loading → Loaded(list) / Error(msg); kills re-fetch the list.
+    /// Loading → Loaded(list) / Error(msg); kills re-fetch the list. `input`
+    /// is the filter text — substring-matched against name + image.
+    /// `sort_by` / `sort_dir` drive the clickable column headers.
     Docker {
         state: DockerState,
+        input: String,
+        sort_by: DockerSortBy,
+        sort_dir: SortDir,
+    },
+    /// "Processes" action. Same shape as Docker but backed by `ps -axo …`.
+    /// `input` filters by process name; per-row action is `Kill` (SIGTERM).
+    /// Defaults to sorting by CPU descending.
+    Processes {
+        state: ProcessesState,
+        input: String,
+        sort_by: ProcessSortBy,
+        sort_dir: SortDir,
     },
 }
 
@@ -137,6 +151,7 @@ pub enum PaletteAction {
     Copy,
     Delete,
     DockerContainers,
+    Processes,
     Exit,
 }
 
@@ -145,6 +160,7 @@ impl PaletteAction {
         PaletteAction::Copy,
         PaletteAction::Delete,
         PaletteAction::DockerContainers,
+        PaletteAction::Processes,
         PaletteAction::Exit,
     ];
 
@@ -153,6 +169,7 @@ impl PaletteAction {
             PaletteAction::Copy => "Copy",
             PaletteAction::Delete => "Delete",
             PaletteAction::DockerContainers => "Docker containers",
+            PaletteAction::Processes => "Processes",
             PaletteAction::Exit => "Exit",
         }
     }
@@ -167,6 +184,55 @@ pub struct DockerContainer {
     pub status: String,
 }
 
+/// Sortable columns in the Docker containers modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerSortBy {
+    Name,
+    Image,
+    Status,
+}
+
+impl DockerSortBy {
+    pub fn label(self) -> &'static str {
+        match self {
+            DockerSortBy::Name => "Name",
+            DockerSortBy::Image => "Image",
+            DockerSortBy::Status => "Status",
+        }
+    }
+
+    /// Direction applied when a column is clicked while it isn't already the
+    /// active sort column. Text columns lean ascending — clicking "Name"
+    /// from a blank slate should give an A-Z list.
+    pub fn initial_dir(self) -> SortDir {
+        SortDir::Asc
+    }
+}
+
+pub fn sort_containers(containers: &mut [DockerContainer], by: DockerSortBy, dir: SortDir) {
+    use std::cmp::Reverse;
+    match (by, dir) {
+        (DockerSortBy::Name, SortDir::Asc) => {
+            containers.sort_by_cached_key(|c| c.name.to_lowercase());
+        }
+        (DockerSortBy::Name, SortDir::Desc) => {
+            containers.sort_by_cached_key(|c| Reverse(c.name.to_lowercase()));
+        }
+        (DockerSortBy::Image, SortDir::Asc) => {
+            containers.sort_by_cached_key(|c| c.image.to_lowercase());
+        }
+        (DockerSortBy::Image, SortDir::Desc) => {
+            containers.sort_by_cached_key(|c| Reverse(c.image.to_lowercase()));
+        }
+        (DockerSortBy::Status, SortDir::Asc) => {
+            containers.sort_by_cached_key(|c| c.status.to_lowercase());
+        }
+        (DockerSortBy::Status, SortDir::Desc) => {
+            containers.sort_by_cached_key(|c| Reverse(c.status.to_lowercase()));
+        }
+    }
+}
+
 /// Lifecycle of the Docker containers modal. Drives both the loading
 /// placeholder and the post-load list / error states.
 #[derive(Debug, Clone)]
@@ -174,6 +240,84 @@ pub enum DockerState {
     Loading,
     Loaded(Vec<DockerContainer>),
     Error(String),
+}
+
+/// Snapshot of one process from `ps`. Percentages are wall-clock CPU usage
+/// and RSS as a fraction of total RAM, both as reported by `ps` at the
+/// moment of the call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Process {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: f32,
+    pub mem_percent: f32,
+}
+
+/// Lifecycle of the Processes modal. Same shape as [`DockerState`].
+#[derive(Debug, Clone)]
+pub enum ProcessesState {
+    Loading,
+    Loaded(Vec<Process>),
+    Error(String),
+}
+
+/// Sortable columns in the Processes modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessSortBy {
+    Name,
+    Pid,
+    Cpu,
+    Mem,
+}
+
+impl ProcessSortBy {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProcessSortBy::Name => "Name",
+            ProcessSortBy::Pid => "PID",
+            ProcessSortBy::Cpu => "CPU",
+            ProcessSortBy::Mem => "MEM",
+        }
+    }
+
+    /// Default direction when switching to this column. Numeric columns
+    /// default to descending so "click CPU" lists the heaviest first; the
+    /// Name column defaults to A-Z.
+    pub fn initial_dir(self) -> SortDir {
+        match self {
+            ProcessSortBy::Name => SortDir::Asc,
+            ProcessSortBy::Pid | ProcessSortBy::Cpu | ProcessSortBy::Mem => SortDir::Desc,
+        }
+    }
+}
+
+pub fn sort_processes(processes: &mut [Process], by: ProcessSortBy, dir: SortDir) {
+    use std::cmp::Ordering;
+    use std::cmp::Reverse;
+    // f32 isn't Ord, so partial_cmp + NaN guard.
+    let cmp_f32 = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+    match (by, dir) {
+        (ProcessSortBy::Name, SortDir::Asc) => {
+            processes.sort_by_cached_key(|p| p.name.to_lowercase());
+        }
+        (ProcessSortBy::Name, SortDir::Desc) => {
+            processes.sort_by_cached_key(|p| Reverse(p.name.to_lowercase()));
+        }
+        (ProcessSortBy::Pid, SortDir::Asc) => processes.sort_by_key(|p| p.pid),
+        (ProcessSortBy::Pid, SortDir::Desc) => processes.sort_by_key(|p| Reverse(p.pid)),
+        (ProcessSortBy::Cpu, SortDir::Asc) => {
+            processes.sort_by(|a, b| cmp_f32(a.cpu_percent, b.cpu_percent));
+        }
+        (ProcessSortBy::Cpu, SortDir::Desc) => {
+            processes.sort_by(|a, b| cmp_f32(b.cpu_percent, a.cpu_percent));
+        }
+        (ProcessSortBy::Mem, SortDir::Asc) => {
+            processes.sort_by(|a, b| cmp_f32(a.mem_percent, b.mem_percent));
+        }
+        (ProcessSortBy::Mem, SortDir::Desc) => {
+            processes.sort_by(|a, b| cmp_f32(b.mem_percent, a.mem_percent));
+        }
+    }
 }
 
 /// Parse output of `docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}'`.
@@ -198,6 +342,74 @@ pub fn parse_docker_ps(stdout: &str) -> Vec<DockerContainer> {
                 status,
             })
         })
+        .collect()
+}
+
+/// Parse output of `ps -axo pid=,pcpu=,pmem=,comm=`. The command name is the
+/// last column so anything past the third whitespace block is treated as
+/// the name, even if it contains spaces (Mac process names sometimes do).
+/// Returns the list sorted by CPU descending so heavy hitters surface first.
+pub fn parse_ps_output(stdout: &str) -> Vec<Process> {
+    let mut out: Vec<Process> = stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid_str, rest) = line.split_once(char::is_whitespace)?;
+            let rest = rest.trim_start();
+            let (cpu_str, rest) = rest.split_once(char::is_whitespace)?;
+            let rest = rest.trim_start();
+            let (mem_str, name) = rest.split_once(char::is_whitespace)?;
+            let pid: u32 = pid_str.parse().ok()?;
+            let cpu_percent: f32 = cpu_str.parse().ok()?;
+            let mem_percent: f32 = mem_str.parse().ok()?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(Process {
+                pid,
+                name,
+                cpu_percent,
+                mem_percent,
+            })
+        })
+        .collect();
+    // Descending CPU. partial_cmp on f32 can be None for NaN — fall back to
+    // Equal so we get a total order even on weird inputs.
+    out.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// Case-insensitive substring filter over container name + image.
+pub fn filtered_containers<'a>(
+    containers: &'a [DockerContainer],
+    input: &str,
+) -> Vec<&'a DockerContainer> {
+    if input.is_empty() {
+        return containers.iter().collect();
+    }
+    let needle = input.to_lowercase();
+    containers
+        .iter()
+        .filter(|c| {
+            c.name.to_lowercase().contains(&needle) || c.image.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// Case-insensitive substring filter over process name.
+pub fn filtered_processes<'a>(processes: &'a [Process], input: &str) -> Vec<&'a Process> {
+    if input.is_empty() {
+        return processes.iter().collect();
+    }
+    let needle = input.to_lowercase();
+    processes
+        .iter()
+        .filter(|p| p.name.to_lowercase().contains(&needle))
         .collect()
 }
 
@@ -1211,4 +1423,273 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, "Up 2 hours | restarting");
     }
+
+    #[test]
+    fn palette_action_processes_label() {
+        assert_eq!(PaletteAction::Processes.label(), "Processes");
+    }
+
+    #[test]
+    fn filtered_actions_finds_processes() {
+        let out = filtered_actions("proc");
+        assert_eq!(out, vec![PaletteAction::Processes]);
+    }
+
+    #[test]
+    fn parse_ps_output_basic_sorted_by_cpu_desc() {
+        // Note: kernel-like names in brackets ([kthreadd]) should pass too.
+        let stdout = "  100 0.5 1.0 bash\n  101 12.3 4.5 chrome\n  102 0.0 0.1 [kthreadd]\n";
+        let out = parse_ps_output(stdout);
+        assert_eq!(out.len(), 3);
+        // Sort by CPU desc.
+        assert_eq!(out[0].name, "chrome");
+        assert_eq!(out[0].pid, 101);
+        assert!((out[0].cpu_percent - 12.3).abs() < 1e-3);
+        assert!((out[0].mem_percent - 4.5).abs() < 1e-3);
+        assert_eq!(out[1].name, "bash");
+        assert_eq!(out[2].name, "[kthreadd]");
+    }
+
+    #[test]
+    fn parse_ps_output_handles_name_with_spaces() {
+        // On macOS `comm` can contain spaces (e.g. "Google Chrome"). The
+        // parser must put the command-name column last so any spaces stay
+        // inside it.
+        let stdout = "  100 1.0 2.0 Google Chrome Helper (Renderer)\n";
+        let out = parse_ps_output(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "Google Chrome Helper (Renderer)");
+    }
+
+    #[test]
+    fn parse_ps_output_skips_malformed_lines() {
+        let stdout = "garbage\n  100 1.0 2.0 valid\nnotanint x x x\n";
+        let out = parse_ps_output(stdout);
+        // Only the valid row survives.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "valid");
+    }
+
+    #[test]
+    fn parse_ps_output_empty_returns_empty() {
+        assert!(parse_ps_output("").is_empty());
+        assert!(parse_ps_output("\n").is_empty());
+    }
+
+    #[test]
+    fn filtered_containers_matches_name_and_image() {
+        let containers = vec![
+            DockerContainer {
+                id: "1".into(),
+                name: "web".into(),
+                image: "nginx".into(),
+                status: "Up".into(),
+            },
+            DockerContainer {
+                id: "2".into(),
+                name: "db".into(),
+                image: "postgres".into(),
+                status: "Up".into(),
+            },
+        ];
+        // Filter by name.
+        let out = filtered_containers(&containers, "web");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "web");
+        // Filter by image.
+        let out = filtered_containers(&containers, "postgres");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "db");
+        // Empty filter returns everything.
+        let out = filtered_containers(&containers, "");
+        assert_eq!(out.len(), 2);
+        // No match.
+        let out = filtered_containers(&containers, "zzz");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filtered_containers_is_case_insensitive() {
+        let containers = vec![DockerContainer {
+            id: "1".into(),
+            name: "Web".into(),
+            image: "Nginx".into(),
+            status: "Up".into(),
+        }];
+        assert_eq!(filtered_containers(&containers, "WEB").len(), 1);
+        assert_eq!(filtered_containers(&containers, "ngINX").len(), 1);
+    }
+
+    #[test]
+    fn filtered_processes_substring_matches_name() {
+        let procs = vec![
+            Process {
+                pid: 1,
+                name: "bash".into(),
+                cpu_percent: 0.0,
+                mem_percent: 0.0,
+            },
+            Process {
+                pid: 2,
+                name: "chrome".into(),
+                cpu_percent: 0.0,
+                mem_percent: 0.0,
+            },
+        ];
+        let out = filtered_processes(&procs, "rome");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "chrome");
+        // Empty filter returns everything.
+        assert_eq!(filtered_processes(&procs, "").len(), 2);
+        // No match.
+        assert!(filtered_processes(&procs, "zzz").is_empty());
+    }
+
+    #[test]
+    fn filtered_processes_is_case_insensitive() {
+        let procs = vec![Process {
+            pid: 1,
+            name: "Chrome".into(),
+            cpu_percent: 0.0,
+            mem_percent: 0.0,
+        }];
+        assert_eq!(filtered_processes(&procs, "CHROME").len(), 1);
+    }
+
+    #[test]
+    fn docker_sort_by_initial_dir_is_asc() {
+        // All text columns default to ascending so a "click Name" lands on A→Z.
+        assert_eq!(DockerSortBy::Name.initial_dir(), SortDir::Asc);
+        assert_eq!(DockerSortBy::Image.initial_dir(), SortDir::Asc);
+        assert_eq!(DockerSortBy::Status.initial_dir(), SortDir::Asc);
+    }
+
+    #[test]
+    fn process_sort_by_initial_dir_picks_desc_for_numeric_columns() {
+        assert_eq!(ProcessSortBy::Name.initial_dir(), SortDir::Asc);
+        assert_eq!(ProcessSortBy::Pid.initial_dir(), SortDir::Desc);
+        assert_eq!(ProcessSortBy::Cpu.initial_dir(), SortDir::Desc);
+        assert_eq!(ProcessSortBy::Mem.initial_dir(), SortDir::Desc);
+    }
+
+    fn mk_container(name: &str, image: &str, status: &str) -> DockerContainer {
+        DockerContainer {
+            id: format!("{}-id", name),
+            name: name.to_string(),
+            image: image.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn sort_containers_by_name_case_insensitive() {
+        let mut v = vec![
+            mk_container("Bravo", "nginx", "Up"),
+            mk_container("alpha", "redis", "Up"),
+            mk_container("Charlie", "postgres", "Restarting"),
+        ];
+        sort_containers(&mut v, DockerSortBy::Name, SortDir::Asc);
+        assert_eq!(v[0].name, "alpha");
+        assert_eq!(v[1].name, "Bravo");
+        assert_eq!(v[2].name, "Charlie");
+    }
+
+    #[test]
+    fn sort_containers_by_image_desc() {
+        let mut v = vec![
+            mk_container("a", "alpine", "Up"),
+            mk_container("b", "ubuntu", "Up"),
+            mk_container("c", "nginx", "Up"),
+        ];
+        sort_containers(&mut v, DockerSortBy::Image, SortDir::Desc);
+        assert_eq!(v[0].image, "ubuntu");
+        assert_eq!(v[1].image, "nginx");
+        assert_eq!(v[2].image, "alpine");
+    }
+
+    #[test]
+    fn sort_containers_by_status() {
+        let mut v = vec![
+            mk_container("a", "alpine", "Up 5 min"),
+            mk_container("b", "ubuntu", "Restarting"),
+            mk_container("c", "nginx", "Exited"),
+        ];
+        sort_containers(&mut v, DockerSortBy::Status, SortDir::Asc);
+        assert_eq!(v[0].status, "Exited");
+        assert_eq!(v[1].status, "Restarting");
+        assert_eq!(v[2].status, "Up 5 min");
+    }
+
+    fn mk_proc(name: &str, pid: u32, cpu: f32, mem: f32) -> Process {
+        Process {
+            pid,
+            name: name.to_string(),
+            cpu_percent: cpu,
+            mem_percent: mem,
+        }
+    }
+
+    #[test]
+    fn sort_processes_by_cpu_desc() {
+        let mut v = vec![
+            mk_proc("bash", 100, 0.5, 1.0),
+            mk_proc("chrome", 101, 12.3, 4.5),
+            mk_proc("kthread", 102, 0.0, 0.1),
+        ];
+        sort_processes(&mut v, ProcessSortBy::Cpu, SortDir::Desc);
+        assert_eq!(v[0].name, "chrome");
+        assert_eq!(v[1].name, "bash");
+        assert_eq!(v[2].name, "kthread");
+    }
+
+    #[test]
+    fn sort_processes_by_cpu_asc_is_reverse() {
+        let mut v = vec![
+            mk_proc("bash", 100, 0.5, 1.0),
+            mk_proc("chrome", 101, 12.3, 4.5),
+        ];
+        sort_processes(&mut v, ProcessSortBy::Cpu, SortDir::Asc);
+        assert_eq!(v[0].name, "bash");
+        assert_eq!(v[1].name, "chrome");
+    }
+
+    #[test]
+    fn sort_processes_by_mem_desc() {
+        let mut v = vec![
+            mk_proc("a", 1, 0.0, 1.0),
+            mk_proc("b", 2, 0.0, 10.5),
+            mk_proc("c", 3, 0.0, 5.0),
+        ];
+        sort_processes(&mut v, ProcessSortBy::Mem, SortDir::Desc);
+        assert_eq!(v[0].name, "b");
+        assert_eq!(v[1].name, "c");
+        assert_eq!(v[2].name, "a");
+    }
+
+    #[test]
+    fn sort_processes_by_pid_desc() {
+        let mut v = vec![
+            mk_proc("a", 100, 0.0, 0.0),
+            mk_proc("b", 50, 0.0, 0.0),
+            mk_proc("c", 200, 0.0, 0.0),
+        ];
+        sort_processes(&mut v, ProcessSortBy::Pid, SortDir::Desc);
+        assert_eq!(v[0].pid, 200);
+        assert_eq!(v[1].pid, 100);
+        assert_eq!(v[2].pid, 50);
+    }
+
+    #[test]
+    fn sort_processes_by_name_case_insensitive() {
+        let mut v = vec![
+            mk_proc("Bravo", 1, 0.0, 0.0),
+            mk_proc("alpha", 2, 0.0, 0.0),
+            mk_proc("Charlie", 3, 0.0, 0.0),
+        ];
+        sort_processes(&mut v, ProcessSortBy::Name, SortDir::Asc);
+        assert_eq!(v[0].name, "alpha");
+        assert_eq!(v[1].name, "Bravo");
+        assert_eq!(v[2].name, "Charlie");
+    }
+
 }

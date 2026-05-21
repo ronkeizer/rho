@@ -21,13 +21,14 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, RowColors, SavedState,
 };
 use domain::{
-    add_recent, filtered_actions, filtered_recents, sort_entries, DeleteFocus, DockerContainer,
-    DockerState, Entry, GitInfo, NewFilesFocus, PaletteAction, Pane, Prompt, RowVisual, Side,
-    SortBy, SortDir,
+    add_recent, filtered_actions, filtered_containers, filtered_processes, filtered_recents,
+    sort_containers, sort_entries, sort_processes, DeleteFocus, DockerContainer, DockerSortBy,
+    DockerState, Entry, GitInfo, NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy,
+    ProcessesState, Prompt, RowVisual, Side, SortBy, SortDir,
 };
 use fs_ops::{
     copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
-    file_watch_subscription, loading_tasks,
+    file_watch_subscription, kill_process_task, loading_tasks, ps_task,
 };
 
 const PROMPT_ID: &str = "prompt";
@@ -103,6 +104,16 @@ enum Message {
     DockerKillFinished(String, Result<(), String>),
     /// User clicked Shell on a container row — spawn a terminal.
     DockerShell(String),
+    /// `ps -axo …` completed (or failed) for the Processes modal.
+    ProcessesListLoaded(Result<Vec<Process>, String>),
+    /// User clicked Kill on a process row — send SIGTERM.
+    ProcessKill(u32),
+    /// `kill <pid>` completed.
+    ProcessKillFinished(u32, Result<(), String>),
+    /// User clicked a Docker column header — toggle / switch the sort.
+    DockerToggleSort(DockerSortBy),
+    /// User clicked a Processes column header — toggle / switch the sort.
+    ProcessToggleSort(ProcessSortBy),
     NoOp,
 }
 
@@ -489,9 +500,10 @@ impl App {
                             let n = filtered_actions(input).len();
                             *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                         }
-                        Prompt::Delete { .. }
-                        | Prompt::NewFiles { .. }
-                        | Prompt::Docker { .. } => {}
+                        Prompt::Docker { input, .. } | Prompt::Processes { input, .. } => {
+                            *input = value;
+                        }
+                        Prompt::Delete { .. } | Prompt::NewFiles { .. } => {}
                     }
                 }
             }
@@ -550,10 +562,35 @@ impl App {
                             }
                             None
                         }
-                        // Docker is mouse-only in v1 — Enter is a no-op.
-                        // Putting it back so the modal doesn't close.
-                        Prompt::Docker { state } => {
-                            self.prompt = Some(Prompt::Docker { state });
+                        // Docker / Processes have a filter input but actions
+                        // are mouse-only — Enter is a no-op. Re-instate the
+                        // prompt so the modal doesn't close.
+                        Prompt::Docker {
+                            state,
+                            input,
+                            sort_by,
+                            sort_dir,
+                        } => {
+                            self.prompt = Some(Prompt::Docker {
+                                state,
+                                input,
+                                sort_by,
+                                sort_dir,
+                            });
+                            None
+                        }
+                        Prompt::Processes {
+                            state,
+                            input,
+                            sort_by,
+                            sort_dir,
+                        } => {
+                            self.prompt = Some(Prompt::Processes {
+                                state,
+                                input,
+                                sort_by,
+                                sort_dir,
+                            });
                             None
                         }
                     }
@@ -731,9 +768,18 @@ impl App {
                 // Only fold the result back in if the Docker modal is still
                 // up; the user may have dismissed it before docker ps
                 // finished.
-                if let Some(Prompt::Docker { state }) = self.prompt.as_mut() {
+                if let Some(Prompt::Docker {
+                    state,
+                    sort_by,
+                    sort_dir,
+                    ..
+                }) = self.prompt.as_mut()
+                {
                     *state = match result {
-                        Ok(list) => DockerState::Loaded(list),
+                        Ok(mut list) => {
+                            sort_containers(&mut list, *sort_by, *sort_dir);
+                            DockerState::Loaded(list)
+                        }
                         Err(msg) => DockerState::Error(msg),
                     };
                 }
@@ -754,6 +800,72 @@ impl App {
             Message::DockerShell(id) => {
                 if let Err(e) = docker_shell(&id) {
                     eprintln!("docker shell {} failed: {}", id, e);
+                }
+            }
+            Message::ProcessesListLoaded(result) => {
+                if let Some(Prompt::Processes {
+                    state,
+                    sort_by,
+                    sort_dir,
+                    ..
+                }) = self.prompt.as_mut()
+                {
+                    *state = match result {
+                        Ok(mut list) => {
+                            sort_processes(&mut list, *sort_by, *sort_dir);
+                            ProcessesState::Loaded(list)
+                        }
+                        Err(msg) => ProcessesState::Error(msg),
+                    };
+                }
+            }
+            Message::ProcessKill(pid) => {
+                return kill_process_task(pid);
+            }
+            Message::ProcessKillFinished(pid, result) => {
+                if let Err(e) = &result {
+                    eprintln!("kill {} failed: {}", pid, e);
+                }
+                if let Some(Prompt::Processes { .. }) = &self.prompt {
+                    return ps_task();
+                }
+            }
+            Message::DockerToggleSort(column) => {
+                if let Some(Prompt::Docker {
+                    state,
+                    sort_by,
+                    sort_dir,
+                    ..
+                }) = self.prompt.as_mut()
+                {
+                    if *sort_by == column {
+                        *sort_dir = sort_dir.toggled();
+                    } else {
+                        *sort_by = column;
+                        *sort_dir = column.initial_dir();
+                    }
+                    if let DockerState::Loaded(list) = state {
+                        sort_containers(list, *sort_by, *sort_dir);
+                    }
+                }
+            }
+            Message::ProcessToggleSort(column) => {
+                if let Some(Prompt::Processes {
+                    state,
+                    sort_by,
+                    sort_dir,
+                    ..
+                }) = self.prompt.as_mut()
+                {
+                    if *sort_by == column {
+                        *sort_dir = sort_dir.toggled();
+                    } else {
+                        *sort_by = column;
+                        *sort_dir = column.initial_dir();
+                    }
+                    if let ProcessesState::Loaded(list) = state {
+                        sort_processes(list, *sort_by, *sort_dir);
+                    }
                 }
             }
             Message::NoOp => {}
@@ -785,8 +897,26 @@ impl App {
             PaletteAction::DockerContainers => {
                 self.prompt = Some(Prompt::Docker {
                     state: DockerState::Loading,
+                    input: String::new(),
+                    sort_by: DockerSortBy::Name,
+                    sort_dir: SortDir::Asc,
                 });
-                docker_ps_task()
+                Task::batch([
+                    docker_ps_task(),
+                    text_input::focus(text_input::Id::new(PROMPT_ID)),
+                ])
+            }
+            PaletteAction::Processes => {
+                self.prompt = Some(Prompt::Processes {
+                    state: ProcessesState::Loading,
+                    input: String::new(),
+                    sort_by: ProcessSortBy::Cpu,
+                    sort_dir: SortDir::Desc,
+                });
+                Task::batch([
+                    ps_task(),
+                    text_input::focus(text_input::Id::new(PROMPT_ID)),
+                ])
             }
             PaletteAction::Exit => window::get_oldest().and_then(window::close),
         }
@@ -1473,6 +1603,12 @@ fn compute_row_style(
 }
 
 fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
+    // Docker / Processes are table-shaped and benefit from extra horizontal
+    // room; the other modals are single-column and stay narrow.
+    let modal_width = match prompt {
+        Prompt::Docker { .. } | Prompt::Processes { .. } => 720.0,
+        _ => 440.0,
+    };
     let dialog_inner = container(match prompt {
         Prompt::Open {
             input,
@@ -1501,10 +1637,12 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 let list_col = filtered.iter().enumerate().fold(
                     column![].spacing(2),
                     |col, (i, path)| {
+                        // Highlighted row gets the primary fill; the rest
+                        // inherit the modal background via `button::text`.
                         let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
                             button::primary
                         } else {
-                            button::secondary
+                            button::text
                         };
                         col.push(
                             button(
@@ -1559,10 +1697,12 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 let actions_col = filtered.iter().enumerate().fold(
                     column![].spacing(4),
                     |col, (i, action)| {
+                        // Same idea as the Open modal: highlight only the
+                        // active row; the rest inherit the modal background.
                         let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
                             button::primary
                         } else {
-                            button::secondary
+                            button::text
                         };
                         col.push(
                             button(text(action.label()))
@@ -1702,7 +1842,55 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
             ]
             .spacing(10)
         }
-        Prompt::Docker { state } => {
+        Prompt::Docker {
+            state,
+            input,
+            sort_by,
+            sort_dir,
+        } => {
+            let filter_widget = text_input("filter by name or image…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+            // Header wrapped in the same container shape as a body row (same
+            // padding, same 1px border — invisible here) so widths line up
+            // exactly. The "Actions" column uses FillPortion(2), matched in
+            // the body row below.
+            let header_row = container(
+                row![
+                    docker_header(
+                        DockerSortBy::Name,
+                        *sort_by,
+                        *sort_dir,
+                        Length::FillPortion(3)
+                    ),
+                    docker_header(
+                        DockerSortBy::Image,
+                        *sort_by,
+                        *sort_dir,
+                        Length::FillPortion(4)
+                    ),
+                    docker_header(
+                        DockerSortBy::Status,
+                        *sort_by,
+                        *sort_dir,
+                        Length::FillPortion(3)
+                    ),
+                    Space::with_width(Length::FillPortion(2)),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(Padding::from([3, 8]))
+            .style(|_theme: &Theme| container::Style {
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            });
             let body: Element<'_, Message> = match state {
                 DockerState::Loading => container(text("Loading…").size(12))
                     .padding(Padding::from([8, 8]))
@@ -1723,74 +1911,248 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                         .into()
                 }
                 DockerState::Loaded(containers) => {
-                    let list_col =
-                        containers
-                            .iter()
-                            .fold(column![].spacing(6), |col, c| {
-                                let id = c.id.clone();
-                                let id_for_shell = c.id.clone();
-                                let header_line = text(format!(
-                                    "{}  ·  {}",
-                                    if c.name.is_empty() { &c.id } else { &c.name },
-                                    c.image
-                                ))
+                    let filtered = filtered_containers(containers, input);
+                    if filtered.is_empty() {
+                        container(text("No containers match.").size(12))
+                            .padding(Padding::from([8, 8]))
+                            .into()
+                    } else {
+                        let list_col = filtered.iter().fold(column![].spacing(3), |col, c| {
+                            let id = c.id.clone();
+                            let id_for_shell = c.id.clone();
+                            let name_cell = text(
+                                if c.name.is_empty() { c.id.clone() } else { c.name.clone() },
+                            )
+                            .font(Font::MONOSPACE)
+                            .size(11)
+                            .width(Length::FillPortion(3))
+                            .wrapping(iced::widget::text::Wrapping::None);
+                            let image_cell = text(c.image.clone())
                                 .font(Font::MONOSPACE)
-                                .size(12);
-                                let status_line = text(c.status.clone())
-                                    .font(Font::MONOSPACE)
-                                    .size(11)
-                                    .style(|theme: &Theme| iced::widget::text::Style {
-                                        color: Some(dim(theme.extended_palette().background.base.text)),
-                                    });
-                                let actions = row![
-                                    button(text("Kill").size(11))
-                                        .on_press(Message::DockerKill(id))
-                                        .padding(Padding::from([4, 12]))
-                                        .style(button::danger),
-                                    button(text("Shell").size(11))
-                                        .on_press(Message::DockerShell(id_for_shell))
-                                        .padding(Padding::from([4, 12]))
-                                        .style(button::primary),
-                                ]
-                                .spacing(6);
-                                let row_widget = row![
-                                    column![header_line, status_line]
-                                        .spacing(2)
+                                .size(11)
+                                .width(Length::FillPortion(4))
+                                .wrapping(iced::widget::text::Wrapping::None);
+                            let status_cell = text(c.status.clone())
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::FillPortion(3))
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .style(|theme: &Theme| iced::widget::text::Style {
+                                    color: Some(dim(theme.extended_palette().background.base.text)),
+                                });
+                            // Actions packed into a FillPortion(2) column so
+                            // the header's matching spacer lines up exactly.
+                            let actions_col = row![
+                                button(
+                                    text("Kill")
+                                        .size(10)
+                                        .align_x(Horizontal::Center)
                                         .width(Length::Fill),
-                                    actions,
-                                ]
+                                )
+                                .on_press(Message::DockerKill(id))
+                                .padding(Padding::from([2, 0]))
+                                .width(Length::Fill)
+                                .style(button::danger),
+                                button(
+                                    text("Shell")
+                                        .size(10)
+                                        .align_x(Horizontal::Center)
+                                        .width(Length::Fill),
+                                )
+                                .on_press(Message::DockerShell(id_for_shell))
+                                .padding(Padding::from([2, 0]))
+                                .width(Length::Fill)
+                                .style(button::primary),
+                            ]
+                            .spacing(6)
+                            .width(Length::FillPortion(2));
+                            let row_widget = row![name_cell, image_cell, status_cell, actions_col]
                                 .spacing(8)
                                 .align_y(iced::Alignment::Center);
-                                col.push(
-                                    container(row_widget)
-                                        .padding(Padding::from([6, 8]))
-                                        .style(|theme: &Theme| container::Style {
-                                            background: Some(
-                                                theme.extended_palette().background.weak.color.into(),
-                                            ),
-                                            border: Border {
-                                                color: theme.extended_palette().background.strong.color,
-                                                width: 1.0,
-                                                radius: 4.0.into(),
-                                            },
-                                            ..Default::default()
-                                        }),
-                                )
-                            });
-                    scrollable(list_col).height(Length::Fixed(320.0)).into()
+                            col.push(
+                                container(row_widget)
+                                    .padding(Padding::from([3, 8]))
+                                    .style(|theme: &Theme| container::Style {
+                                        // Inherit the modal's background
+                                        // (palette.background.base) — rows
+                                        // are visually separated by the
+                                        // border alone.
+                                        border: Border {
+                                            color: theme.extended_palette().background.strong.color,
+                                            width: 1.0,
+                                            radius: 4.0.into(),
+                                        },
+                                        ..Default::default()
+                                    }),
+                            )
+                        });
+                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                    }
                 }
             };
 
             column![
                 text("Docker containers").size(15),
+                filter_widget,
+                header_row,
                 body,
-                text("Click Kill or Shell  ·  Esc dismisses").size(11),
+                text("Type to filter  ·  click a header to sort  ·  click Kill or Shell  ·  Esc dismisses").size(11),
             ]
-            .spacing(10)
+            .spacing(6)
+        }
+        Prompt::Processes {
+            state,
+            input,
+            sort_by,
+            sort_dir,
+        } => {
+            let filter_widget = text_input("filter by name…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+            // Header wrapped to mirror the body-row container shape (same
+            // padding + invisible 1px border so widths line up exactly).
+            let header_row = container(
+                row![
+                    process_header(ProcessSortBy::Name, *sort_by, *sort_dir, Length::Fill),
+                    process_header(
+                        ProcessSortBy::Pid,
+                        *sort_by,
+                        *sort_dir,
+                        Length::Fixed(96.0)
+                    ),
+                    process_header(
+                        ProcessSortBy::Cpu,
+                        *sort_by,
+                        *sort_dir,
+                        Length::Fixed(96.0)
+                    ),
+                    process_header(
+                        ProcessSortBy::Mem,
+                        *sort_by,
+                        *sort_dir,
+                        Length::Fixed(96.0)
+                    ),
+                    Space::with_width(Length::Fixed(60.0)),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(Padding::from([3, 8]))
+            .style(|_theme: &Theme| container::Style {
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            });
+            let body: Element<'_, Message> = match state {
+                ProcessesState::Loading => container(text("Loading…").size(12))
+                    .padding(Padding::from([8, 8]))
+                    .into(),
+                ProcessesState::Error(msg) => container(
+                    text(msg.clone())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .style(|theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.extended_palette().danger.base.color),
+                        }),
+                )
+                .padding(Padding::from([8, 8]))
+                .into(),
+                ProcessesState::Loaded(procs) if procs.is_empty() => {
+                    container(text("No processes.").size(12))
+                        .padding(Padding::from([8, 8]))
+                        .into()
+                }
+                ProcessesState::Loaded(procs) => {
+                    let filtered = filtered_processes(procs, input);
+                    if filtered.is_empty() {
+                        container(text("No processes match.").size(12))
+                            .padding(Padding::from([8, 8]))
+                            .into()
+                    } else {
+                        let list_col = filtered.iter().fold(column![].spacing(3), |col, p| {
+                            let pid = p.pid;
+                            let dim_style = |theme: &Theme| iced::widget::text::Style {
+                                color: Some(dim(theme.extended_palette().background.base.text)),
+                            };
+                            let name_cell = text(p.name.clone())
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::Fill)
+                                .wrapping(iced::widget::text::Wrapping::None);
+                            let pid_cell = text(format!("PID {}", p.pid))
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::Fixed(96.0))
+                                .style(dim_style);
+                            let cpu_cell = text(format!("CPU {:>5.1}%", p.cpu_percent))
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::Fixed(96.0))
+                                .style(dim_style);
+                            let mem_cell = text(format!("MEM {:>5.1}%", p.mem_percent))
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::Fixed(96.0))
+                                .style(dim_style);
+                            // Kill column is Fixed(60) here and a matching
+                            // 60-wide spacer in the header so widths align.
+                            let row_widget = row![
+                                name_cell,
+                                pid_cell,
+                                cpu_cell,
+                                mem_cell,
+                                button(
+                                    text("Kill")
+                                        .size(10)
+                                        .align_x(Horizontal::Center)
+                                        .width(Length::Fill),
+                                )
+                                .on_press(Message::ProcessKill(pid))
+                                .padding(Padding::from([2, 0]))
+                                .width(Length::Fixed(60.0))
+                                .style(button::danger),
+                            ]
+                            .spacing(8)
+                            .align_y(iced::Alignment::Center);
+                            col.push(
+                                container(row_widget)
+                                    .padding(Padding::from([3, 8]))
+                                    .style(|theme: &Theme| container::Style {
+                                        // Inherit the modal's background
+                                        // (palette.background.base) — rows
+                                        // are visually separated by the
+                                        // border alone.
+                                        border: Border {
+                                            color: theme.extended_palette().background.strong.color,
+                                            width: 1.0,
+                                            radius: 4.0.into(),
+                                        },
+                                        ..Default::default()
+                                    }),
+                            )
+                        });
+                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                    }
+                }
+            };
+
+            column![
+                text("Processes").size(15),
+                filter_widget,
+                header_row,
+                body,
+                text("Type to filter  ·  click a header to sort  ·  click Kill (SIGTERM)  ·  Esc dismisses").size(11),
+            ]
+            .spacing(6)
         }
     })
     .padding(16)
-    .width(Length::Fixed(440.0))
+    .width(Length::Fixed(modal_width))
     .style(modal_style);
 
     let dialog = mouse_area(dialog_inner).on_press(Message::NoOp);
@@ -1808,6 +2170,70 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
         .center_y(Length::Fill);
 
     stack![backdrop, centered].into()
+}
+
+/// Clickable column header for the Docker modal. Shows a `↑`/`↓` arrow on
+/// whichever column is currently the active sort.
+///
+/// Font + horizontal padding are deliberately matched to the row cells
+/// below — monospace, size 11, zero horizontal button-padding — so the
+/// column-left of every header sits at the same x as the column-left of
+/// every cell.
+fn docker_header<'a>(
+    column: DockerSortBy,
+    active: DockerSortBy,
+    dir: SortDir,
+    width: Length,
+) -> Element<'a, Message> {
+    let arrow = if active == column {
+        match dir {
+            SortDir::Asc => " ↑",
+            SortDir::Desc => " ↓",
+        }
+    } else {
+        ""
+    };
+    button(
+        text(format!("{}{}", column.label(), arrow))
+            .font(Font::MONOSPACE)
+            .size(11)
+            .width(Length::Fill),
+    )
+    .width(width)
+    .padding(Padding::from([2, 0]))
+    .style(button::text)
+    .on_press(Message::DockerToggleSort(column))
+    .into()
+}
+
+/// Clickable column header for the Processes modal. Same pattern as
+/// [`docker_header`] — monospace + zero horizontal padding so headers
+/// align with the row cells.
+fn process_header<'a>(
+    column: ProcessSortBy,
+    active: ProcessSortBy,
+    dir: SortDir,
+    width: Length,
+) -> Element<'a, Message> {
+    let arrow = if active == column {
+        match dir {
+            SortDir::Asc => " ↑",
+            SortDir::Desc => " ↓",
+        }
+    } else {
+        ""
+    };
+    button(
+        text(format!("{}{}", column.label(), arrow))
+            .font(Font::MONOSPACE)
+            .size(11)
+            .width(Length::Fill),
+    )
+    .width(width)
+    .padding(Padding::from([2, 0]))
+    .style(button::text)
+    .on_press(Message::ProcessToggleSort(column))
+    .into()
 }
 
 fn modal_style(theme: &Theme) -> container::Style {

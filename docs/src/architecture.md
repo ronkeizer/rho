@@ -150,8 +150,43 @@ stderr verbatim. Late-arriving `DockerListLoaded` messages are dropped if
 the user has already dismissed the modal — same guard pattern as the
 per-pane generation tags described above.
 
-The modal is mouse-only in v1 (no keyboard nav on container rows). It
-isn't in the `Prompt::Open | Prompt::CommandPalette` arrow-key redirect
-arm, so the suppression block at the top of `update` swallows pane-nav
-keys while it's open. `PromptSubmit` for `Prompt::Docker` is a no-op that
-reinstates the prompt — preventing Enter from closing it accidentally.
+The modal has a filter `text_input` at the top — substring match against
+container name + image via [`filtered_containers`] in `domain.rs`. The
+input is fed through the same `PromptChanged` handler that the Open /
+Copy / CommandPalette prompts use; typing into it doesn't trigger any
+list navigation because per-row actions stay mouse-only.
+
+[`filtered_containers`]: https://github.com/ronkeizer/rho/blob/main/src/domain.rs
+
+The modal isn't in the `Prompt::Open | Prompt::CommandPalette` arrow-key
+redirect arm, so the suppression block at the top of `update` swallows
+pane-nav keys while it's open. `PromptSubmit` for `Prompt::Docker` is a
+no-op that reinstates the prompt — preventing Enter from closing it
+accidentally.
+
+## Processes integration
+
+Picking "Processes" from the command palette opens `Prompt::Processes`,
+a near-mirror of the Docker modal. Same three-state machine
+(`ProcessesState::Loading | Loaded(Vec<Process>) | Error(String)`), same
+modal-on-top stacking, same filter `text_input`, same one-shot
+`PromptSubmit` no-op.
+
+Two subprocess interactions, both in `fs_ops.rs`:
+
+- `ps_task` runs `ps -axo pid=,pcpu=,pmem=,comm=` inside
+  `spawn_blocking`. The column order is load-bearing: `comm` comes
+  **last** because Mac-style command names (`Google Chrome Helper
+  (Renderer)`) can contain spaces. The parser in `domain.rs`
+  (`parse_ps_output`) splits the first three tokens on whitespace and
+  keeps everything after the third boundary as the name. Results are
+  sorted by CPU descending before they're handed back to the App.
+- `kill_process_task` runs `kill <pid>` (SIGTERM, deliberately polite).
+  On completion the App re-issues `ps_task` so the killed process
+  disappears.
+
+Both functions are `#[cfg(unix)]`. On Windows the stubs return a
+"not supported on this platform" string that the modal surfaces in place
+of the list — wiring up `tasklist` and `taskkill` is left for later. The
+modal-open suppression handles arrow keys the same way as the Docker
+modal, and `PromptSubmit` for `Prompt::Processes` is the same no-op.
