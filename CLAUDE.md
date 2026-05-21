@@ -4,15 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`fm` is a cross-platform dual-pane file manager (fman/Total Commander style) written in Rust on top of `iced 0.13`. The entire app lives in a single binary crate; `src/main.rs` is currently ~1500 lines and divided into sections delimited by `// -----` headers (Configuration, Domain types, Messages, App, Async tasks, View helpers).
+`fm` is a cross-platform dual-pane file manager (fman/Total Commander style) written in Rust on top of `iced 0.13`. A single binary crate split into four modules:
+
+- `src/config.rs` — `~/.fm.yaml` settings (with hot reload), `~/.fm-state.yaml` session restore, color parsing, editor/Quick Look launchers, `home_dir`/`expand_tilde`.
+- `src/domain.rs` — pure types with no iced widget code: `Side`, `SortBy`/`SortDir`, `Entry`, `Pane` (selection/filter/sort), `Prompt` + focus enums, `PaletteAction`, `GitInfo`, `sort_entries`. Unit-tested in isolation.
+- `src/fs_ops.rs` — directory streaming (`load_dir_task`), copy/delete (`copy_task`, `delete_task`, `copy_recursive`, `delete_path`), git probe (`git_info_task`, `gather_git_info`), file-watch subscription. Everything that returns `Task<Message>` / `Subscription<Message>` lives here.
+- `src/main.rs` — `App` state, the central `Message` enum, the `update`/`view`/`subscription` glue, and the view helpers (`view_pane`, `view_modal`, `build_row`, `compute_row_style`, layout math, formatters). Sections inside still use `// -----` headers.
 
 ## Commands
 
 - `cargo run` — launch the app
 - `cargo check` — preferred during edits; full builds take ~15s on cold cache because of iced's dep tree, type-check is fast
 - `cargo build --release` — release binary
+- `cargo test` — 94 unit tests across `config`, `domain`, `fs_ops`, plus view-helper tests in `main`
 
-No tests, no lint config, no CI yet.
+No lint config or CI yet.
 
 ## iced feature flag (load-bearing)
 
