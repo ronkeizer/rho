@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -5,11 +6,11 @@ use chrono::{DateTime, Local};
 use iced::alignment::Horizontal;
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+    button, column, container, mouse_area, row, scrollable, stack, text, text_input, Space,
 };
 use iced::{
-    time, window, Border, Color, Element, Font, Length, Padding, Shadow, Size,
-    Subscription, Task, Theme, Vector,
+    time, window, Border, Color, Element, Font, Length, Padding, Shadow, Size, Subscription, Task,
+    Theme, Vector,
 };
 use serde::Deserialize;
 
@@ -37,6 +38,9 @@ struct Config {
     cursor_color: Option<String>,
     mark_color: Option<String>,
     folder_color: Option<String>,
+    /// Folders to watch for new files. Each accepts a `~/` prefix. Non-recursive.
+    /// Read once at startup — editing this requires restarting the app.
+    watch_folders: Vec<String>,
 }
 
 impl Default for Config {
@@ -54,6 +58,7 @@ impl Default for Config {
             cursor_color: None,
             mark_color: None,
             folder_color: Some("#6db4ff".to_string()),
+            watch_folders: vec!["~/Downloads".to_string()],
         }
     }
 }
@@ -154,7 +159,11 @@ fn default_template_yaml() -> &'static str {
      folder_color: \"#6db4ff\"\n\
      # stripe_color: \"#1c1d1f\"\n\
      # cursor_color: \"#3a80c8\"\n\
-     # mark_color: \"#2a4a6a\"\n"
+     # mark_color: \"#2a4a6a\"\n\
+     # Folders to watch for new files. App pops up a prompt offering to switch\n\
+     # a pane to that folder. Non-recursive. Restart to apply changes.\n\
+     watch_folders:\n\
+     \x20\x20- \"~/Downloads\"\n"
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,7 +207,12 @@ fn blend(a: Color, b: Color, t: f32) -> Color {
 /// muted compared to a "regular" file. Used both for the name widget (which
 /// may have a folder-color override) and for the row's default text color.
 fn dim(c: Color) -> Color {
-    Color { r: c.r * 0.55, g: c.g * 0.55, b: c.b * 0.55, a: c.a }
+    Color {
+        r: c.r * 0.55,
+        g: c.g * 0.55,
+        b: c.b * 0.55,
+        a: c.a,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,12 +287,29 @@ enum RowVisual {
     Marked,
 }
 
-/// The three modal flavors. Each carries the data the modal needs.
+/// Modal flavors. Each carries the data the modal needs.
 #[derive(Debug, Clone)]
 enum Prompt {
-    Open { input: String },
-    Copy { input: String },
-    Delete { paths: Vec<PathBuf>, focus: DeleteFocus },
+    Open {
+        input: String,
+    },
+    Copy {
+        input: String,
+    },
+    Delete {
+        paths: Vec<PathBuf>,
+        focus: DeleteFocus,
+    },
+    /// Filesystem watcher noticed new files in a watched folder; ask the user
+    /// whether to open the folder in one of the panes.
+    NewFiles {
+        folder: PathBuf,
+        files: Vec<String>,
+        focus: NewFilesFocus,
+    },
+    CommandPalette {
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,12 +327,56 @@ impl DeleteFocus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewFilesFocus {
+    No,
+    Left,
+    Right,
+}
+
+impl NewFilesFocus {
+    fn next(self) -> Self {
+        match self {
+            NewFilesFocus::No => NewFilesFocus::Left,
+            NewFilesFocus::Left => NewFilesFocus::Right,
+            NewFilesFocus::Right => NewFilesFocus::No,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteAction {
+    Copy,
+    Delete,
+    Exit,
+}
+
+impl PaletteAction {
+    const ALL: &'static [PaletteAction] = &[
+        PaletteAction::Copy,
+        PaletteAction::Delete,
+        PaletteAction::Exit,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PaletteAction::Copy => "Copy",
+            PaletteAction::Delete => "Delete",
+            PaletteAction::Exit => "Exit",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GitInfo {
     branch: String,
     uncommitted: usize,
     ahead: usize,
     behind: usize,
+    /// Names within the current pane directory that have uncommitted changes.
+    /// For files, the name matches directly; for directories, at least one
+    /// descendant has changes (we collapse subpaths to their first segment).
+    modified_names: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -328,6 +403,11 @@ struct Pane {
     load_generation: u64,
     /// Result of the async git probe, if this directory is inside a git repo.
     git_info: Option<GitInfo>,
+    /// Name of an entry the cursor should land on as soon as it appears in
+    /// the streaming load. Used to focus on a newly-detected file after the
+    /// "new files" modal opens its folder. Cleared on `navigate()`, or when
+    /// the entry has been located.
+    pending_focus: Option<String>,
 }
 
 impl Pane {
@@ -346,6 +426,7 @@ impl Pane {
             loading: true,
             load_generation: 0,
             git_info: None,
+            pending_focus: None,
         }
     }
 
@@ -361,6 +442,9 @@ impl Pane {
         self.loading = true;
         self.load_generation += 1;
         self.git_info = None;
+        // A fresh navigation overrides any in-flight focus request. The caller
+        // re-sets pending_focus *after* navigate() if it wants one.
+        self.pending_focus = None;
         self.load_generation
     }
 
@@ -368,10 +452,24 @@ impl Pane {
         if chunk.is_empty() {
             return;
         }
-        let prior = self.cursor_name();
+        // `pending_focus` (set by the caller, e.g. NewFilesPickSide) wins over
+        // the natural "preserve previous cursor" behavior — we want the cursor
+        // to *land on* the new file as soon as it shows up in any chunk.
+        let preserve = self.pending_focus.clone().or_else(|| self.cursor_name());
         self.entries.append(&mut chunk);
-        sort_entries(&mut self.entries, self.sort_by, self.sort_dir);
-        self.recompute_visible(prior.as_deref());
+        // Sorting is deferred to EntriesDone so we don't re-sort the growing
+        // list on every chunk (which would be O(n² log n) total work on the
+        // main thread and stall keyboard events like F5).
+        self.recompute_visible(preserve.as_deref());
+
+        // Clear the focus request once we've actually positioned the cursor
+        // on the requested entry. If the chunk didn't include it yet, leave
+        // pending_focus set so the next chunk can retry.
+        if let Some(target) = &self.pending_focus {
+            if self.cursor_name().as_deref() == Some(target.as_str()) {
+                self.pending_focus = None;
+            }
+        }
     }
 
     /// Rebuild `visible_indices` from `entries` and the current filter, then
@@ -394,9 +492,7 @@ impl Pane {
                     // sensible results while typing things like "(".
                     let needle = self.filter.to_lowercase();
                     (0..self.entries.len())
-                        .filter(|&i| {
-                            self.entries[i].name.to_lowercase().contains(&needle)
-                        })
+                        .filter(|&i| self.entries[i].name.to_lowercase().contains(&needle))
                         .collect()
                 }
             }
@@ -406,9 +502,7 @@ impl Pane {
             Some(name) => self
                 .visible_indices
                 .iter()
-                .position(|&i| {
-                    self.entries.get(i).map(|e| e.name.as_str()) == Some(name)
-                })
+                .position(|&i| self.entries.get(i).map(|e| e.name.as_str()) == Some(name))
                 .map(|p| p + 1)
                 .unwrap_or(0),
             None => {
@@ -488,21 +582,31 @@ impl Pane {
 }
 
 fn sort_entries(entries: &mut [Entry], by: SortBy, dir: SortDir) {
-    entries.sort_by(|a, b| {
-        let dir_cmp = b.is_dir.cmp(&a.is_dir);
-        if dir_cmp != std::cmp::Ordering::Equal {
-            return dir_cmp;
+    use std::cmp::Reverse;
+    // Dirs always sort before files; within each group sort by the chosen
+    // column. sort_by_cached_key computes the key once per element (O(n)
+    // allocations for the Name case) instead of on every pairwise comparison
+    // (O(n log n) allocations with the old sort_by approach).
+    match (by, dir) {
+        (SortBy::Name, SortDir::Asc) => {
+            entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
         }
-        let ord = match by {
-            SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            SortBy::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
-            SortBy::Modified => a.modified.cmp(&b.modified),
-        };
-        match dir {
-            SortDir::Asc => ord,
-            SortDir::Desc => ord.reverse(),
+        (SortBy::Name, SortDir::Desc) => {
+            entries.sort_by_cached_key(|e| (!e.is_dir, Reverse(e.name.to_lowercase())));
         }
-    });
+        (SortBy::Size, SortDir::Asc) => {
+            entries.sort_by_key(|e| (!e.is_dir, e.size.unwrap_or(0)));
+        }
+        (SortBy::Size, SortDir::Desc) => {
+            entries.sort_by_key(|e| (!e.is_dir, Reverse(e.size.unwrap_or(0))));
+        }
+        (SortBy::Modified, SortDir::Asc) => {
+            entries.sort_by_key(|e| (!e.is_dir, e.modified));
+        }
+        (SortBy::Modified, SortDir::Desc) => {
+            entries.sort_by_key(|e| (!e.is_dir, Reverse(e.modified)));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +642,16 @@ enum Message {
     CopyFinished(Vec<(PathBuf, Result<(), String>)>),
     DeleteFinished(Vec<(PathBuf, Result<(), String>)>),
     Resized(Size),
+    /// The watcher subscription noticed new files in `folder`.
+    NewFilesDetected(PathBuf, Vec<String>),
+    /// User picked a pane in the NewFiles modal.
+    NewFilesPickSide(Side),
+    /// Open the command-palette modal (Cmd+Shift+P).
+    OpenCommandPalette,
+    /// Move the palette cursor by `delta` rows (wraps).
+    PaletteMove(i32),
+    /// User selected an action from the command palette.
+    PaletteSelect(PaletteAction),
     NoOp,
 }
 
@@ -558,6 +672,9 @@ struct App {
     copy_in_progress: Option<(usize, PathBuf)>,
     /// File count while a delete task is in flight.
     delete_in_progress: Option<usize>,
+    /// New-file detections that arrived while another modal was open. Drained
+    /// FIFO when the current modal closes.
+    pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
 }
 
 impl App {
@@ -594,6 +711,7 @@ impl App {
             settings_mtime,
             copy_in_progress: None,
             delete_in_progress: None,
+            pending_new_files: std::collections::VecDeque::new(),
         };
         // Pane::empty starts at load_generation 0; the initial loads tag
         // their chunks the same way so they're accepted.
@@ -665,13 +783,26 @@ impl App {
 
         if let Some(y) = target {
             pane.scroll_y = y;
-            scrollable::scroll_to(
-                scroll_id(side),
-                scrollable::AbsoluteOffset { x: 0.0, y },
-            )
+            scrollable::scroll_to(scroll_id(side), scrollable::AbsoluteOffset { x: 0.0, y })
         } else {
             Task::none()
         }
+    }
+
+    /// Force-scroll `side`'s pane so its selected row sits roughly a third of
+    /// the way down the viewport. Used right after a `pending_focus` request
+    /// is resolved — `ensure_active_visible` is too conservative there because
+    /// `pane.scroll_y` may be stale from before the navigation.
+    fn scroll_to_focused(&mut self, side: Side) -> Task<Message> {
+        let fallback_vh = viewport_height_estimate(self.window_size.height);
+        let stride = self.config.row_height_px;
+        let pane = self.pane_mut(side);
+        let vh = pane.viewport_height.unwrap_or(fallback_vh);
+        let row_top = pane.selected as f32 * stride;
+        // Leave some context above the file so it's not glued to the top edge.
+        let y = (row_top - vh / 3.0).max(0.0);
+        pane.scroll_y = y;
+        scrollable::scroll_to(scroll_id(side), scrollable::AbsoluteOffset { x: 0.0, y })
     }
 
     fn reload_both_panes(&mut self) -> Task<Message> {
@@ -686,22 +817,48 @@ impl App {
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
-        // The delete confirmation modal has no text_input, so navigation keys
-        // fall through to top-level messages. Rewrite them to focus-aware
-        // actions so the user can drive the dialog with the keyboard alone:
-        // Enter activates whichever button is focused, Tab/←/→ flip focus.
-        let msg = if let Some(Prompt::Delete { focus, .. }) = &self.prompt {
-            let focus = *focus;
-            match msg {
-                Message::ActivateSelection => match focus {
-                    DeleteFocus::Confirm => Message::PromptSubmit,
-                    DeleteFocus::Cancel => Message::PromptCancel,
-                },
-                Message::SwitchSide => Message::SwitchPromptFocus,
-                _ => msg,
+        // Modals without a text_input let navigation keys fall through to
+        // top-level messages. Rewrite them to focus-aware actions so the user
+        // can drive the dialog with the keyboard alone: Enter activates the
+        // focused button, Tab/←/→ flip focus.
+        let msg = match (&self.prompt, msg) {
+            (Some(Prompt::Delete { focus, .. }), m) => {
+                let focus = *focus;
+                match m {
+                    Message::ActivateSelection => match focus {
+                        DeleteFocus::Confirm => Message::PromptSubmit,
+                        DeleteFocus::Cancel => Message::PromptCancel,
+                    },
+                    Message::SwitchSide => Message::SwitchPromptFocus,
+                    other => other,
+                }
             }
-        } else {
-            msg
+            (Some(Prompt::NewFiles { focus, .. }), m) => {
+                let focus = *focus;
+                match m {
+                    Message::ActivateSelection => match focus {
+                        NewFilesFocus::No => Message::PromptCancel,
+                        NewFilesFocus::Left => Message::NewFilesPickSide(Side::Left),
+                        NewFilesFocus::Right => Message::NewFilesPickSide(Side::Right),
+                    },
+                    Message::SwitchSide => Message::SwitchPromptFocus,
+                    other => other,
+                }
+            }
+            (Some(Prompt::CommandPalette { selected }), m) => {
+                let selected = *selected;
+                match m {
+                    // Enter activates the currently highlighted action.
+                    Message::ActivateSelection => {
+                        Message::PaletteSelect(PaletteAction::ALL[selected])
+                    }
+                    // Arrow keys + Tab cycle the selection (handled as PaletteMove).
+                    Message::MoveSelection(delta, _) => Message::PaletteMove(delta),
+                    Message::SwitchSide => Message::PaletteMove(1),
+                    other => other,
+                }
+            }
+            (_, m) => m,
         };
 
         // While *any* modal is open, suppress pane-nav keys that text_input
@@ -716,6 +873,7 @@ impl App {
                 | Message::OpenFile
                 | Message::OpenCopyPrompt
                 | Message::OpenDeletePrompt
+                | Message::OpenCommandPalette
                 | Message::FilterAppend(..) => return Task::none(),
                 _ => {}
             }
@@ -754,9 +912,7 @@ impl App {
                         return Task::none();
                     }
                 }
-                if let Some(parent) =
-                    self.pane(side).path.parent().map(|p| p.to_path_buf())
-                {
+                if let Some(parent) = self.pane(side).path.parent().map(|p| p.to_path_buf()) {
                     return self.navigate(side, parent);
                 }
             }
@@ -825,11 +981,11 @@ impl App {
                     });
                 }
             }
-            Message::SwitchPromptFocus => {
-                if let Some(Prompt::Delete { focus, .. }) = self.prompt.as_mut() {
-                    *focus = focus.toggle();
-                }
-            }
+            Message::SwitchPromptFocus => match self.prompt.as_mut() {
+                Some(Prompt::Delete { focus, .. }) => *focus = focus.toggle(),
+                Some(Prompt::NewFiles { focus, .. }) => *focus = focus.next(),
+                _ => {}
+            },
             Message::OpenSettingsFile => {
                 ensure_settings_file();
                 let path = settings_path();
@@ -852,17 +1008,21 @@ impl App {
                         Prompt::Open { input } | Prompt::Copy { input } => {
                             *input = value;
                         }
-                        Prompt::Delete { .. } => {}
+                        Prompt::Delete { .. }
+                        | Prompt::NewFiles { .. }
+                        | Prompt::CommandPalette { .. } => {}
                     }
                 }
             }
             Message::PromptSubmit => {
-                if let Some(prompt) = self.prompt.take() {
+                let task = if let Some(prompt) = self.prompt.take() {
                     match prompt {
                         Prompt::Open { input } => {
                             let path = PathBuf::from(expand_tilde(input.trim()));
                             if path.is_dir() {
-                                return self.navigate(self.active, path);
+                                Some(self.navigate(self.active, path))
+                            } else {
+                                None
                             }
                         }
                         Prompt::Copy { input } => {
@@ -870,24 +1030,42 @@ impl App {
                             if dest.is_dir() {
                                 let srcs = self.pane(self.active).marked_paths();
                                 if !srcs.is_empty() {
-                                    self.copy_in_progress =
-                                        Some((srcs.len(), dest.clone()));
-                                    return copy_task(srcs, dest);
+                                    self.copy_in_progress = Some((srcs.len(), dest.clone()));
+                                    Some(copy_task(srcs, dest))
+                                } else {
+                                    None
                                 }
+                            } else {
+                                None
                             }
                         }
                         Prompt::Delete { paths, .. } => {
                             if !paths.is_empty() {
                                 self.delete_in_progress = Some(paths.len());
-                                return delete_task(paths);
+                                Some(delete_task(paths))
+                            } else {
+                                None
                             }
                         }
+                        // NewFiles uses NewFilesPickSide / PromptCancel, never
+                        // PromptSubmit. If we somehow get here, just drop it.
+                        Prompt::NewFiles { .. } => None,
+                        // CommandPalette has its own action messages; PromptSubmit
+                        // is a no-op here.
+                        Prompt::CommandPalette { .. } => None,
                     }
+                } else {
+                    None
+                };
+                self.show_next_pending();
+                if let Some(t) = task {
+                    return t;
                 }
             }
             Message::PromptCancel => {
                 if self.prompt.is_some() {
                     self.prompt = None;
+                    self.show_next_pending();
                 } else {
                     // No modal — Esc clears the active pane's filter.
                     let side = self.active;
@@ -907,15 +1085,28 @@ impl App {
                 pane.recompute_visible(prior.as_deref());
             }
             Message::EntriesChunk(side, generation, chunk) => {
+                // Read pending-focus state *before* the append, so we can
+                // detect when this chunk is the one that resolves the focus
+                // request and force a scroll in that case.
+                let had_pending = self.pane(side).pending_focus.is_some();
                 let pane = self.pane_mut(side);
                 if pane.load_generation == generation {
                     pane.append_chunk(chunk);
+                    if had_pending && self.pane(side).pending_focus.is_none() {
+                        return self.scroll_to_focused(side);
+                    }
                     return self.ensure_active_visible();
                 }
             }
             Message::EntriesDone(side, generation) => {
                 let pane = self.pane_mut(side);
                 if pane.load_generation == generation {
+                    // All chunks have arrived — sort once now that the list is
+                    // complete. This is O(n log n) total instead of the
+                    // O(n² log n) that resulted from sorting in append_chunk.
+                    let preserve = pane.cursor_name();
+                    sort_entries(&mut pane.entries, pane.sort_by, pane.sort_dir);
+                    pane.recompute_visible(preserve.as_deref());
                     pane.loading = false;
                 }
             }
@@ -955,9 +1146,86 @@ impl App {
             Message::Resized(size) => {
                 self.window_size = size;
             }
+            Message::NewFilesDetected(folder, files) => {
+                if files.is_empty() {
+                    // Shouldn't happen — the watcher only emits non-empty
+                    // batches — but guard so a stray empty event doesn't pop
+                    // an empty modal.
+                } else if self.prompt.is_none() {
+                    self.prompt = Some(Prompt::NewFiles {
+                        folder,
+                        files,
+                        focus: NewFilesFocus::No,
+                    });
+                } else {
+                    self.pending_new_files.push_back((folder, files));
+                }
+            }
+            Message::NewFilesPickSide(side) => {
+                if let Some(Prompt::NewFiles { folder, files, .. }) = self.prompt.take() {
+                    let task = self.navigate(side, folder);
+                    // The watcher accumulates names in arrival order within a
+                    // burst, so `.last()` is the most-recently-added file.
+                    // navigate() just cleared pending_focus; set it after.
+                    if let Some(latest) = files.last().cloned() {
+                        self.pane_mut(side).pending_focus = Some(latest);
+                    }
+                    self.active = side;
+                    self.save_state();
+                    self.show_next_pending();
+                    return task;
+                }
+            }
+            Message::OpenCommandPalette => {
+                self.prompt = Some(Prompt::CommandPalette { selected: 0 });
+            }
+            Message::PaletteMove(delta) => {
+                if let Some(Prompt::CommandPalette { selected }) = self.prompt.as_mut() {
+                    let n = PaletteAction::ALL.len() as i32;
+                    *selected = ((*selected as i32 + delta).rem_euclid(n)) as usize;
+                }
+            }
+            Message::PaletteSelect(action) => {
+                self.prompt = None;
+                match action {
+                    PaletteAction::Copy => {
+                        let other = self.active.other();
+                        let dest = self.pane(other).path.display().to_string();
+                        self.prompt = Some(Prompt::Copy { input: dest });
+                        return text_input::focus(text_input::Id::new(PROMPT_ID));
+                    }
+                    PaletteAction::Delete => {
+                        let paths = self.pane(self.active).marked_paths();
+                        if !paths.is_empty() {
+                            self.prompt = Some(Prompt::Delete {
+                                paths,
+                                focus: DeleteFocus::Cancel,
+                            });
+                        }
+                    }
+                    PaletteAction::Exit => {
+                        return window::get_oldest().and_then(window::close);
+                    }
+                }
+            }
             Message::NoOp => {}
         }
         Task::none()
+    }
+
+    /// If the currently-displayed modal has just closed and we have queued
+    /// new-file detections waiting, surface the next one.
+    fn show_next_pending(&mut self) {
+        if self.prompt.is_some() {
+            return;
+        }
+        if let Some((folder, files)) = self.pending_new_files.pop_front() {
+            self.prompt = Some(Prompt::NewFiles {
+                folder,
+                files,
+                focus: NewFilesFocus::No,
+            });
+        }
     }
 
     /// Returns a transient status string when something async is happening.
@@ -967,20 +1235,18 @@ impl App {
     fn status_text(&self) -> Option<String> {
         if let Some((count, dest)) = &self.copy_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
-            return Some(format!(
-                "Copying {} {} to {}…",
-                count,
-                noun,
-                dest.display()
-            ));
+            return Some(format!("Copying {} {} to {}…", count, noun, dest.display()));
         }
         if let Some(count) = self.delete_in_progress {
             let noun = if count == 1 { "file" } else { "files" };
             return Some(format!("Deleting {} {}…", count, noun));
         }
         if self.left.loading || self.right.loading {
-            let loading_side =
-                if self.left.loading { Side::Left } else { Side::Right };
+            let loading_side = if self.left.loading {
+                Side::Left
+            } else {
+                Side::Right
+            };
             let p = self.pane(loading_side);
             return Some(format!("Loading {}…", p.path.display()));
         }
@@ -998,6 +1264,7 @@ impl App {
                 name_max,
                 &self.config,
                 colors,
+                self.window_size.height,
             ),
             view_pane(
                 Side::Right,
@@ -1006,6 +1273,7 @@ impl App {
                 name_max,
                 &self.config,
                 colors,
+                self.window_size.height,
             ),
         ]
         .spacing(8)
@@ -1014,7 +1282,11 @@ impl App {
         let marks = {
             let p = self.pane(self.active);
             let n = p.marked_paths().len();
-            if n > 1 { format!("{} marked", n) } else { String::new() }
+            if n > 1 {
+                format!("{} marked", n)
+            } else {
+                String::new()
+            }
         };
         let hints = text(format!(
             "Active: {}{}{}   ·   ⌘P go to folder  ·  ⌘, settings  ·  F4 open  ·  F5 copy  ·  Delete  ·  ↑↓/PgUp/PgDn (+Shift extend)  ·  Tab switch  ·  Backspace up",
@@ -1054,12 +1326,11 @@ impl App {
                 .into(),
         };
 
-        let base: Element<'_, Message> =
-            container(column![panes, hints, status_bar].spacing(6))
-                .padding(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+        let base: Element<'_, Message> = container(column![panes, hints, status_bar].spacing(6))
+            .padding(8)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
         if let Some(prompt) = &self.prompt {
             stack![base, view_modal(prompt)].into()
@@ -1074,6 +1345,11 @@ impl App {
                 return Some(Message::ShiftChanged(true));
             }
             match key {
+                Key::Character(ref c)
+                    if mods.command() && mods.shift() && c.eq_ignore_ascii_case("p") =>
+                {
+                    Some(Message::OpenCommandPalette)
+                }
                 Key::Character(ref c) if mods.command() && c.eq_ignore_ascii_case("p") => {
                     Some(Message::OpenPrompt)
                 }
@@ -1081,12 +1357,8 @@ impl App {
                     Some(Message::OpenSettingsFile)
                 }
                 Key::Named(Named::Escape) => Some(Message::PromptCancel),
-                Key::Named(Named::ArrowUp) => {
-                    Some(Message::MoveSelection(-1, mods.shift()))
-                }
-                Key::Named(Named::ArrowDown) => {
-                    Some(Message::MoveSelection(1, mods.shift()))
-                }
+                Key::Named(Named::ArrowUp) => Some(Message::MoveSelection(-1, mods.shift())),
+                Key::Named(Named::ArrowDown) => Some(Message::MoveSelection(1, mods.shift())),
                 Key::Named(Named::PageUp) => Some(Message::PageMove(-1, mods.shift())),
                 Key::Named(Named::PageDown) => Some(Message::PageMove(1, mods.shift())),
                 // ←/→ are only meaningful inside the Delete modal; in main
@@ -1103,9 +1375,7 @@ impl App {
                 // Plain character keys (no Ctrl/Cmd/Alt) feed the type-to-filter.
                 // The earlier Cmd+P / Cmd+, guards have already matched before
                 // we get here, so unmodified characters fall through to this.
-                Key::Character(c)
-                    if !mods.command() && !mods.control() && !mods.alt() =>
-                {
+                Key::Character(c) if !mods.command() && !mods.control() && !mods.alt() => {
                     Some(Message::FilterAppend(c.to_string()))
                 }
                 _ => None,
@@ -1119,10 +1389,25 @@ impl App {
 
         let resizes = window::resize_events().map(|(_, size)| Message::Resized(size));
 
-        let settings_poll =
-            time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
+        let settings_poll = time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
 
-        Subscription::batch([key_press, key_release, resizes, settings_poll])
+        let mut subs = vec![key_press, key_release, resizes, settings_poll];
+
+        // Watch folders are read once at startup (same lifecycle as window
+        // size). Filter out paths that don't exist so notify::watch() doesn't
+        // log a misleading error.
+        let watched: Vec<PathBuf> = self
+            .config
+            .watch_folders
+            .iter()
+            .map(|s| PathBuf::from(expand_tilde(s)))
+            .filter(|p| p.is_dir())
+            .collect();
+        if !watched.is_empty() {
+            subs.push(file_watch_subscription(watched));
+        }
+
+        Subscription::batch(subs)
     }
 }
 
@@ -1160,20 +1445,18 @@ fn load_dir_task(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let metadata = entry.metadata().ok();
             let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = metadata.as_ref().and_then(|m| {
-                if m.is_file() {
-                    Some(m.len())
-                } else {
-                    None
-                }
-            });
+            let size = metadata
+                .as_ref()
+                .and_then(|m| if m.is_file() { Some(m.len()) } else { None });
             let modified = metadata.as_ref().and_then(|m| m.modified().ok());
-            batch.push(Entry { name, is_dir, size, modified });
+            batch.push(Entry {
+                name,
+                is_dir,
+                size,
+                modified,
+            });
             if batch.len() >= CHUNK_SIZE {
-                let chunk = std::mem::replace(
-                    &mut batch,
-                    Vec::with_capacity(CHUNK_SIZE),
-                );
+                let chunk = std::mem::replace(&mut batch, Vec::with_capacity(CHUNK_SIZE));
                 // If the receiver was dropped (e.g. a newer load superseded
                 // this one), bail out — no point reading the rest.
                 if tx.blocking_send(chunk).is_err() {
@@ -1188,13 +1471,139 @@ fn load_dir_task(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
     });
 
     let chunks = stream::unfold(rx, move |mut rx| async move {
-        rx.recv().await.map(|chunk| {
-            (Message::EntriesChunk(side, generation, chunk), rx)
-        })
+        rx.recv()
+            .await
+            .map(|chunk| (Message::EntriesChunk(side, generation, chunk), rx))
     });
     let done = stream::once(async move { Message::EntriesDone(side, generation) });
 
     Task::stream(chunks.chain(done))
+}
+
+/// Subscription that watches `folders` (non-recursively) for newly-created or
+/// renamed-in files and emits a `NewFilesDetected` message per folder, with a
+/// short quiet-window so a burst (e.g. unpacking an archive) is coalesced into
+/// a single modal.
+fn file_watch_subscription(folders: Vec<PathBuf>) -> Subscription<Message> {
+    use iced::futures::SinkExt;
+    use iced::stream;
+    use notify::{
+        event::ModifyKind, recommended_watcher, Event, EventKind, RecursiveMode, Watcher,
+    };
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    Subscription::run_with_id(
+        "file-watcher",
+        stream::channel(64, move |mut output| async move {
+            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Event>(256);
+
+            // notify's callback runs on its own thread (not a tokio worker),
+            // so blocking_send is the right way to hand events back to us.
+            let mut watcher = match recommended_watcher(move |res| {
+                if let Ok(event) = res {
+                    let _ = raw_tx.blocking_send(event);
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("file watcher: init failed: {}", e);
+                    return;
+                }
+            };
+
+            for folder in &folders {
+                if let Err(e) = watcher.watch(folder, RecursiveMode::NonRecursive) {
+                    eprintln!("file watcher: skipping {}: {}", folder.display(), e);
+                }
+            }
+
+            // Per-folder accumulator. `deadline` is the time at which we
+            // flush. Any incoming event pushes the deadline out by `quiet`
+            // so a burst of fast-arriving events fires one modal at the end.
+            let mut pending: HashMap<PathBuf, Vec<String>> = HashMap::new();
+            let mut deadline: Option<Instant> = None;
+            let quiet = Duration::from_millis(500);
+            let idle_timeout = Duration::from_secs(3600);
+
+            loop {
+                let wait = deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()))
+                    .unwrap_or(idle_timeout);
+
+                tokio::select! {
+                    maybe_evt = raw_rx.recv() => {
+                        let Some(event) = maybe_evt else { break };
+                        let relevant = matches!(
+                            event.kind,
+                            EventKind::Create(_)
+                                | EventKind::Modify(ModifyKind::Name(_))
+                        );
+                        if !relevant {
+                            continue;
+                        }
+                        for path in event.paths {
+                            let Some(name) = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                            else {
+                                continue;
+                            };
+                            if is_ignored_watch_filename(&name) {
+                                continue;
+                            }
+                            let Some(parent) = path.parent().map(PathBuf::from)
+                            else {
+                                continue;
+                            };
+                            // Drop events for paths outside our exact watch
+                            // set (some backends report adjacent paths).
+                            if !folders.iter().any(|f| f == &parent) {
+                                continue;
+                            }
+                            // Skip directories and stale events whose target
+                            // is already gone.
+                            if !path.is_file() {
+                                continue;
+                            }
+                            let bucket = pending.entry(parent).or_default();
+                            if !bucket.iter().any(|n| n == &name) {
+                                bucket.push(name);
+                            }
+                        }
+                        if !pending.is_empty() {
+                            deadline = Some(Instant::now() + quiet);
+                        }
+                    }
+                    _ = tokio::time::sleep(wait), if deadline.is_some() => {
+                        for (folder, files) in pending.drain() {
+                            let _ = output
+                                .send(Message::NewFilesDetected(folder, files))
+                                .await;
+                        }
+                        deadline = None;
+                    }
+                }
+            }
+
+            // Keep the watcher alive until the stream is dropped.
+            drop(watcher);
+        }),
+    )
+}
+
+/// Filenames the watcher should treat as noise: in-progress downloads (Chrome,
+/// Firefox, browsers' generic temps) and hidden files (`.DS_Store` etc).
+fn is_ignored_watch_filename(name: &str) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    let ext = name
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "crdownload" | "part" | "download" | "tmp")
 }
 
 fn copy_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
@@ -1206,15 +1615,11 @@ fn copy_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
                         let name = match src.file_name() {
                             Some(n) => n.to_owned(),
                             None => {
-                                return (
-                                    src.clone(),
-                                    Err("source has no file name".to_string()),
-                                )
+                                return (src.clone(), Err("source has no file name".to_string()))
                             }
                         };
                         let target = dest_dir.join(name);
-                        let res =
-                            copy_recursive(&src, &target).map_err(|e| e.to_string());
+                        let res = copy_recursive(&src, &target).map_err(|e| e.to_string());
                         (src, res)
                     })
                     .collect::<Vec<_>>()
@@ -1294,22 +1699,59 @@ fn gather_git_info(path: &Path) -> Option<GitInfo> {
         branch_out.trim().to_string()
     };
 
-    let status =
-        run_git(path, &["status", "--porcelain"]).unwrap_or_default();
-    let uncommitted = status.lines().filter(|l| !l.is_empty()).count();
+    // `--no-renames` keeps each line in the simple `XY path` shape so we don't
+    // have to deal with the `orig -> new` rename syntax when extracting names.
+    let status = run_git(path, &["status", "--porcelain", "--no-renames"]).unwrap_or_default();
+    let mut uncommitted = 0;
+    let mut modified_names: HashSet<String> = HashSet::new();
+    for line in status.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        uncommitted += 1;
+        // Porcelain v1: two status chars, one space, then the path.
+        if line.len() < 4 {
+            continue;
+        }
+        let raw = &line[3..];
+        // Git quotes paths containing unusual chars; the inner string is good
+        // enough for our prefix-segment match.
+        let unquoted = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(raw);
+        // Entries outside the current pane (deeper-repo paths surface as
+        // `../foo`) don't get a marker in this directory.
+        if unquoted.starts_with("../") || unquoted == ".." {
+            continue;
+        }
+        if let Some(first_seg) = unquoted.split('/').next() {
+            if !first_seg.is_empty() {
+                modified_names.insert(first_seg.to_string());
+            }
+        }
+    }
 
     // Ahead/behind requires an upstream — fall back to (0, 0) if it isn't set.
-    let (ahead, behind) =
-        run_git(path, &["rev-list", "--count", "--left-right", "HEAD...@{u}"])
-            .and_then(|s| {
-                let mut parts = s.split_whitespace();
-                let a: usize = parts.next()?.parse().ok()?;
-                let b: usize = parts.next()?.parse().ok()?;
-                Some((a, b))
-            })
-            .unwrap_or((0, 0));
+    let (ahead, behind) = run_git(
+        path,
+        &["rev-list", "--count", "--left-right", "HEAD...@{u}"],
+    )
+    .and_then(|s| {
+        let mut parts = s.split_whitespace();
+        let a: usize = parts.next()?.parse().ok()?;
+        let b: usize = parts.next()?.parse().ok()?;
+        Some((a, b))
+    })
+    .unwrap_or((0, 0));
 
-    Some(GitInfo { branch, uncommitted, ahead, behind })
+    Some(GitInfo {
+        branch,
+        uncommitted,
+        ahead,
+        behind,
+        modified_names,
+    })
 }
 
 fn run_git(path: &Path, args: &[&str]) -> Option<String> {
@@ -1336,14 +1778,32 @@ fn view_pane<'a>(
     name_max_chars: usize,
     config: &Config,
     colors: RowColors,
+    window_height: f32,
 ) -> Element<'a, Message> {
     let path_header = text(pane.path.display().to_string())
         .font(Font::MONOSPACE)
         .size(config.row_font_size);
 
+    // Match the body row's leading git-marker gutter so the "Name" header
+    // sits over the actual names rather than the marker column.
+    let name_header = row![
+        Space::with_width(Length::Fixed(config.row_font_size as f32)),
+        header_cell(
+            side,
+            "Name",
+            SortBy::Name,
+            pane,
+            Length::Fill,
+            Horizontal::Left,
+            config
+        ),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+
     let column_header = container(
         row![
-            header_cell(side, "Name", SortBy::Name, pane, Length::Fill, Horizontal::Left, config),
+            name_header,
             header_cell(
                 side,
                 "Size",
@@ -1372,6 +1832,28 @@ fn view_pane<'a>(
     });
 
     let pad_y = config.row_padding_y();
+    let stride = config.row_height_px;
+    let fallback_vh = viewport_height_estimate(window_height);
+    let vh = pane.viewport_height.unwrap_or(fallback_vh);
+
+    // Total list rows: the synthetic ".." row plus all visible entries.
+    let total_rows = 1 + pane.visible_indices.len();
+
+    // Virtual rendering: only build widgets for rows inside (or near) the
+    // current viewport. `Space` spacers above and below fill the remaining
+    // height so the scrollable's total content size — and therefore its
+    // scrollbar position — stays accurate regardless of how many entries
+    // exist. This keeps view() O(visible rows) instead of O(total entries),
+    // which is the main reason large directories stall key-press handling.
+    let first_row = (pane.scroll_y / stride).floor() as usize;
+    // +2 overdraw: ensures partial rows at the top and bottom edge of the
+    // viewport are never blank while the user scrolls.
+    let last_row = ((pane.scroll_y + vh) / stride).ceil() as usize + 2;
+    let first_row = first_row.min(total_rows);
+    let last_row = last_row.min(total_rows);
+
+    let top_space = first_row as f32 * stride;
+    let bottom_space = total_rows.saturating_sub(last_row) as f32 * stride;
 
     // ".." row — treated as a directory for color purposes, never dimmed.
     let up_visual = row_visual(pane, 0);
@@ -1389,11 +1871,19 @@ fn view_pane<'a>(
         pad_y,
         up_name_color,
         false,
+        false,
     );
 
-    let mut list = column![up].spacing(0);
-    for (visible_pos, &entry_idx) in pane.visible_indices.iter().enumerate() {
-        let row_index = visible_pos + 1;
+    let mut list = column![].spacing(0).push(Space::with_height(top_space));
+    if first_row == 0 {
+        list = list.push(up);
+    }
+    for row_idx in first_row.max(1)..last_row {
+        let visible_pos = row_idx - 1;
+        let &entry_idx = match pane.visible_indices.get(visible_pos) {
+            Some(i) => i,
+            None => break,
+        };
         let entry = match pane.entries.get(entry_idx) {
             Some(e) => e,
             None => continue,
@@ -1406,17 +1896,21 @@ fn view_pane<'a>(
         let name = truncate_with_ellipsis(&raw_name, name_max_chars);
         let size_str = entry.size.map(format_size).unwrap_or_default();
         let mod_str = entry.modified.map(format_modified).unwrap_or_default();
-        let visual = row_visual(pane, row_index);
+        let visual = row_visual(pane, row_idx);
         let name_color = folder_name_color(entry.is_dir, visual, active, colors);
-        let in_selection =
-            active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
+        let in_selection = active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
         let dim_row = entry.name.starts_with('.') && !in_selection;
+        let git_modified = pane
+            .git_info
+            .as_ref()
+            .map(|i| i.modified_names.contains(&entry.name))
+            .unwrap_or(false);
         list = list.push(build_row(
-            row_index,
+            row_idx,
             name,
             size_str,
             mod_str,
-            Message::RowClicked(side, row_index),
+            Message::RowClicked(side, row_idx),
             visual,
             active,
             config,
@@ -1424,8 +1918,10 @@ fn view_pane<'a>(
             pad_y,
             name_color,
             dim_row,
+            git_modified,
         ));
     }
+    list = list.push(Space::with_height(bottom_space));
 
     // Show a placeholder only when we have nothing to display yet. Once the
     // first streamed chunk arrives we switch to the scrollable so the user
@@ -1440,11 +1936,7 @@ fn view_pane<'a>(
             .id(scroll_id(side))
             .height(Length::Fill)
             .on_scroll(move |viewport| {
-                Message::Scrolled(
-                    side,
-                    viewport.absolute_offset().y,
-                    viewport.bounds().height,
-                )
+                Message::Scrolled(side, viewport.absolute_offset().y, viewport.bounds().height)
             })
             .into()
     };
@@ -1478,13 +1970,19 @@ fn view_pane<'a>(
         .width(Length::FillPortion(1))
         .height(Length::Fill);
 
-    mouse_area(bordered).on_press(Message::Activate(side)).into()
+    mouse_area(bordered)
+        .on_press(Message::Activate(side))
+        .into()
 }
 
 fn git_info_bar<'a>(info: &GitInfo, config: &Config) -> Element<'a, Message> {
     let mut parts: Vec<String> = vec![format!("branch: {}", info.branch)];
     if info.uncommitted > 0 {
-        let noun = if info.uncommitted == 1 { "change" } else { "changes" };
+        let noun = if info.uncommitted == 1 {
+            "change"
+        } else {
+            "changes"
+        };
         parts.push(format!("{} uncommitted {}", info.uncommitted, noun));
     }
     if info.ahead > 0 || info.behind > 0 {
@@ -1547,8 +2045,7 @@ fn folder_name_color(
     pane_active: bool,
     colors: RowColors,
 ) -> Option<Color> {
-    let in_selection =
-        pane_active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
+    let in_selection = pane_active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
     if !in_selection && is_dir {
         colors.folder
     } else {
@@ -1610,8 +2107,21 @@ fn build_row<'a>(
     pad_y: u16,
     name_color: Option<Color>,
     dim_row: bool,
+    git_modified: bool,
 ) -> Element<'a, Message> {
     let font_size = config.row_font_size;
+    // Fixed-width gutter so every row's name column aligns regardless of
+    // whether a git marker is present.
+    let git_marker_width = Length::Fixed(font_size as f32);
+    let git_marker = text(if git_modified { "●" } else { "" })
+        .font(Font::MONOSPACE)
+        .size(font_size)
+        .width(git_marker_width)
+        .style(|_theme: &Theme| iced::widget::text::Style {
+            // GitHub-ish "modified" amber, picked to stand out on both light
+            // and dark themes without further tuning.
+            color: Some(Color::from_rgb8(0xd2, 0x99, 0x22)),
+        });
     let name_widget = text(name)
         .font(Font::MONOSPACE)
         .size(font_size)
@@ -1623,16 +2133,18 @@ fn build_row<'a>(
             let resolved = match (name_color, dim_row) {
                 (Some(c), true) => Some(dim(c)),
                 (Some(c), false) => Some(c),
-                (None, true) => {
-                    Some(dim(theme.extended_palette().background.base.text))
-                }
+                (None, true) => Some(dim(theme.extended_palette().background.base.text)),
                 (None, false) => None,
             };
             iced::widget::text::Style { color: resolved }
         });
 
+    // Keep marker and name visually adjacent — the outer row's 8px spacing
+    // would otherwise push the name away from the marker.
+    let name_cell = row![git_marker, name_widget].spacing(4).width(Length::Fill);
+
     let content = row![
-        name_widget,
+        name_cell,
         text(size)
             .font(Font::MONOSPACE)
             .size(font_size)
@@ -1651,7 +2163,13 @@ fn build_row<'a>(
         .padding(Padding::from([pad_y, 8]))
         .style(move |theme: &Theme, status: button::Status| {
             compute_row_style(
-                theme, status, visual, pane_active, row_index, colors, dim_row,
+                theme,
+                status,
+                visual,
+                pane_active,
+                row_index,
+                colors,
+                dim_row,
             )
         })
         .into()
@@ -1682,13 +2200,21 @@ fn compute_row_style(
         (RowVisual::Cursor, true) => {
             let pair = palette.primary.strong;
             let bg = colors.cursor.unwrap_or(pair.color);
-            let fg = if colors.cursor.is_some() { Color::WHITE } else { pair.text };
+            let fg = if colors.cursor.is_some() {
+                Color::WHITE
+            } else {
+                pair.text
+            };
             (Some(bg.into()), fg)
         }
         (RowVisual::Marked, true) => {
             let pair = palette.primary.weak;
             let bg = colors.mark.unwrap_or(pair.color);
-            let fg = if colors.mark.is_some() { Color::WHITE } else { pair.text };
+            let fg = if colors.mark.is_some() {
+                Color::WHITE
+            } else {
+                pair.text
+            };
             (Some(bg.into()), fg)
         }
         _ => {
@@ -1729,7 +2255,9 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                     "/path/to/destination",
                     "Enter to copy  ·  Esc or click outside to cancel",
                 ),
-                Prompt::Delete { .. } => unreachable!(),
+                Prompt::Delete { .. } | Prompt::NewFiles { .. } | Prompt::CommandPalette { .. } => {
+                    unreachable!()
+                }
             };
             column![
                 text(title).size(15),
@@ -1739,6 +2267,31 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                     .on_submit(Message::PromptSubmit)
                     .padding(8),
                 text(hint).size(11),
+            ]
+            .spacing(10)
+        }
+        Prompt::CommandPalette { selected } => {
+            let actions_col = PaletteAction::ALL.iter().enumerate().fold(
+                column![].spacing(4),
+                |col, (i, action)| {
+                    let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
+                        button::primary
+                    } else {
+                        button::secondary
+                    };
+                    col.push(
+                        button(text(action.label()))
+                            .on_press(Message::PaletteSelect(*action))
+                            .padding(Padding::from([8, 20]))
+                            .width(Length::Fill)
+                            .style(style),
+                    )
+                },
+            );
+            column![
+                text("Command Palette").size(15),
+                actions_col,
+                text("↑/↓ or Tab navigate  ·  Enter activate  ·  Esc dismiss").size(11),
             ]
             .spacing(10)
         }
@@ -1785,6 +2338,77 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 text(question),
                 actions,
                 text("Tab or ←/→ switch  ·  Enter activate  ·  Esc cancel").size(11),
+            ]
+            .spacing(10)
+        }
+        Prompt::NewFiles {
+            folder,
+            files,
+            focus,
+        } => {
+            let focus = *focus;
+            let primary: fn(&Theme, button::Status) -> button::Style = button::primary;
+            let secondary: fn(&Theme, button::Status) -> button::Style = button::secondary;
+
+            let header = if files.len() == 1 {
+                format!("New file detected in {}:", folder.display())
+            } else {
+                format!(
+                    "{} new files detected in {}:",
+                    files.len(),
+                    folder.display()
+                )
+            };
+
+            // Cap the listed file count so the modal doesn't grow unbounded
+            // when a big extraction lands.
+            const MAX_LISTED: usize = 8;
+            let mut listing = String::new();
+            for name in files.iter().take(MAX_LISTED) {
+                listing.push_str("  • ");
+                listing.push_str(name);
+                listing.push('\n');
+            }
+            if files.len() > MAX_LISTED {
+                listing.push_str(&format!("  …and {} more\n", files.len() - MAX_LISTED));
+            }
+            let listing = listing.trim_end().to_string();
+
+            let actions = row![
+                button(text("No"))
+                    .on_press(Message::PromptCancel)
+                    .padding(Padding::from([6, 16]))
+                    .style(if focus == NewFilesFocus::No {
+                        primary
+                    } else {
+                        secondary
+                    }),
+                button(text("Left pane"))
+                    .on_press(Message::NewFilesPickSide(Side::Left))
+                    .padding(Padding::from([6, 16]))
+                    .style(if focus == NewFilesFocus::Left {
+                        primary
+                    } else {
+                        secondary
+                    }),
+                button(text("Right pane"))
+                    .on_press(Message::NewFilesPickSide(Side::Right))
+                    .padding(Padding::from([6, 16]))
+                    .style(if focus == NewFilesFocus::Right {
+                        primary
+                    } else {
+                        secondary
+                    }),
+            ]
+            .spacing(10);
+
+            column![
+                text("New files detected").size(15),
+                text(header),
+                text(listing).font(Font::MONOSPACE).size(12),
+                text("Would you like to switch a pane to this folder?"),
+                actions,
+                text("Tab cycles focus  ·  Enter activates  ·  Esc dismisses").size(11),
             ]
             .spacing(10)
         }
@@ -1975,8 +2599,18 @@ mod tests {
 
     #[test]
     fn blend_at_zero_returns_a() {
-        let a = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
-        let b = Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
+        let a = Color {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let b = Color {
+            r: 0.0,
+            g: 1.0,
+            b: 0.0,
+            a: 1.0,
+        };
         let result = blend(a, b, 0.0);
         assert!(approx_eq(result.r, 1.0));
         assert!(approx_eq(result.g, 0.0));
@@ -1984,8 +2618,18 @@ mod tests {
 
     #[test]
     fn blend_at_one_returns_b() {
-        let a = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
-        let b = Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
+        let a = Color {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let b = Color {
+            r: 0.0,
+            g: 1.0,
+            b: 0.0,
+            a: 1.0,
+        };
         let result = blend(a, b, 1.0);
         assert!(approx_eq(result.r, 0.0));
         assert!(approx_eq(result.g, 1.0));
@@ -1993,8 +2637,18 @@ mod tests {
 
     #[test]
     fn blend_at_midpoint() {
-        let a = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
-        let b = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+        let a = Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let b = Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        };
         let result = blend(a, b, 0.5);
         assert!(approx_eq(result.r, 0.5));
         assert!(approx_eq(result.g, 0.5));
@@ -2005,7 +2659,12 @@ mod tests {
 
     #[test]
     fn dim_scales_each_channel() {
-        let c = Color { r: 1.0, g: 0.8, b: 0.4, a: 1.0 };
+        let c = Color {
+            r: 1.0,
+            g: 0.8,
+            b: 0.4,
+            a: 1.0,
+        };
         let d = dim(c);
         assert!(approx_eq(d.r, 0.55));
         assert!(approx_eq(d.g, 0.8 * 0.55));
@@ -2358,9 +3017,24 @@ mod tests {
         let t1 = UNIX_EPOCH + Duration::from_secs(100);
         let t2 = UNIX_EPOCH + Duration::from_secs(200);
         let mut entries = vec![
-            Entry { name: "a".into(), is_dir: false, size: None, modified: Some(t2) },
-            Entry { name: "b".into(), is_dir: false, size: None, modified: None },
-            Entry { name: "c".into(), is_dir: false, size: None, modified: Some(t1) },
+            Entry {
+                name: "a".into(),
+                is_dir: false,
+                size: None,
+                modified: Some(t2),
+            },
+            Entry {
+                name: "b".into(),
+                is_dir: false,
+                size: None,
+                modified: None,
+            },
+            Entry {
+                name: "c".into(),
+                is_dir: false,
+                size: None,
+                modified: Some(t1),
+            },
         ];
         sort_entries(&mut entries, SortBy::Modified, SortDir::Asc);
         // Option<SystemTime>: None < Some(_), so the no-mtime entry sorts first.
@@ -2389,6 +3063,12 @@ mod tests {
     fn pane_with_entries(path: &str, entries: Vec<Entry>) -> Pane {
         let mut pane = Pane::empty(PathBuf::from(path));
         pane.append_chunk(entries);
+        // Simulate EntriesDone: sort once, then rebuild visible indices.
+        // append_chunk itself no longer sorts (deferred to EntriesDone so
+        // the main thread isn't doing O(n² log n) work during streaming).
+        let preserve = pane.cursor_name();
+        sort_entries(&mut pane.entries, pane.sort_by, pane.sort_dir);
+        pane.recompute_visible(preserve.as_deref());
         pane.loading = false;
         pane
     }
@@ -2423,6 +3103,7 @@ mod tests {
             uncommitted: 1,
             ahead: 0,
             behind: 0,
+            modified_names: HashSet::new(),
         });
         let gen_before = p.load_generation;
 
@@ -2718,9 +3399,11 @@ mod tests {
         p.append_chunk(vec![mk_entry("b", false, Some(1))]);
         p.append_chunk(vec![mk_entry("a", false, Some(2))]);
         assert_eq!(p.entries.len(), 2);
-        // Sorted by name ascending by default.
-        assert_eq!(p.entries[0].name, "a");
-        assert_eq!(p.entries[1].name, "b");
+        // Entries are stored in arrival order during streaming; sorting is
+        // deferred to the EntriesDone handler to avoid O(n² log n) work on
+        // the main thread. So here "b" still precedes "a".
+        assert_eq!(p.entries[0].name, "b");
+        assert_eq!(p.entries[1].name, "a");
     }
 
     #[test]

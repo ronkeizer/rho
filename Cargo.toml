@@ -8,9 +8,10 @@ iced = { version = "0.13", features = ["tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 open = "5"
 regex = "1"
+notify = "6"
 
 [dev-dependencies]
 tempfile = "3"
