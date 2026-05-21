@@ -113,3 +113,45 @@ subprocess calls: `branch --show-current`, `status --porcelain`, and
 `git_info_task` that's part of the loading_tasks batch, so info is
 fetched on every navigate and refreshed after copy/delete (because
 `reload_both_panes` routes through `navigate()`).
+
+## Docker integration
+
+The "Docker containers" palette action opens a modal driven by a
+three-state machine — `DockerState::Loading | Loaded(Vec<DockerContainer>)
+| Error(String)`. The state lives inside the `Prompt::Docker` variant so
+it follows the same `Option<Prompt>` lifecycle as every other modal.
+
+Three subprocess interactions, all in `fs_ops.rs`:
+
+- `docker_ps_task` runs `docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}'`
+  inside `spawn_blocking` and returns a `Message::DockerListLoaded(Result<…>)`.
+  The format string and `splitn(4, '|')` parser are kept in sync — the
+  parser lives in `domain.rs` as `parse_docker_ps` so it's reachable from
+  unit tests without invoking Docker.
+- `docker_kill_task` runs `docker kill <id>` and returns
+  `Message::DockerKillFinished(id, Result<…>)`. On completion the update
+  handler re-issues `docker_ps_task` so the killed container disappears
+  (or sticks around with a fresh status if the kill failed).
+- `docker_shell` is **synchronous** — it just spawns a terminal and
+  doesn't follow the child's lifetime. Per-OS:
+  - macOS: `osascript` with `tell app "Terminal" to do script "..."`. The
+    ID is run through `shell_quote` (a tiny `\` / `"` escaper) so a
+    well-formed AppleScript string is always produced even if Docker
+    ever loosens its ID/name character set.
+  - Linux: `x-terminal-emulator -e docker exec -it <id> /bin/sh`.
+  - Windows: `cmd /C start cmd /K "docker exec -it <id> /bin/sh"`.
+  - `/bin/sh` is used rather than bash because Alpine-based images
+    typically don't ship bash.
+
+Error handling: every shell-out maps `ErrorKind::NotFound` (docker missing
+from PATH) to a friendly "Docker doesn't appear to be installed" message
+that the modal displays in place of the list, and non-zero exits surface
+stderr verbatim. Late-arriving `DockerListLoaded` messages are dropped if
+the user has already dismissed the modal — same guard pattern as the
+per-pane generation tags described above.
+
+The modal is mouse-only in v1 (no keyboard nav on container rows). It
+isn't in the `Prompt::Open | Prompt::CommandPalette` arrow-key redirect
+arm, so the suppression block at the top of `update` swallows pane-nav
+keys while it's open. `PromptSubmit` for `Prompt::Docker` is a no-op that
+reinstates the prompt — preventing Enter from closing it accidentally.
