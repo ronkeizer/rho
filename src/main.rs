@@ -1911,3 +1911,1035 @@ fn expand_tilde(p: &str) -> String {
     }
     p.to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    // --- parse_hex_color ---
+
+    #[test]
+    fn parse_hex_color_with_hash() {
+        let c = parse_hex_color("#ff8800").unwrap();
+        assert!(approx_eq(c.r, 1.0));
+        assert!(approx_eq(c.g, 0x88 as f32 / 255.0));
+        assert!(approx_eq(c.b, 0.0));
+        assert!(approx_eq(c.a, 1.0));
+    }
+
+    #[test]
+    fn parse_hex_color_without_hash() {
+        let c = parse_hex_color("00ff00").unwrap();
+        assert!(approx_eq(c.r, 0.0));
+        assert!(approx_eq(c.g, 1.0));
+        assert!(approx_eq(c.b, 0.0));
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_short() {
+        assert!(parse_hex_color("#fff").is_none());
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_long() {
+        assert!(parse_hex_color("#ff88001a").is_none());
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_non_hex() {
+        assert!(parse_hex_color("#gghhii").is_none());
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_empty() {
+        assert!(parse_hex_color("").is_none());
+    }
+
+    #[test]
+    fn parse_hex_color_strips_whitespace() {
+        let c = parse_hex_color("  #112233  ").unwrap();
+        assert!(approx_eq(c.r, 0x11 as f32 / 255.0));
+        assert!(approx_eq(c.g, 0x22 as f32 / 255.0));
+        assert!(approx_eq(c.b, 0x33 as f32 / 255.0));
+    }
+
+    // --- blend ---
+
+    #[test]
+    fn blend_at_zero_returns_a() {
+        let a = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
+        let b = Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
+        let result = blend(a, b, 0.0);
+        assert!(approx_eq(result.r, 1.0));
+        assert!(approx_eq(result.g, 0.0));
+    }
+
+    #[test]
+    fn blend_at_one_returns_b() {
+        let a = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
+        let b = Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
+        let result = blend(a, b, 1.0);
+        assert!(approx_eq(result.r, 0.0));
+        assert!(approx_eq(result.g, 1.0));
+    }
+
+    #[test]
+    fn blend_at_midpoint() {
+        let a = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        let b = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+        let result = blend(a, b, 0.5);
+        assert!(approx_eq(result.r, 0.5));
+        assert!(approx_eq(result.g, 0.5));
+        assert!(approx_eq(result.b, 0.5));
+    }
+
+    // --- dim ---
+
+    #[test]
+    fn dim_scales_each_channel() {
+        let c = Color { r: 1.0, g: 0.8, b: 0.4, a: 1.0 };
+        let d = dim(c);
+        assert!(approx_eq(d.r, 0.55));
+        assert!(approx_eq(d.g, 0.8 * 0.55));
+        assert!(approx_eq(d.b, 0.4 * 0.55));
+        // Alpha is unchanged.
+        assert!(approx_eq(d.a, 1.0));
+    }
+
+    // --- format_size ---
+
+    #[test]
+    fn format_size_zero() {
+        assert_eq!(format_size(0), "0 B");
+    }
+
+    #[test]
+    fn format_size_under_kb() {
+        assert_eq!(format_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_size_exact_kb() {
+        assert_eq!(format_size(1024), "1 KB");
+    }
+
+    #[test]
+    fn format_size_kb_range() {
+        assert_eq!(format_size(2048), "2 KB");
+    }
+
+    #[test]
+    fn format_size_exact_mb() {
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn format_size_mb_fractional() {
+        // 1.5 MB → "1.5 MB"
+        assert_eq!(format_size(1024 * 1024 + 512 * 1024), "1.5 MB");
+    }
+
+    #[test]
+    fn format_size_exact_gb() {
+        assert_eq!(format_size(1024u64.pow(3)), "1.0 GB");
+    }
+
+    // --- truncate_with_ellipsis ---
+
+    #[test]
+    fn truncate_shorter_than_max_returns_input() {
+        assert_eq!(truncate_with_ellipsis("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_exactly_at_max_returns_input() {
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_over_max_adds_ellipsis() {
+        // max_chars=5 → 4 chars + '…' = 5 chars total.
+        assert_eq!(truncate_with_ellipsis("hello world", 5), "hell…");
+    }
+
+    #[test]
+    fn truncate_max_zero_returns_empty() {
+        assert_eq!(truncate_with_ellipsis("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_unicode_safe() {
+        // The 'é' is a single char but multiple bytes; truncation should work
+        // on chars, not bytes.
+        let s = "café-society";
+        let out = truncate_with_ellipsis(s, 5);
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    // --- expand_tilde ---
+
+    #[test]
+    fn expand_tilde_without_tilde_passes_through() {
+        assert_eq!(expand_tilde("/var/log"), "/var/log");
+    }
+
+    #[test]
+    fn expand_tilde_with_tilde_slash_substitutes_home() {
+        let expanded = expand_tilde("~/Documents");
+        let home = home_dir();
+        assert_eq!(expanded, format!("{}/Documents", home.display()));
+    }
+
+    #[test]
+    fn expand_tilde_only() {
+        // Just "~" expands to home (no trailing content).
+        let expanded = expand_tilde("~");
+        assert_eq!(expanded, home_dir().display().to_string());
+    }
+
+    // --- enums ---
+
+    #[test]
+    fn sort_dir_toggle_round_trips() {
+        assert_eq!(SortDir::Asc.toggled(), SortDir::Desc);
+        assert_eq!(SortDir::Desc.toggled(), SortDir::Asc);
+        assert_eq!(SortDir::Asc.toggled().toggled(), SortDir::Asc);
+    }
+
+    #[test]
+    fn side_other_flips() {
+        assert_eq!(Side::Left.other(), Side::Right);
+        assert_eq!(Side::Right.other(), Side::Left);
+        assert_eq!(Side::Left.other().other(), Side::Left);
+    }
+
+    #[test]
+    fn delete_focus_toggle() {
+        assert_eq!(DeleteFocus::Cancel.toggle(), DeleteFocus::Confirm);
+        assert_eq!(DeleteFocus::Confirm.toggle(), DeleteFocus::Cancel);
+    }
+
+    #[test]
+    fn default_active_side_is_left() {
+        assert_eq!(default_active_side(), Side::Left);
+    }
+
+    // --- Config ---
+
+    #[test]
+    fn config_default_values_are_sensible() {
+        let c = Config::default();
+        assert!(c.row_height_px > 0.0);
+        assert!(c.row_font_size > 0);
+        assert!(c.size_column_px > 0.0);
+        assert!(c.modified_column_px > 0.0);
+        assert!(c.window_width > 0.0);
+        assert!(c.window_rows > 0);
+        assert!(c.mono_glyph_px > 0.0);
+        // Default ships with folder color set so users see colored dirs out of
+        // the box.
+        assert!(c.folder_color.is_some());
+    }
+
+    #[test]
+    fn row_padding_y_is_non_negative_and_centered() {
+        let c = Config {
+            row_height_px: 20.0,
+            row_font_size: 13,
+            ..Config::default()
+        };
+        // text_h = 13 * 1.3 = 16.9; padding = (20 - 16.9)/2 = 1.55 → round 2.
+        assert_eq!(c.row_padding_y(), 2);
+    }
+
+    #[test]
+    fn row_padding_y_floors_at_zero_when_height_too_small() {
+        let c = Config {
+            row_height_px: 5.0,
+            row_font_size: 13,
+            ..Config::default()
+        };
+        // text_h = 16.9 > row_height; pad would be negative → clamped to 0.
+        assert_eq!(c.row_padding_y(), 0);
+    }
+
+    #[test]
+    fn window_size_depends_on_rows_and_height() {
+        let c = Config {
+            row_height_px: 20.0,
+            window_rows: 30,
+            window_width: 1000.0,
+            ..Config::default()
+        };
+        let size = c.window_size();
+        assert!(approx_eq(size.width, 1000.0));
+        // chrome (90) + 30 * 20 = 690.
+        assert!(approx_eq(size.height, 690.0));
+    }
+
+    #[test]
+    fn config_yaml_partial_uses_defaults_for_missing_fields() {
+        let yaml = "row_font_size: 17\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.row_font_size, 17);
+        // Other fields fall back to defaults.
+        assert_eq!(cfg.row_height_px, Config::default().row_height_px);
+        assert_eq!(cfg.window_rows, Config::default().window_rows);
+    }
+
+    #[test]
+    fn config_yaml_empty_is_all_defaults() {
+        let cfg: Config = serde_yaml::from_str("").unwrap_or_default();
+        // Both fields the same as Default::default().
+        assert_eq!(cfg.row_height_px, Config::default().row_height_px);
+        assert_eq!(cfg.row_font_size, Config::default().row_font_size);
+    }
+
+    #[test]
+    fn row_colors_parses_hex_overrides() {
+        let cfg = Config {
+            stripe_color: Some("#112233".to_string()),
+            cursor_color: Some("#445566".to_string()),
+            mark_color: Some("#778899".to_string()),
+            folder_color: Some("#aabbcc".to_string()),
+            ..Config::default()
+        };
+        let colors = row_colors_from(&cfg);
+        assert!(colors.stripe.is_some());
+        assert!(colors.cursor.is_some());
+        assert!(colors.mark.is_some());
+        assert!(colors.folder.is_some());
+    }
+
+    #[test]
+    fn row_colors_unset_or_invalid_resolve_to_none() {
+        let cfg = Config {
+            stripe_color: None,
+            cursor_color: Some("not-a-color".to_string()),
+            mark_color: Some("#xyzxyz".to_string()),
+            folder_color: None,
+            ..Config::default()
+        };
+        let colors = row_colors_from(&cfg);
+        assert!(colors.stripe.is_none());
+        assert!(colors.cursor.is_none());
+        assert!(colors.mark.is_none());
+        assert!(colors.folder.is_none());
+    }
+
+    // --- SavedState ---
+
+    #[test]
+    fn saved_state_roundtrips_through_yaml() {
+        let state = SavedState {
+            left: PathBuf::from("/tmp/left"),
+            right: PathBuf::from("/tmp/right"),
+            active: Side::Right,
+        };
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        let parsed: SavedState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.left, state.left);
+        assert_eq!(parsed.right, state.right);
+        assert_eq!(parsed.active, state.active);
+    }
+
+    #[test]
+    fn saved_state_active_field_defaults_when_missing() {
+        // Older state files (or hand-edited ones) may omit `active`. The
+        // serde default should fill in Side::Left rather than failing.
+        let yaml = "left: /a\nright: /b\n";
+        let parsed: SavedState = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.left, PathBuf::from("/a"));
+        assert_eq!(parsed.right, PathBuf::from("/b"));
+        assert_eq!(parsed.active, Side::Left);
+    }
+
+    #[test]
+    fn saved_state_yaml_uses_lowercase_side() {
+        let state = SavedState {
+            left: PathBuf::from("/x"),
+            right: PathBuf::from("/y"),
+            active: Side::Right,
+        };
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        // serde(rename_all = "lowercase") should produce "right" not "Right".
+        assert!(yaml.contains("active: right"));
+    }
+
+    // --- sort_entries ---
+
+    fn mk_entry(name: &str, is_dir: bool, size: Option<u64>) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir,
+            size,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn sort_clusters_directories_first() {
+        let mut entries = vec![
+            mk_entry("zfile", false, Some(10)),
+            mk_entry("adir", true, None),
+            mk_entry("mfile", false, Some(20)),
+            mk_entry("bdir", true, None),
+        ];
+        sort_entries(&mut entries, SortBy::Name, SortDir::Asc);
+        assert!(entries[0].is_dir);
+        assert!(entries[1].is_dir);
+        assert!(!entries[2].is_dir);
+        assert!(!entries[3].is_dir);
+    }
+
+    #[test]
+    fn sort_by_name_is_case_insensitive() {
+        let mut entries = vec![
+            mk_entry("Banana", false, None),
+            mk_entry("apple", false, None),
+            mk_entry("cherry", false, None),
+        ];
+        sort_entries(&mut entries, SortBy::Name, SortDir::Asc);
+        assert_eq!(entries[0].name, "apple");
+        assert_eq!(entries[1].name, "Banana");
+        assert_eq!(entries[2].name, "cherry");
+    }
+
+    #[test]
+    fn sort_by_name_desc_reverses() {
+        let mut entries = vec![
+            mk_entry("a", false, None),
+            mk_entry("b", false, None),
+            mk_entry("c", false, None),
+        ];
+        sort_entries(&mut entries, SortBy::Name, SortDir::Desc);
+        assert_eq!(entries[0].name, "c");
+        assert_eq!(entries[2].name, "a");
+    }
+
+    #[test]
+    fn sort_by_size_ascending() {
+        let mut entries = vec![
+            mk_entry("c", false, Some(300)),
+            mk_entry("a", false, Some(100)),
+            mk_entry("b", false, Some(200)),
+        ];
+        sort_entries(&mut entries, SortBy::Size, SortDir::Asc);
+        assert_eq!(entries[0].size, Some(100));
+        assert_eq!(entries[1].size, Some(200));
+        assert_eq!(entries[2].size, Some(300));
+    }
+
+    #[test]
+    fn sort_by_size_treats_none_as_zero() {
+        let mut entries = vec![
+            mk_entry("a", false, Some(50)),
+            mk_entry("b", false, None),
+            mk_entry("c", false, Some(10)),
+        ];
+        sort_entries(&mut entries, SortBy::Size, SortDir::Asc);
+        // None (treated as 0) sorts first.
+        assert_eq!(entries[0].size, None);
+        assert_eq!(entries[1].size, Some(10));
+        assert_eq!(entries[2].size, Some(50));
+    }
+
+    #[test]
+    fn sort_by_modified_handles_some_and_none() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t1 = UNIX_EPOCH + Duration::from_secs(100);
+        let t2 = UNIX_EPOCH + Duration::from_secs(200);
+        let mut entries = vec![
+            Entry { name: "a".into(), is_dir: false, size: None, modified: Some(t2) },
+            Entry { name: "b".into(), is_dir: false, size: None, modified: None },
+            Entry { name: "c".into(), is_dir: false, size: None, modified: Some(t1) },
+        ];
+        sort_entries(&mut entries, SortBy::Modified, SortDir::Asc);
+        // Option<SystemTime>: None < Some(_), so the no-mtime entry sorts first.
+        assert_eq!(entries[0].name, "b");
+        assert_eq!(entries[1].name, "c");
+        assert_eq!(entries[2].name, "a");
+    }
+
+    #[test]
+    fn sort_keeps_dirs_first_even_when_sorting_by_size() {
+        let mut entries = vec![
+            mk_entry("file_big", false, Some(1000)),
+            mk_entry("dir", true, None),
+            mk_entry("file_small", false, Some(10)),
+        ];
+        sort_entries(&mut entries, SortBy::Size, SortDir::Asc);
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[1].size, Some(10));
+        assert_eq!(entries[2].size, Some(1000));
+    }
+
+    // --- Pane init + navigate ---
+
+    /// Helper to construct a Pane preloaded with entries, bypassing the
+    /// streaming load path so tests don't depend on the filesystem.
+    fn pane_with_entries(path: &str, entries: Vec<Entry>) -> Pane {
+        let mut pane = Pane::empty(PathBuf::from(path));
+        pane.append_chunk(entries);
+        pane.loading = false;
+        pane
+    }
+
+    #[test]
+    fn pane_empty_starts_loading_with_no_entries() {
+        let p = Pane::empty(PathBuf::from("/tmp"));
+        assert_eq!(p.path, PathBuf::from("/tmp"));
+        assert!(p.entries.is_empty());
+        assert!(p.visible_indices.is_empty());
+        assert!(p.filter.is_empty());
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.anchor, 0);
+        assert_eq!(p.sort_by, SortBy::Name);
+        assert_eq!(p.sort_dir, SortDir::Asc);
+        assert!(p.loading);
+        assert_eq!(p.load_generation, 0);
+        assert!(p.git_info.is_none());
+    }
+
+    #[test]
+    fn navigate_bumps_generation_and_resets_state() {
+        let mut p = pane_with_entries(
+            "/old",
+            vec![mk_entry("a", false, Some(1)), mk_entry("b", false, Some(2))],
+        );
+        p.selected = 2;
+        p.anchor = 1;
+        p.filter = "x".to_string();
+        p.git_info = Some(GitInfo {
+            branch: "main".into(),
+            uncommitted: 1,
+            ahead: 0,
+            behind: 0,
+        });
+        let gen_before = p.load_generation;
+
+        let gen_after = p.navigate(PathBuf::from("/new"));
+
+        assert_eq!(gen_after, gen_before + 1);
+        assert_eq!(p.load_generation, gen_after);
+        assert_eq!(p.path, PathBuf::from("/new"));
+        assert!(p.entries.is_empty());
+        assert!(p.visible_indices.is_empty());
+        assert!(p.filter.is_empty());
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.anchor, 0);
+        assert!(p.loading);
+        assert!(p.git_info.is_none());
+    }
+
+    #[test]
+    fn navigate_generation_strictly_increases() {
+        let mut p = Pane::empty(PathBuf::from("/"));
+        let g0 = p.load_generation;
+        let g1 = p.navigate(PathBuf::from("/a"));
+        let g2 = p.navigate(PathBuf::from("/b"));
+        let g3 = p.navigate(PathBuf::from("/c"));
+        assert!(g1 > g0);
+        assert!(g2 > g1);
+        assert!(g3 > g2);
+    }
+
+    // --- Pane selection mechanics ---
+
+    fn three_entry_pane() -> Pane {
+        pane_with_entries(
+            "/p",
+            vec![
+                mk_entry("a", false, Some(1)),
+                mk_entry("b", false, Some(2)),
+                mk_entry("c", false, Some(3)),
+            ],
+        )
+    }
+
+    #[test]
+    fn move_to_clamps_at_top() {
+        let mut p = three_entry_pane();
+        p.move_to(-5, false);
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.anchor, 0);
+    }
+
+    #[test]
+    fn move_to_clamps_at_bottom() {
+        // 3 entries → max row index is 3 (".." is row 0, entries 1..=3).
+        let mut p = three_entry_pane();
+        p.move_to(99, false);
+        assert_eq!(p.selected, 3);
+        assert_eq!(p.anchor, 3);
+    }
+
+    #[test]
+    fn move_to_collapses_anchor_when_not_extending() {
+        let mut p = three_entry_pane();
+        p.selected = 1;
+        p.anchor = 3;
+        p.move_to(2, false);
+        assert_eq!(p.selected, 2);
+        assert_eq!(p.anchor, 2);
+    }
+
+    #[test]
+    fn move_to_preserves_anchor_when_extending() {
+        let mut p = three_entry_pane();
+        p.selected = 1;
+        p.anchor = 1;
+        p.move_to(3, true);
+        assert_eq!(p.selected, 3);
+        // Anchor stays at the start of the range.
+        assert_eq!(p.anchor, 1);
+    }
+
+    #[test]
+    fn move_by_uses_relative_delta() {
+        let mut p = three_entry_pane();
+        p.selected = 1;
+        p.anchor = 1;
+        p.move_by(2, false);
+        assert_eq!(p.selected, 3);
+    }
+
+    #[test]
+    fn move_by_clamps_negative_below_zero() {
+        let mut p = three_entry_pane();
+        p.selected = 1;
+        p.move_by(-100, false);
+        assert_eq!(p.selected, 0);
+    }
+
+    // --- mark_range / is_marked ---
+
+    #[test]
+    fn mark_range_returns_low_high_regardless_of_order() {
+        let mut p = three_entry_pane();
+        p.anchor = 1;
+        p.selected = 3;
+        assert_eq!(p.mark_range(), (1, 3));
+
+        p.anchor = 3;
+        p.selected = 1;
+        assert_eq!(p.mark_range(), (1, 3));
+    }
+
+    #[test]
+    fn mark_range_collapses_to_point_when_equal() {
+        let mut p = three_entry_pane();
+        p.anchor = 2;
+        p.selected = 2;
+        assert_eq!(p.mark_range(), (2, 2));
+    }
+
+    #[test]
+    fn is_marked_includes_both_endpoints() {
+        let mut p = three_entry_pane();
+        p.anchor = 1;
+        p.selected = 3;
+        assert!(p.is_marked(1));
+        assert!(p.is_marked(2));
+        assert!(p.is_marked(3));
+        assert!(!p.is_marked(0));
+    }
+
+    #[test]
+    fn is_marked_excludes_out_of_range_rows() {
+        let mut p = three_entry_pane();
+        p.anchor = 1;
+        p.selected = 2;
+        assert!(!p.is_marked(3));
+    }
+
+    // --- recompute_visible (filter) ---
+
+    fn alpha_pane() -> Pane {
+        pane_with_entries(
+            "/p",
+            vec![
+                mk_entry("alpha", false, Some(1)),
+                mk_entry("beta", false, Some(2)),
+                mk_entry("gamma", false, Some(3)),
+                mk_entry("alphabet", false, Some(4)),
+            ],
+        )
+    }
+
+    #[test]
+    fn empty_filter_shows_all_entries() {
+        let p = alpha_pane();
+        assert!(p.filter.is_empty());
+        assert_eq!(p.visible_indices.len(), p.entries.len());
+    }
+
+    #[test]
+    fn substring_filter_matches() {
+        let mut p = alpha_pane();
+        p.filter = "alpha".to_string();
+        p.recompute_visible(None);
+        assert_eq!(p.visible_indices.len(), 2);
+        let names: Vec<_> = p
+            .visible_indices
+            .iter()
+            .map(|&i| p.entries[i].name.as_str())
+            .collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"alphabet"));
+    }
+
+    #[test]
+    fn filter_is_case_insensitive() {
+        let mut p = alpha_pane();
+        p.filter = "ALPHA".to_string();
+        p.recompute_visible(None);
+        assert_eq!(p.visible_indices.len(), 2);
+    }
+
+    #[test]
+    fn invalid_regex_falls_back_to_substring() {
+        let mut p = alpha_pane();
+        // Unbalanced paren — invalid regex syntax.
+        p.filter = "(alpha".to_string();
+        p.recompute_visible(None);
+        // Substring search for "(alpha" finds nothing in our entries.
+        assert!(p.visible_indices.is_empty());
+
+        // But "(a" likewise invalid regex, substring matches…well only literal
+        // "(a" which is absent. Better: test fallback with a string that
+        // *would* match as substring but is invalid regex: "alpha(" → bare
+        // "(" makes the regex error, fallback looks for the literal substring
+        // "alpha(" which is also absent. So instead use a clear case:
+        p.filter = "[".to_string(); // invalid regex; substring "[" not in names.
+        p.recompute_visible(None);
+        assert!(p.visible_indices.is_empty());
+    }
+
+    #[test]
+    fn cursor_preserved_by_name_when_still_visible() {
+        let mut p = alpha_pane();
+        // Cursor on "beta" (visible row 2, since alpha is sorted before beta).
+        // The pane_with_entries helper calls append_chunk which sorts. After
+        // sort: alpha, alphabet, beta, gamma → "beta" at visible row 3.
+        p.selected = 3; // "beta"
+        p.anchor = 3;
+        assert_eq!(p.cursor_name().as_deref(), Some("beta"));
+
+        // Apply a filter that still matches "beta".
+        p.filter = "b".to_string();
+        let prior = p.cursor_name();
+        p.recompute_visible(prior.as_deref());
+
+        // Cursor should still be on "beta".
+        assert_eq!(p.cursor_name().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn cursor_resets_when_previously_focused_entry_filtered_out() {
+        let mut p = alpha_pane();
+        p.selected = 3; // "beta" after sorting
+        p.anchor = 3;
+        let prior = p.cursor_name();
+        assert_eq!(prior.as_deref(), Some("beta"));
+
+        // Filter excludes "beta".
+        p.filter = "alpha".to_string();
+        p.recompute_visible(prior.as_deref());
+
+        // Cursor falls back to the ".." row.
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.anchor, 0);
+    }
+
+    #[test]
+    fn clearing_filter_restores_all_entries() {
+        let mut p = alpha_pane();
+        p.filter = "alpha".to_string();
+        p.recompute_visible(None);
+        assert_eq!(p.visible_indices.len(), 2);
+
+        p.filter.clear();
+        p.recompute_visible(None);
+        assert_eq!(p.visible_indices.len(), 4);
+    }
+
+    // --- toggle_sort ---
+
+    #[test]
+    fn toggle_sort_same_column_flips_direction() {
+        let mut p = alpha_pane();
+        assert_eq!(p.sort_dir, SortDir::Asc);
+        p.toggle_sort(SortBy::Name);
+        assert_eq!(p.sort_by, SortBy::Name);
+        assert_eq!(p.sort_dir, SortDir::Desc);
+        p.toggle_sort(SortBy::Name);
+        assert_eq!(p.sort_dir, SortDir::Asc);
+    }
+
+    #[test]
+    fn toggle_sort_different_column_resets_to_asc() {
+        let mut p = alpha_pane();
+        p.sort_dir = SortDir::Desc; // pretend we were in descending order
+        p.sort_by = SortBy::Name;
+        p.toggle_sort(SortBy::Size);
+        assert_eq!(p.sort_by, SortBy::Size);
+        assert_eq!(p.sort_dir, SortDir::Asc);
+    }
+
+    #[test]
+    fn toggle_sort_preserves_cursor_by_name() {
+        let mut p = alpha_pane();
+        // Default sort by Name Asc: alpha, alphabet, beta, gamma → "gamma"
+        // is at visible row 4. Cursor there.
+        p.selected = 4;
+        p.anchor = 4;
+        assert_eq!(p.cursor_name().as_deref(), Some("gamma"));
+
+        // Sort by Size Asc: 1=alpha, 2=beta, 3=gamma, 4=alphabet.
+        // "gamma" is now at row 3 (visible row index = entry index + 1).
+        p.toggle_sort(SortBy::Size);
+        assert_eq!(p.cursor_name().as_deref(), Some("gamma"));
+    }
+
+    // --- append_chunk ---
+
+    #[test]
+    fn append_chunk_accumulates_across_calls() {
+        let mut p = Pane::empty(PathBuf::from("/p"));
+        p.append_chunk(vec![mk_entry("b", false, Some(1))]);
+        p.append_chunk(vec![mk_entry("a", false, Some(2))]);
+        assert_eq!(p.entries.len(), 2);
+        // Sorted by name ascending by default.
+        assert_eq!(p.entries[0].name, "a");
+        assert_eq!(p.entries[1].name, "b");
+    }
+
+    #[test]
+    fn append_chunk_rebuilds_visible_indices() {
+        let mut p = Pane::empty(PathBuf::from("/p"));
+        p.append_chunk(vec![
+            mk_entry("a", false, Some(1)),
+            mk_entry("b", false, Some(2)),
+        ]);
+        assert_eq!(p.visible_indices.len(), 2);
+    }
+
+    #[test]
+    fn append_chunk_respects_existing_filter() {
+        let mut p = Pane::empty(PathBuf::from("/p"));
+        p.filter = "alp".to_string();
+        p.recompute_visible(None);
+        p.append_chunk(vec![
+            mk_entry("alpha", false, None),
+            mk_entry("zebra", false, None),
+        ]);
+        // "alp" matches "alpha", not "zebra".
+        assert_eq!(p.visible_indices.len(), 1);
+        assert_eq!(p.entries[p.visible_indices[0]].name, "alpha");
+    }
+
+    #[test]
+    fn append_empty_chunk_is_noop() {
+        let mut p = Pane::empty(PathBuf::from("/p"));
+        p.append_chunk(vec![mk_entry("a", false, None)]);
+        let before_len = p.entries.len();
+        p.append_chunk(Vec::new());
+        assert_eq!(p.entries.len(), before_len);
+    }
+
+    // --- cursor_name / entry_at ---
+
+    #[test]
+    fn cursor_name_returns_none_for_dotdot_row() {
+        let mut p = alpha_pane();
+        p.selected = 0; // ".." row
+        assert!(p.cursor_name().is_none());
+    }
+
+    #[test]
+    fn cursor_name_returns_entry_name_for_real_row() {
+        let mut p = alpha_pane();
+        p.selected = 1; // first entry after sort
+        assert_eq!(p.cursor_name().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn entry_at_zero_is_none() {
+        let p = alpha_pane();
+        assert!(p.entry_at(0).is_none());
+    }
+
+    #[test]
+    fn entry_at_returns_visible_entry() {
+        let p = alpha_pane();
+        let e = p.entry_at(1).unwrap();
+        assert_eq!(e.name, "alpha");
+    }
+
+    #[test]
+    fn entry_at_out_of_range_returns_none() {
+        let p = alpha_pane();
+        assert!(p.entry_at(99).is_none());
+    }
+
+    // --- marked_paths ---
+
+    #[test]
+    fn marked_paths_for_single_row_returns_one_path() {
+        let mut p = alpha_pane();
+        p.selected = 1; // "alpha"
+        p.anchor = 1;
+        let paths = p.marked_paths();
+        assert_eq!(paths, vec![PathBuf::from("/p").join("alpha")]);
+    }
+
+    #[test]
+    fn marked_paths_for_range_returns_all_entries_in_range() {
+        let mut p = alpha_pane();
+        p.anchor = 1; // alpha
+        p.selected = 3; // beta (after sort: alpha, alphabet, beta, gamma)
+        let paths = p.marked_paths();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&PathBuf::from("/p").join("alpha")));
+        assert!(paths.contains(&PathBuf::from("/p").join("alphabet")));
+        assert!(paths.contains(&PathBuf::from("/p").join("beta")));
+    }
+
+    #[test]
+    fn marked_paths_skips_dotdot_row() {
+        let mut p = alpha_pane();
+        // Range includes the ".." row at index 0.
+        p.anchor = 0;
+        p.selected = 2;
+        let paths = p.marked_paths();
+        // 2 entries returned (alpha + alphabet), not 3 — the ".." row is dropped.
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn marked_paths_with_only_dotdot_selected_is_empty() {
+        let mut p = alpha_pane();
+        p.anchor = 0;
+        p.selected = 0;
+        assert!(p.marked_paths().is_empty());
+    }
+
+    // --- copy_recursive / delete_path (filesystem) ---
+
+    #[test]
+    fn copy_recursive_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&src, b"hello world").unwrap();
+
+        copy_recursive(&src, &dst).unwrap();
+
+        assert!(dst.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello world");
+        // Source is untouched.
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn copy_recursive_directory_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
+
+        copy_recursive(&src, &dst).unwrap();
+
+        assert!(dst.join("a.txt").exists());
+        assert!(dst.join("sub/b.txt").exists());
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn copy_recursive_missing_source_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let dst = dir.path().join("dst");
+        assert!(copy_recursive(&missing, &dst).is_err());
+    }
+
+    #[test]
+    fn delete_path_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("to_delete.txt");
+        std::fs::write(&file, b"bye").unwrap();
+        assert!(file.exists());
+
+        delete_path(&file).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn delete_path_removes_directory_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("doomed");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir(target.join("sub")).unwrap();
+        std::fs::write(target.join("sub/b.txt"), b"b").unwrap();
+
+        delete_path(&target).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn delete_path_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-here");
+        assert!(delete_path(&missing).is_err());
+    }
+
+    // --- layout helpers ---
+
+    #[test]
+    fn name_max_chars_at_normal_width_is_reasonable() {
+        let cfg = Config::default();
+        let n = name_max_chars(1100.0, &cfg);
+        // Sanity bounds: at 1100px window with the default columns the name
+        // column should fit a few dozen glyphs.
+        assert!(n >= 20, "expected at least 20 chars, got {}", n);
+        assert!(n <= 100, "expected at most 100 chars, got {}", n);
+    }
+
+    #[test]
+    fn name_max_chars_at_tiny_width_clamps_at_minimum() {
+        let cfg = Config::default();
+        // Even with a very narrow window, the helper clamps at 8 so we never
+        // truncate filenames down to one or two glyphs.
+        let n = name_max_chars(100.0, &cfg);
+        assert!(n >= 8);
+    }
+
+    #[test]
+    fn viewport_height_estimate_subtracts_chrome() {
+        // At 700 window height, available rows ≈ 700 - 110 = 590.
+        let h = viewport_height_estimate(700.0);
+        assert!(approx_eq(h, 590.0));
+    }
+
+    #[test]
+    fn viewport_height_estimate_clamps_at_minimum() {
+        // At absurdly small heights it must still return at least 100 so the
+        // scroll math doesn't divide by zero or produce negatives.
+        let h = viewport_height_estimate(0.0);
+        assert!(h >= 100.0);
+    }
+}

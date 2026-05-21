@@ -11,3 +11,6 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt", "sync"] }
 open = "5"
 regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
