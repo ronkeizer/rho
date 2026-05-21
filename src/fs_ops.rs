@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use iced::{Subscription, Task};
 
-use crate::domain::{Entry, GitInfo, Side};
+use crate::domain::{parse_docker_ps, DockerContainer, Entry, GitInfo, Side};
 use crate::Message;
 
 /// Both side-loads (directory entries + git info) for a single pane.
@@ -364,6 +364,136 @@ fn run_git(path: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// ---------------------------------------------------------------------------
+// Docker
+// ---------------------------------------------------------------------------
+
+/// Output format passed to `docker ps`. Keep in sync with [`parse_docker_ps`]
+/// — the field order and the literal `|` separator are load-bearing.
+const DOCKER_PS_FORMAT: &str = "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}";
+
+/// Fetch the list of currently-running containers. Errors (docker not
+/// installed, daemon not running) come back as `Err(message)` so the modal
+/// can show a friendly explanation instead of an empty list.
+pub fn docker_ps_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(run_docker_ps)
+                .await
+                .unwrap_or_else(|e| Err(format!("docker ps task panicked: {}", e)))
+        },
+        Message::DockerListLoaded,
+    )
+}
+
+fn run_docker_ps() -> Result<Vec<DockerContainer>, String> {
+    let output = std::process::Command::new("docker")
+        .args(["ps", "--format", DOCKER_PS_FORMAT])
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                "Docker doesn't appear to be installed (no `docker` binary in PATH).".to_string()
+            }
+            _ => format!("failed to run `docker ps`: {}", e),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let msg = if stderr.trim().is_empty() {
+            format!("`docker ps` exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(msg);
+    }
+    Ok(parse_docker_ps(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// `docker kill <id>`. Errors (e.g. container already gone) are mapped to a
+/// string the App can surface.
+pub fn docker_kill_task(id: String) -> Task<Message> {
+    Task::perform(
+        async move {
+            let id_for_task = id.clone();
+            let res = tokio::task::spawn_blocking(move || run_docker_kill(&id_for_task))
+                .await
+                .unwrap_or_else(|e| Err(format!("docker kill task panicked: {}", e)));
+            (id, res)
+        },
+        |(id, res)| Message::DockerKillFinished(id, res),
+    )
+}
+
+fn run_docker_kill(id: &str) -> Result<(), String> {
+    let output = std::process::Command::new("docker")
+        .args(["kill", id])
+        .output()
+        .map_err(|e| format!("failed to run `docker kill`: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`docker kill` exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(())
+}
+
+/// Open a new terminal window running `docker exec -it <id> /bin/sh`.
+/// `/bin/sh` is used because it's universally available (Alpine images
+/// typically lack bash). Returns once the terminal is *spawned* — we don't
+/// follow its lifetime.
+pub fn docker_shell(id: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript injects the command into a freshly-opened Terminal.app
+        // window. The `do script` form leaves the terminal sitting in the
+        // shell so the user can run extra commands after the exec ends.
+        let script = format!(
+            "tell application \"Terminal\" to do script \"docker exec -it {} /bin/sh\"",
+            shell_quote(id)
+        );
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch Terminal.app: {}", e))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Debian-ish standard alternative; on Wayland/GNOME it usually points
+        // at gnome-terminal. Other distros may need to install the
+        // x-terminal-emulator alternative or symlink something themselves.
+        std::process::Command::new("x-terminal-emulator")
+            .args(["-e", "docker", "exec", "-it", id, "/bin/sh"])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch x-terminal-emulator: {}", e))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "cmd", "/K"])
+            .arg(format!("docker exec -it {} /bin/sh", id))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch cmd: {}", e))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = id;
+        Err("opening a shell isn't supported on this platform".to_string())
+    }
+}
+
+/// Minimal escaping for embedding into AppleScript `do script "..."`.
+/// Container IDs / names are `[A-Za-z0-9_.-]+` per Docker, but defense in
+/// depth doesn't cost us anything.
+#[cfg(target_os = "macos")]
+fn shell_quote(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +568,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("not-here");
         assert!(delete_path(&missing).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shell_quote_escapes_quotes_and_backslashes() {
+        // Plain container IDs round-trip unchanged.
+        assert_eq!(shell_quote("abc123"), "abc123");
+        // Embedded double-quote / backslash are escaped so the surrounding
+        // AppleScript string stays well-formed.
+        assert_eq!(shell_quote(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(shell_quote(r"a\b"), r"a\\b");
     }
 }

@@ -92,6 +92,12 @@ pub enum Prompt {
         input: String,
         selected: usize,
     },
+    /// "Docker containers" action. Shows the currently-running containers
+    /// from `docker ps`, each with Kill and Shell buttons. The state goes
+    /// Loading → Loaded(list) / Error(msg); kills re-fetch the list.
+    Docker {
+        state: DockerState,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +136,7 @@ impl NewFilesFocus {
 pub enum PaletteAction {
     Copy,
     Delete,
+    DockerContainers,
     Exit,
 }
 
@@ -137,6 +144,7 @@ impl PaletteAction {
     pub const ALL: &'static [PaletteAction] = &[
         PaletteAction::Copy,
         PaletteAction::Delete,
+        PaletteAction::DockerContainers,
         PaletteAction::Exit,
     ];
 
@@ -144,9 +152,53 @@ impl PaletteAction {
         match self {
             PaletteAction::Copy => "Copy",
             PaletteAction::Delete => "Delete",
+            PaletteAction::DockerContainers => "Docker containers",
             PaletteAction::Exit => "Exit",
         }
     }
+}
+
+/// Snapshot of a single running container surfaced from `docker ps`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerContainer {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub status: String,
+}
+
+/// Lifecycle of the Docker containers modal. Drives both the loading
+/// placeholder and the post-load list / error states.
+#[derive(Debug, Clone)]
+pub enum DockerState {
+    Loading,
+    Loaded(Vec<DockerContainer>),
+    Error(String),
+}
+
+/// Parse output of `docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}'`.
+/// Lines with the wrong number of fields are skipped silently — we'd rather
+/// show a short list than break the modal on a malformed line.
+pub fn parse_docker_ps(stdout: &str) -> Vec<DockerContainer> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '|');
+            let id = parts.next()?.trim().to_string();
+            let name = parts.next()?.trim().to_string();
+            let image = parts.next()?.trim().to_string();
+            let status = parts.next()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            Some(DockerContainer {
+                id,
+                name,
+                image,
+                status,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1106,5 +1158,57 @@ mod tests {
         add_recent(&mut r, PathBuf::from("/a"), 10);
         add_recent(&mut r, PathBuf::from("/a"), 10);
         assert_eq!(r, vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn palette_action_docker_label() {
+        assert_eq!(PaletteAction::DockerContainers.label(), "Docker containers");
+    }
+
+    #[test]
+    fn filtered_actions_finds_docker() {
+        let out = filtered_actions("docker");
+        assert_eq!(out, vec![PaletteAction::DockerContainers]);
+    }
+
+    #[test]
+    fn parse_docker_ps_basic() {
+        let stdout = "abc123|web|nginx:latest|Up 2 hours\n\
+                      def456|db|postgres:15|Up 5 minutes (healthy)\n";
+        let out = parse_docker_ps(stdout);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "abc123");
+        assert_eq!(out[0].name, "web");
+        assert_eq!(out[0].image, "nginx:latest");
+        assert_eq!(out[0].status, "Up 2 hours");
+        assert_eq!(out[1].name, "db");
+        assert_eq!(out[1].status, "Up 5 minutes (healthy)");
+    }
+
+    #[test]
+    fn parse_docker_ps_empty_returns_empty() {
+        assert!(parse_docker_ps("").is_empty());
+        // Trailing newline shouldn't produce a phantom row.
+        assert!(parse_docker_ps("\n").is_empty());
+    }
+
+    #[test]
+    fn parse_docker_ps_skips_malformed_lines() {
+        // Line 2 has fewer than 4 fields → skipped.
+        let stdout = "abc|web|nginx|Up 1m\nshort|line\ndef|db|postgres|Up 2m\n";
+        let out = parse_docker_ps(stdout);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "abc");
+        assert_eq!(out[1].id, "def");
+    }
+
+    #[test]
+    fn parse_docker_ps_preserves_pipes_after_third() {
+        // Status strings can legitimately contain "|", and splitn(4) keeps
+        // anything past the third pipe inside the status field.
+        let stdout = "abc|web|nginx|Up 2 hours | restarting\n";
+        let out = parse_docker_ps(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, "Up 2 hours | restarting");
     }
 }

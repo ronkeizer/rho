@@ -21,10 +21,14 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, RowColors, SavedState,
 };
 use domain::{
-    add_recent, filtered_actions, filtered_recents, sort_entries, DeleteFocus, Entry, GitInfo,
-    NewFilesFocus, PaletteAction, Pane, Prompt, RowVisual, Side, SortBy, SortDir,
+    add_recent, filtered_actions, filtered_recents, sort_entries, DeleteFocus, DockerContainer,
+    DockerState, Entry, GitInfo, NewFilesFocus, PaletteAction, Pane, Prompt, RowVisual, Side,
+    SortBy, SortDir,
 };
-use fs_ops::{copy_task, delete_task, file_watch_subscription, loading_tasks};
+use fs_ops::{
+    copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
+    file_watch_subscription, loading_tasks,
+};
 
 const PROMPT_ID: &str = "prompt";
 const RECENT_CAP: usize = 50;
@@ -91,6 +95,14 @@ enum Message {
     OpenRecent(PathBuf),
     /// User clicked an action in the command palette — activate it directly.
     PaletteSelect(PaletteAction),
+    /// `docker ps` completed (or failed) for the Docker modal.
+    DockerListLoaded(Result<Vec<DockerContainer>, String>),
+    /// User clicked Kill on a container row — start the kill task.
+    DockerKill(String),
+    /// `docker kill <id>` completed.
+    DockerKillFinished(String, Result<(), String>),
+    /// User clicked Shell on a container row — spawn a terminal.
+    DockerShell(String),
     NoOp,
 }
 
@@ -477,7 +489,9 @@ impl App {
                             let n = filtered_actions(input).len();
                             *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                         }
-                        Prompt::Delete { .. } | Prompt::NewFiles { .. } => {}
+                        Prompt::Delete { .. }
+                        | Prompt::NewFiles { .. }
+                        | Prompt::Docker { .. } => {}
                     }
                 }
             }
@@ -534,6 +548,12 @@ impl App {
                             if let Some(action) = filtered.get(selected).copied() {
                                 return self.execute_palette_action(action);
                             }
+                            None
+                        }
+                        // Docker is mouse-only in v1 — Enter is a no-op.
+                        // Putting it back so the modal doesn't close.
+                        Prompt::Docker { state } => {
+                            self.prompt = Some(Prompt::Docker { state });
                             None
                         }
                     }
@@ -707,6 +727,35 @@ impl App {
             Message::PaletteSelect(action) => {
                 return self.execute_palette_action(action);
             }
+            Message::DockerListLoaded(result) => {
+                // Only fold the result back in if the Docker modal is still
+                // up; the user may have dismissed it before docker ps
+                // finished.
+                if let Some(Prompt::Docker { state }) = self.prompt.as_mut() {
+                    *state = match result {
+                        Ok(list) => DockerState::Loaded(list),
+                        Err(msg) => DockerState::Error(msg),
+                    };
+                }
+            }
+            Message::DockerKill(id) => {
+                return docker_kill_task(id);
+            }
+            Message::DockerKillFinished(id, result) => {
+                if let Err(e) = &result {
+                    eprintln!("docker kill {} failed: {}", id, e);
+                }
+                // Re-fetch the list so the killed container disappears (or
+                // sticks around with a refreshed status if the kill failed).
+                if let Some(Prompt::Docker { .. }) = &self.prompt {
+                    return docker_ps_task();
+                }
+            }
+            Message::DockerShell(id) => {
+                if let Err(e) = docker_shell(&id) {
+                    eprintln!("docker shell {} failed: {}", id, e);
+                }
+            }
             Message::NoOp => {}
         }
         Task::none()
@@ -732,6 +781,12 @@ impl App {
                     });
                 }
                 Task::none()
+            }
+            PaletteAction::DockerContainers => {
+                self.prompt = Some(Prompt::Docker {
+                    state: DockerState::Loading,
+                });
+                docker_ps_task()
             }
             PaletteAction::Exit => window::get_oldest().and_then(window::close),
         }
@@ -1644,6 +1699,92 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 text("Would you like to switch a pane to this folder?"),
                 actions,
                 text("Tab cycles focus  ·  Enter activates  ·  Esc dismisses").size(11),
+            ]
+            .spacing(10)
+        }
+        Prompt::Docker { state } => {
+            let body: Element<'_, Message> = match state {
+                DockerState::Loading => container(text("Loading…").size(12))
+                    .padding(Padding::from([8, 8]))
+                    .into(),
+                DockerState::Error(msg) => container(
+                    text(msg.clone())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .style(|theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.extended_palette().danger.base.color),
+                        }),
+                )
+                .padding(Padding::from([8, 8]))
+                .into(),
+                DockerState::Loaded(containers) if containers.is_empty() => {
+                    container(text("No running containers.").size(12))
+                        .padding(Padding::from([8, 8]))
+                        .into()
+                }
+                DockerState::Loaded(containers) => {
+                    let list_col =
+                        containers
+                            .iter()
+                            .fold(column![].spacing(6), |col, c| {
+                                let id = c.id.clone();
+                                let id_for_shell = c.id.clone();
+                                let header_line = text(format!(
+                                    "{}  ·  {}",
+                                    if c.name.is_empty() { &c.id } else { &c.name },
+                                    c.image
+                                ))
+                                .font(Font::MONOSPACE)
+                                .size(12);
+                                let status_line = text(c.status.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(11)
+                                    .style(|theme: &Theme| iced::widget::text::Style {
+                                        color: Some(dim(theme.extended_palette().background.base.text)),
+                                    });
+                                let actions = row![
+                                    button(text("Kill").size(11))
+                                        .on_press(Message::DockerKill(id))
+                                        .padding(Padding::from([4, 12]))
+                                        .style(button::danger),
+                                    button(text("Shell").size(11))
+                                        .on_press(Message::DockerShell(id_for_shell))
+                                        .padding(Padding::from([4, 12]))
+                                        .style(button::primary),
+                                ]
+                                .spacing(6);
+                                let row_widget = row![
+                                    column![header_line, status_line]
+                                        .spacing(2)
+                                        .width(Length::Fill),
+                                    actions,
+                                ]
+                                .spacing(8)
+                                .align_y(iced::Alignment::Center);
+                                col.push(
+                                    container(row_widget)
+                                        .padding(Padding::from([6, 8]))
+                                        .style(|theme: &Theme| container::Style {
+                                            background: Some(
+                                                theme.extended_palette().background.weak.color.into(),
+                                            ),
+                                            border: Border {
+                                                color: theme.extended_palette().background.strong.color,
+                                                width: 1.0,
+                                                radius: 4.0.into(),
+                                            },
+                                            ..Default::default()
+                                        }),
+                                )
+                            });
+                    scrollable(list_col).height(Length::Fixed(320.0)).into()
+                }
+            };
+
+            column![
+                text("Docker containers").size(15),
+                body,
+                text("Click Kill or Shell  ·  Esc dismisses").size(11),
             ]
             .spacing(10)
         }

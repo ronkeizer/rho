@@ -73,7 +73,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -85,3 +85,29 @@ Inside a modal, the navigation keys behave differently:
 | Copy (text input only) | `Enter` submit, `Esc` cancel |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
+| Docker containers | Mouse-only in v1 — click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
+
+### Docker containers modal
+
+Picking **Docker containers** from the command palette runs `docker ps`
+and shows each running container as a row with name, image, status, and
+two buttons:
+
+- **Kill** — runs `docker kill <id>`. The list re-fetches on completion so
+  the killed container disappears (or sticks around with a refreshed
+  status if the kill failed).
+- **Shell** — opens a new terminal window running `docker exec -it <id>
+  /bin/sh`. `/bin/sh` is used rather than `bash` because Alpine-based
+  images often don't ship bash. The terminal lives independently of `fm`
+  — closing it doesn't affect the container.
+
+Platform notes for the **Shell** button:
+
+- **macOS** — uses `osascript` to open Terminal.app.
+- **Linux** — uses `x-terminal-emulator`. If you're on a distro that
+  doesn't ship this alternative you'll need to install it or symlink to
+  your preferred emulator.
+- **Windows** — opens `cmd /K`.
+
+If Docker isn't installed (no `docker` binary on PATH), the modal shows
+an explanatory message instead of an empty list.
