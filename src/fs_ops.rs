@@ -10,7 +10,8 @@ use std::time::Duration;
 use iced::{Subscription, Task};
 
 use crate::domain::{
-    parse_docker_ps, parse_ps_output, Application, DockerContainer, Entry, GitInfo, Process, Side,
+    parse_docker_ps, parse_git_branches, parse_ps_output, Application, DockerContainer, Entry,
+    GitBranch, GitInfo, Process, Side,
 };
 use crate::Message;
 
@@ -648,6 +649,88 @@ pub fn launch_app(path: &Path) -> Result<(), String> {
         let _ = path;
         Err("Launching applications isn't supported on this platform.".to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Git branches
+// ---------------------------------------------------------------------------
+
+/// `git for-each-ref --sort=-committerdate refs/heads/` for the repo
+/// containing `repo_path`. Returns the branches most-recent-commit first;
+/// the parser preserves arrival order so we don't need to sort again.
+pub fn git_branches_task(repo_path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || run_git_branches(&repo_path))
+                .await
+                .unwrap_or_else(|e| Err(format!("git branches task panicked: {}", e)))
+        },
+        Message::GitBranchesLoaded,
+    )
+}
+
+fn run_git_branches(repo_path: &Path) -> Result<Vec<GitBranch>, String> {
+    // `committerdate:short` keeps the per-row width small (YYYY-MM-DD).
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/heads/",
+            "--format=%(refname:short)|%(committerdate:short)",
+        ])
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                "`git` isn't installed (not found in PATH).".to_string()
+            }
+            _ => format!("failed to run `git for-each-ref`: {}", e),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`git for-each-ref` exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(parse_git_branches(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// `git -C <repo_path> checkout <branch>`. Errors (dirty working tree,
+/// non-existent branch) come back as `Err(stderr)`.
+pub fn git_checkout_task(repo_path: PathBuf, branch: String) -> Task<Message> {
+    Task::perform(
+        async move {
+            let branch_clone = branch.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                run_git_checkout(&repo_path, &branch_clone)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("git checkout task panicked: {}", e)));
+            (branch, res)
+        },
+        |(branch, res)| Message::GitCheckoutFinished(branch, res),
+    )
+}
+
+fn run_git_checkout(repo_path: &Path, branch: &str) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["checkout", branch])
+        .output()
+        .map_err(|e| format!("failed to run `git checkout`: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`git checkout` exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

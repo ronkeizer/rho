@@ -21,15 +21,17 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, RowColors, SavedState,
 };
 use domain::{
-    add_recent, filtered_actions, filtered_apps, filtered_containers, filtered_processes,
-    filtered_recents, sort_apps, sort_containers, sort_entries, sort_processes, Application,
-    AppsState, DeleteFocus, DockerContainer, DockerSortBy, DockerState, Entry, GitInfo,
+    add_recent, available_palette_actions, filtered_actions, filtered_apps, filtered_branches,
+    filtered_containers, filtered_processes, filtered_recents, keyboard_shortcuts, sort_apps,
+    sort_containers, sort_entries, sort_processes, Application, AppsState, DeleteFocus,
+    DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
     NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy, ProcessesState, Prompt, RowVisual,
     Side, SortBy, SortDir,
 };
 use fs_ops::{
     apps_task, copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
-    file_watch_subscription, kill_process_task, launch_app, loading_tasks, ps_task,
+    file_watch_subscription, git_branches_task, git_checkout_task, kill_process_task, launch_app,
+    loading_tasks, ps_task,
 };
 
 const PROMPT_ID: &str = "prompt";
@@ -119,6 +121,12 @@ enum Message {
     AppsListLoaded(Result<Vec<Application>, String>),
     /// User clicked Launch on an app row — `open` the bundle.
     LaunchApp(PathBuf),
+    /// `git for-each-ref` completed (or failed) for the GitBranches modal.
+    GitBranchesLoaded(Result<Vec<GitBranch>, String>),
+    /// User clicked Checkout on a branch row — start the checkout task.
+    GitCheckout(String),
+    /// `git checkout <branch>` completed.
+    GitCheckoutFinished(String, Result<(), String>),
     /// Global "quit the app" — currently bound to F10.
     ExitApp,
     NoOp,
@@ -213,6 +221,13 @@ impl App {
             Side::Left => &self.left,
             Side::Right => &self.right,
         }
+    }
+
+    /// True iff the active pane is inside a git repository (i.e. `git_info`
+    /// was populated by the per-navigate probe). Used by the command palette
+    /// to gate the Git: branch action.
+    fn in_git_repo(&self) -> bool {
+        self.pane(self.active).git_info.is_some()
     }
 
     fn pane_mut(&mut self, side: Side) -> &mut Pane {
@@ -333,7 +348,8 @@ impl App {
             (
                 Some(Prompt::Open { .. })
                 | Some(Prompt::CommandPalette { .. })
-                | Some(Prompt::Apps { .. }),
+                | Some(Prompt::Apps { .. })
+                | Some(Prompt::GitBranches { .. }),
                 m,
             ) => match m {
                 Message::MoveSelection(delta, _) => Message::PromptMove(delta),
@@ -507,9 +523,13 @@ impl App {
                         Prompt::Copy { input } => {
                             *input = value;
                         }
-                        Prompt::CommandPalette { input, selected } => {
+                        Prompt::CommandPalette {
+                            input,
+                            selected,
+                            actions,
+                        } => {
                             *input = value;
-                            let n = filtered_actions(input).len();
+                            let n = filtered_actions(actions, input).len();
                             *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                         }
                         Prompt::Docker { input, .. } | Prompt::Processes { input, .. } => {
@@ -526,7 +546,21 @@ impl App {
                                 *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                             }
                         }
-                        Prompt::Delete { .. } | Prompt::NewFiles { .. } => {}
+                        Prompt::GitBranches {
+                            input,
+                            state,
+                            selected,
+                            ..
+                        } => {
+                            *input = value;
+                            if let GitBranchesState::Loaded(list) = state {
+                                let n = filtered_branches(list, input).len();
+                                *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                            }
+                        }
+                        Prompt::Delete { .. }
+                        | Prompt::NewFiles { .. }
+                        | Prompt::KeyboardShortcuts => {}
                     }
                 }
             }
@@ -578,8 +612,12 @@ impl App {
                         // NewFiles uses NewFilesPickSide / PromptCancel, never
                         // PromptSubmit. If we somehow get here, just drop it.
                         Prompt::NewFiles { .. } => None,
-                        Prompt::CommandPalette { input, selected } => {
-                            let filtered = filtered_actions(&input);
+                        Prompt::CommandPalette {
+                            input,
+                            selected,
+                            actions,
+                        } => {
+                            let filtered = filtered_actions(&actions, &input);
                             if let Some(action) = filtered.get(selected).copied() {
                                 return self.execute_palette_action(action);
                             }
@@ -644,6 +682,38 @@ impl App {
                                 });
                                 None
                             }
+                        }
+                        // GitBranches modal: Enter checks out the highlighted
+                        // branch. Empty/loading/error keeps the modal open.
+                        Prompt::GitBranches {
+                            state,
+                            input,
+                            selected,
+                            repo_path,
+                        } => {
+                            let branch_name = if let GitBranchesState::Loaded(list) = &state {
+                                let filtered = filtered_branches(list, &input);
+                                filtered.get(selected).map(|&b| b.name.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(branch) = branch_name {
+                                Some(git_checkout_task(repo_path.clone(), branch))
+                            } else {
+                                self.prompt = Some(Prompt::GitBranches {
+                                    state,
+                                    input,
+                                    selected,
+                                    repo_path,
+                                });
+                                None
+                            }
+                        }
+                        // Informational modal — Enter is a no-op; put the
+                        // prompt back so the modal doesn't close.
+                        Prompt::KeyboardShortcuts => {
+                            self.prompt = Some(Prompt::KeyboardShortcuts);
+                            None
                         }
                     }
                 } else {
@@ -781,9 +851,11 @@ impl App {
                 }
             }
             Message::OpenCommandPalette => {
+                let actions = available_palette_actions(self.in_git_repo());
                 self.prompt = Some(Prompt::CommandPalette {
                     input: String::new(),
                     selected: 0,
+                    actions,
                 });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
@@ -798,8 +870,12 @@ impl App {
                         *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
                     }
                 }
-                Some(Prompt::CommandPalette { input, selected }) => {
-                    let n = filtered_actions(input).len() as i32;
+                Some(Prompt::CommandPalette {
+                    input,
+                    selected,
+                    actions,
+                }) => {
+                    let n = filtered_actions(actions, input).len() as i32;
                     if n > 0 {
                         *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
                     }
@@ -811,6 +887,19 @@ impl App {
                 }) => {
                     if let AppsState::Loaded(list) = state {
                         let n = filtered_apps(list, input).len() as i32;
+                        if n > 0 {
+                            *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                        }
+                    }
+                }
+                Some(Prompt::GitBranches {
+                    state,
+                    input,
+                    selected,
+                    ..
+                }) => {
+                    if let GitBranchesState::Loaded(list) = state {
+                        let n = filtered_branches(list, input).len() as i32;
                         if n > 0 {
                             *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
                         }
@@ -931,6 +1020,41 @@ impl App {
                     eprintln!("launch {} failed: {}", path.display(), e);
                 }
             }
+            Message::GitBranchesLoaded(result) => {
+                if let Some(Prompt::GitBranches { state, .. }) = self.prompt.as_mut() {
+                    // git for-each-ref already returns committerdate-sorted
+                    // rows, so we hand them through unchanged.
+                    *state = match result {
+                        Ok(list) => GitBranchesState::Loaded(list),
+                        Err(msg) => GitBranchesState::Error(msg),
+                    };
+                }
+            }
+            Message::GitCheckout(branch) => {
+                if let Some(Prompt::GitBranches { repo_path, .. }) = &self.prompt {
+                    let path = repo_path.clone();
+                    return git_checkout_task(path, branch);
+                }
+            }
+            Message::GitCheckoutFinished(branch, result) => {
+                match result {
+                    Ok(()) => {
+                        // Switch to the new branch — close the modal and refresh
+                        // both panes so file listings + git_info reflect HEAD.
+                        self.prompt = None;
+                        self.show_next_pending();
+                        return self.reload_both_panes();
+                    }
+                    Err(e) => {
+                        eprintln!("git checkout {} failed: {}", branch, e);
+                        // Surface the error in the modal so the user knows it
+                        // didn't take effect (dirty tree, missing branch, …).
+                        if let Some(Prompt::GitBranches { state, .. }) = self.prompt.as_mut() {
+                            *state = GitBranchesState::Error(e);
+                        }
+                    }
+                }
+            }
             Message::ExitApp => {
                 return window::get_oldest().and_then(window::close);
             }
@@ -1014,6 +1138,23 @@ impl App {
                     text_input::focus(text_input::Id::new(PROMPT_ID)),
                 ])
             }
+            PaletteAction::GitBranch => {
+                let repo_path = self.pane(self.active).path.clone();
+                self.prompt = Some(Prompt::GitBranches {
+                    state: GitBranchesState::Loading,
+                    input: String::new(),
+                    selected: 0,
+                    repo_path: repo_path.clone(),
+                });
+                Task::batch([
+                    git_branches_task(repo_path),
+                    text_input::focus(text_input::Id::new(PROMPT_ID)),
+                ])
+            }
+            PaletteAction::KeyboardShortcuts => {
+                self.prompt = Some(Prompt::KeyboardShortcuts);
+                Task::none()
+            }
             PaletteAction::Exit => window::get_oldest().and_then(window::close),
         }
     }
@@ -1084,54 +1225,21 @@ impl App {
         .spacing(8)
         .height(Length::Fill);
 
-        let marks = {
-            let p = self.pane(self.active);
-            let n = p.marked_paths().len();
-            if n > 1 {
-                format!("{} marked", n)
-            } else {
-                String::new()
-            }
-        };
-        let hints = text(format!(
-            "Active: {}{}{}   ·   ⌘P go to folder  ·  ⌘, settings  ·  F4 open  ·  F5 copy  ·  Delete  ·  ↑↓/PgUp/PgDn (+Shift extend)  ·  Tab switch  ·  Backspace up",
-            match self.active {
-                Side::Left => "left",
-                Side::Right => "right",
-            },
-            if marks.is_empty() { "" } else { "   ·   " },
-            marks,
-        ))
-        .size(11);
+        // Black background + dim text — the quietest band we can give a row
+        // that still needs to be readable. Same look for "Ready" and for any
+        // in-progress task message.
+        let status_msg = self.status_text().unwrap_or_else(|| "Ready".to_string());
+        let status_bar: Element<'_, Message> = container(text(status_msg).size(11))
+            .padding(Padding::from([4, 8]))
+            .width(Length::Fill)
+            .style(|theme: &Theme| container::Style {
+                background: Some(Color::BLACK.into()),
+                text_color: Some(dim(theme.extended_palette().background.base.text)),
+                ..Default::default()
+            })
+            .into();
 
-        let status_bar: Element<'_, Message> = match self.status_text() {
-            Some(msg) => container(text(msg).size(11))
-                .padding(Padding::from([4, 8]))
-                .width(Length::Fill)
-                .style(|theme: &Theme| {
-                    let palette = theme.extended_palette();
-                    container::Style {
-                        background: Some(palette.primary.weak.color.into()),
-                        text_color: Some(palette.primary.weak.text),
-                        ..Default::default()
-                    }
-                })
-                .into(),
-            None => container(text("Ready").size(11))
-                .padding(Padding::from([4, 8]))
-                .width(Length::Fill)
-                .style(|theme: &Theme| {
-                    let palette = theme.extended_palette();
-                    container::Style {
-                        background: Some(palette.background.weak.color.into()),
-                        text_color: Some(palette.background.weak.text),
-                        ..Default::default()
-                    }
-                })
-                .into(),
-        };
-
-        let base: Element<'_, Message> = container(column![panes, hints, status_bar].spacing(6))
+        let base: Element<'_, Message> = container(column![panes, status_bar].spacing(6))
             .padding(8)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1233,7 +1341,14 @@ fn view_pane<'a>(
 ) -> Element<'a, Message> {
     let path_header = text(pane.path.display().to_string())
         .font(Font::MONOSPACE)
-        .size(config.row_font_size);
+        .size(config.row_font_size)
+        .style(move |theme: &Theme| iced::widget::text::Style {
+            color: if active {
+                None
+            } else {
+                Some(dim(theme.extended_palette().background.base.text))
+            },
+        });
 
     // Match the body row's leading git-marker gutter so the "Name" header
     // sits over the actual names rather than the marker column.
@@ -1246,7 +1361,8 @@ fn view_pane<'a>(
             pane,
             Length::Fill,
             Horizontal::Left,
-            config
+            config,
+            active,
         ),
     ]
     .spacing(0)
@@ -1263,6 +1379,7 @@ fn view_pane<'a>(
                 Length::Fixed(config.size_column_px),
                 Horizontal::Right,
                 config,
+                active,
             ),
             header_cell(
                 side,
@@ -1272,14 +1389,23 @@ fn view_pane<'a>(
                 Length::Fixed(config.modified_column_px),
                 Horizontal::Left,
                 config,
+                active,
             ),
         ]
         .spacing(8),
     )
     .padding(Padding::from([0, 8]))
-    .style(|theme: &Theme| container::Style {
-        background: Some(theme.extended_palette().background.weak.color.into()),
-        ..Default::default()
+    .style(move |theme: &Theme| {
+        let palette = theme.extended_palette();
+        let bg = if active {
+            palette.background.weak.color
+        } else {
+            dim(palette.background.weak.color)
+        };
+        container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        }
     });
 
     let pad_y = config.row_padding_y();
@@ -1396,39 +1522,26 @@ fn view_pane<'a>(
 
     let mut inner_col = column![path_header, column_header, body].spacing(4);
     if !pane.filter.is_empty() {
-        inner_col = inner_col.push(filter_bar(pane, config));
+        inner_col = inner_col.push(filter_bar(pane, config, active));
     }
     if let Some(info) = &pane.git_info {
-        inner_col = inner_col.push(git_info_bar(info, config));
+        inner_col = inner_col.push(git_info_bar(info, config, active));
     }
     let inner = container(inner_col).padding(6);
 
-    let bordered = container(inner)
-        .style(move |theme: &Theme| {
-            let palette = theme.extended_palette();
-            let border_color = if active {
-                palette.primary.strong.color
-            } else {
-                palette.background.strong.color
-            };
-            container::Style {
-                border: Border {
-                    color: border_color,
-                    width: if active { 2.0 } else { 1.0 },
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
-        })
+    // No border around the pane any more. The "which pane is active" cue is
+    // carried by the row-level text dimming (`compute_row_style` + the name
+    // widget closure both look at `pane_active` and dim when it's false).
+    let pane_container = container(inner)
         .width(Length::FillPortion(1))
         .height(Length::Fill);
 
-    mouse_area(bordered)
+    mouse_area(pane_container)
         .on_press(Message::Activate(side))
         .into()
 }
 
-fn git_info_bar<'a>(info: &GitInfo, config: &Config) -> Element<'a, Message> {
+fn git_info_bar<'a>(info: &GitInfo, config: &Config, active: bool) -> Element<'a, Message> {
     let mut parts: Vec<String> = vec![format!("branch: {}", info.branch)];
     if info.uncommitted > 0 {
         let noun = if info.uncommitted == 1 {
@@ -1454,18 +1567,23 @@ fn git_info_bar<'a>(info: &GitInfo, config: &Config) -> Element<'a, Message> {
     )
     .padding(Padding::from([2, 8]))
     .width(Length::Fill)
-    .style(|theme: &Theme| {
+    .style(move |theme: &Theme| {
         let palette = theme.extended_palette();
+        let fg = if active {
+            palette.success.weak.text
+        } else {
+            dim(palette.success.weak.text)
+        };
         container::Style {
             background: Some(palette.success.weak.color.into()),
-            text_color: Some(palette.success.weak.text),
+            text_color: Some(fg),
             ..Default::default()
         }
     })
     .into()
 }
 
-fn filter_bar<'a>(pane: &Pane, config: &Config) -> Element<'a, Message> {
+fn filter_bar<'a>(pane: &Pane, config: &Config, active: bool) -> Element<'a, Message> {
     let label = format!(
         "filter: /{}/   ({} of {})",
         pane.filter,
@@ -1479,11 +1597,16 @@ fn filter_bar<'a>(pane: &Pane, config: &Config) -> Element<'a, Message> {
     )
     .padding(Padding::from([4, 8]))
     .width(Length::Fill)
-    .style(|theme: &Theme| {
+    .style(move |theme: &Theme| {
         let palette = theme.extended_palette();
+        let fg = if active {
+            palette.primary.weak.text
+        } else {
+            dim(palette.primary.weak.text)
+        };
         container::Style {
             background: Some(palette.primary.weak.color.into()),
-            text_color: Some(palette.primary.weak.text),
+            text_color: Some(fg),
             ..Default::default()
         }
     })
@@ -1524,6 +1647,7 @@ fn header_cell<'a>(
     width: Length,
     align: Horizontal,
     config: &Config,
+    active: bool,
 ) -> Element<'a, Message> {
     let arrow = if pane.sort_by == column {
         match pane.sort_dir {
@@ -1542,7 +1666,16 @@ fn header_cell<'a>(
     )
     .width(width)
     .padding(Padding::from([2, 4]))
-    .style(button::text)
+    .style(move |theme: &Theme, status: button::Status| {
+        // Inherit the standard text-button look, then mute the label color
+        // when this header is in an inactive pane so it matches the greyed-out
+        // body rows.
+        let mut s = button::text(theme, status);
+        if !active {
+            s.text_color = dim(s.text_color);
+        }
+        s
+    })
     .on_press(Message::ToggleSort(side, column))
     .into()
 }
@@ -1589,6 +1722,15 @@ fn build_row<'a>(
                 (Some(c), false) => Some(c),
                 (None, true) => Some(dim(theme.extended_palette().background.base.text)),
                 (None, false) => None,
+            };
+            // Inactive pane → mute the name too so the row reads as part of
+            // the greyed-out pane.
+            let resolved = if !pane_active {
+                Some(dim(
+                    resolved.unwrap_or_else(|| theme.extended_palette().background.base.text),
+                ))
+            } else {
+                resolved
             };
             iced::widget::text::Style { color: resolved }
         });
@@ -1646,11 +1788,17 @@ fn compute_row_style(
     // dim_row affects the row's default text color (i.e. the Size and Modified
     // columns). The name widget handles its own dimming above so it can
     // combine with the folder-color override.
-    let text_default = if dim_row {
+    let mut text_default = if dim_row {
         dim(palette.background.base.text)
     } else {
         palette.background.base.text
     };
+    // Inactive pane → mute the row text so the whole pane visually recedes.
+    // Cursor/Marked branches below only run when pane_active is true, so they
+    // don't need to apply this dim themselves.
+    if !pane_active {
+        text_default = dim(text_default);
+    }
 
     // Note: hover state intentionally ignored — rows shouldn't light up under
     // the cursor; the only emphasis is the active pane's selection.
@@ -1700,10 +1848,15 @@ fn compute_row_style(
 }
 
 fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
-    // Docker / Processes / Apps are wider so the list rows have room. The
-    // other modals are single-column and stay narrow.
+    // Docker / Processes / Apps / GitBranches are wider so the list rows
+    // have room. KeyboardShortcuts is two-column text — wider than the
+    // single-column modals but narrower than the table-shaped ones.
     let modal_width = match prompt {
-        Prompt::Docker { .. } | Prompt::Processes { .. } | Prompt::Apps { .. } => 720.0,
+        Prompt::Docker { .. }
+        | Prompt::Processes { .. }
+        | Prompt::Apps { .. }
+        | Prompt::GitBranches { .. } => 720.0,
+        Prompt::KeyboardShortcuts => 600.0,
         _ => 440.0,
     };
     let dialog_inner = container(match prompt {
@@ -1778,8 +1931,12 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
             text("Enter to copy  ·  Esc or click outside to cancel").size(11),
         ]
         .spacing(10),
-        Prompt::CommandPalette { input, selected } => {
-            let filtered = filtered_actions(input);
+        Prompt::CommandPalette {
+            input,
+            selected,
+            actions,
+        } => {
+            let filtered = filtered_actions(actions, input);
             let input_widget = text_input("filter actions…", input)
                 .id(text_input::Id::new(PROMPT_ID))
                 .on_input(Message::PromptChanged)
@@ -2347,6 +2504,141 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                     .size(11),
             ]
             .spacing(6)
+        }
+        Prompt::GitBranches {
+            state,
+            input,
+            selected,
+            repo_path: _,
+        } => {
+            let filter_widget = text_input("filter branches…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+
+            let body: Element<'_, Message> = match state {
+                GitBranchesState::Loading => container(text("Loading…").size(12))
+                    .padding(Padding::from([8, 8]))
+                    .into(),
+                GitBranchesState::Error(msg) => container(
+                    text(msg.clone())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .style(|theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.extended_palette().danger.base.color),
+                        }),
+                )
+                .padding(Padding::from([8, 8]))
+                .into(),
+                GitBranchesState::Loaded(branches) => {
+                    let filtered = filtered_branches(branches, input);
+                    if filtered.is_empty() {
+                        container(text("No branches match.").size(12))
+                            .padding(Padding::from([8, 8]))
+                            .into()
+                    } else {
+                        let list_col = filtered.iter().enumerate().fold(
+                            column![].spacing(3),
+                            |col, (i, branch)| {
+                                let name = branch.name.clone();
+                                let highlighted = i == *selected;
+                                let name_cell = text(branch.name.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(12)
+                                    .width(Length::Fill)
+                                    .wrapping(iced::widget::text::Wrapping::None);
+                                let date_cell = text(branch.last_commit.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(11)
+                                    .width(Length::Fixed(110.0))
+                                    .style(|theme: &Theme| iced::widget::text::Style {
+                                        color: Some(dim(theme.extended_palette().background.base.text)),
+                                    });
+                                let row_widget = row![
+                                    name_cell,
+                                    date_cell,
+                                    button(
+                                        text("Checkout")
+                                            .size(10)
+                                            .align_x(Horizontal::Center)
+                                            .width(Length::Fill),
+                                    )
+                                    .on_press(Message::GitCheckout(name))
+                                    .padding(Padding::from([2, 0]))
+                                    .width(Length::Fixed(80.0))
+                                    .style(button::primary),
+                                ]
+                                .spacing(8)
+                                .align_y(iced::Alignment::Center);
+                                col.push(
+                                    container(row_widget)
+                                        .padding(Padding::from([3, 8]))
+                                        .style(move |theme: &Theme| container::Style {
+                                            background: if highlighted {
+                                                Some(
+                                                    theme
+                                                        .extended_palette()
+                                                        .primary
+                                                        .weak
+                                                        .color
+                                                        .into(),
+                                                )
+                                            } else {
+                                                None
+                                            },
+                                            border: Border {
+                                                color: Color::TRANSPARENT,
+                                                width: 1.0,
+                                                radius: 4.0.into(),
+                                            },
+                                            ..Default::default()
+                                        }),
+                                )
+                            },
+                        );
+                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                    }
+                }
+            };
+
+            column![
+                text("Git: branch").size(15),
+                filter_widget,
+                body,
+                text("Type to filter  ·  ↑/↓ select  ·  Enter or click Checkout  ·  Esc dismisses")
+                    .size(11),
+            ]
+            .spacing(6)
+        }
+        Prompt::KeyboardShortcuts => {
+            // Two-column key/description rows, grouped by section. Static
+            // content from `keyboard_shortcuts()`; keep in sync with the
+            // mdBook chapter at docs/src/keybindings.md.
+            let mut body = column![].spacing(10);
+            for (section, bindings) in keyboard_shortcuts() {
+                let mut sect = column![text(section).size(13)].spacing(2);
+                for (keys, description) in bindings {
+                    sect = sect.push(
+                        row![
+                            text(keys)
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::Fixed(220.0)),
+                            text(description).size(11).width(Length::Fill),
+                        ]
+                        .spacing(8),
+                    );
+                }
+                body = body.push(sect);
+            }
+            column![
+                text("Keyboard shortcuts").size(15),
+                scrollable(container(body).padding(Padding::from([4, 4])))
+                    .height(Length::Fixed(420.0)),
+                text("Esc dismisses").size(11),
+            ]
+            .spacing(8)
         }
     })
     .padding(16)

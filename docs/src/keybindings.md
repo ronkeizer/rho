@@ -74,7 +74,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -89,6 +89,8 @@ Inside a modal, the navigation keys behave differently:
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
 | Processes | Type to filter (substring against name). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
 | Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
+| Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
+| Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
 
 ### Docker containers modal
 
@@ -155,3 +157,26 @@ launching macOS `.app` bundles isn't meaningful elsewhere.
 
 App icons are not rendered in v1 — supporting them needs `.icns` parsing
 (adds a dependency) plus per-app I/O on modal open. Likely added later.
+
+### Git: branch modal
+
+Picking **Git: branch** from the command palette runs
+`git for-each-ref --sort=-committerdate refs/heads/ ...` against the
+active pane's directory and lists local branches with the date of their
+last commit. Most-recently-committed branches appear first (best proxy
+for "last used"). A filter input narrows by substring of the branch name
+(case-insensitive).
+
+The action is hidden from the command palette unless the active pane is
+inside a git repository — `git_info` being populated is the signal,
+which is the same probe that drives the per-pane git bar.
+
+- **Checkout** — runs `git checkout <branch>` in the pane's directory.
+  On success the modal closes and both panes reload (so file listings
+  and the git info bar reflect the new HEAD). On failure (dirty working
+  tree, branch already removed, etc.) the modal stays open with the
+  error message in place of the list — re-open the modal to try
+  another branch after fixing the issue.
+
+The branch list is captured at modal open time and isn't refreshed
+during the session. Dismiss and reopen to refresh.

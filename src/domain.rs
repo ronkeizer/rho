@@ -86,11 +86,15 @@ pub enum Prompt {
         files: Vec<String>,
         focus: NewFilesFocus,
     },
-    /// Action picker with a filter input. `selected` is an index into the
-    /// *filtered* list of actions.
+    /// Action picker with a filter input. `actions` is the slate of
+    /// currently-offerable actions, captured at open time (so runtime gating
+    /// like Git: branch availability is stable across the modal session).
+    /// `selected` is an index into the *filtered* list (i.e.
+    /// `filtered_actions(&actions, &input)`).
     CommandPalette {
         input: String,
         selected: usize,
+        actions: Vec<PaletteAction>,
     },
     /// "Docker containers" action. Shows the currently-running containers
     /// from `docker ps`, each with Kill and Shell buttons. The state goes
@@ -120,6 +124,18 @@ pub enum Prompt {
         input: String,
         selected: usize,
     },
+    /// "Git: branch" action. Lists local branches of the repo containing
+    /// `repo_path` (the active pane's path at open time), most-recent commit
+    /// first. Per-row action is `Checkout`.
+    GitBranches {
+        state: GitBranchesState,
+        input: String,
+        selected: usize,
+        repo_path: PathBuf,
+    },
+    /// Static informational modal — lists keyboard shortcuts sourced from
+    /// [`keyboard_shortcuts`]. No interactive state; Esc dismisses.
+    KeyboardShortcuts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +180,10 @@ pub enum PaletteAction {
     /// `cfg` noise, but only listed in [`PaletteAction::ALL`] on macOS — on
     /// other platforms the palette never offers it.
     LaunchApplication,
+    /// Runtime-gated: only offered when the active pane is inside a git
+    /// repository (see [`available_palette_actions`]).
+    GitBranch,
+    KeyboardShortcuts,
     Exit,
 }
 
@@ -175,6 +195,8 @@ impl PaletteAction {
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
         PaletteAction::LaunchApplication,
+        PaletteAction::GitBranch,
+        PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
 
@@ -184,6 +206,8 @@ impl PaletteAction {
         PaletteAction::Delete,
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
+        PaletteAction::GitBranch,
+        PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
 
@@ -194,9 +218,78 @@ impl PaletteAction {
             PaletteAction::DockerContainers => "Docker containers",
             PaletteAction::Processes => "Processes",
             PaletteAction::LaunchApplication => "Launch Application",
+            PaletteAction::GitBranch => "Git: branch",
+            PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
         }
     }
+}
+
+/// Static reference for the in-app "Keyboard shortcuts" modal. Mirror of the
+/// docs at `docs/src/keybindings.md`; keep both in sync when adding bindings.
+/// Returns a list of `(section_title, bindings)` pairs.
+pub fn keyboard_shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    vec![
+        (
+            "Navigation",
+            vec![
+                ("↑ / ↓", "Move the cursor one row"),
+                ("PageUp / PageDown", "Move by one page"),
+                ("Shift + arrow / page", "Extend the selection from the anchor"),
+                ("Tab", "Switch the active pane"),
+                (
+                    "Enter",
+                    "Open the cursor row (directory: descend; file: OS default)",
+                ),
+                (
+                    "Backspace",
+                    "Go to parent (or delete one char of an active filter)",
+                ),
+            ],
+        ),
+        (
+            "File actions",
+            vec![
+                ("F4", "Edit the cursor file in $VISUAL / $EDITOR"),
+                ("Space", "Quick Look preview (macOS only)"),
+                ("F5", "Open the copy modal"),
+                ("Delete", "Open the delete-confirm modal"),
+                ("F10", "Quit the app immediately"),
+            ],
+        ),
+        (
+            "Filtering & sorting",
+            vec![
+                ("any printable char", "Append to type-to-filter"),
+                ("Esc (no modal)", "Clear the active filter"),
+                ("click column header", "Sort by that column; click again to flip"),
+            ],
+        ),
+        (
+            "Modals & global",
+            vec![
+                ("⌘P", "Go to folder (filterable list of recent locations)"),
+                ("⌘⇧P", "Command palette"),
+                ("⌘,", "Open ~/.fm.yaml in the OS default editor"),
+                ("Esc", "Cancel current modal / clear the filter"),
+            ],
+        ),
+    ]
+}
+
+/// Subset of [`PaletteAction::ALL`] currently offerable. `in_git_repo` is the
+/// only runtime gate today (GitBranch is hidden outside repos). Cfg-gated
+/// variants like LaunchApplication are already absent from `ALL` on non-mac
+/// builds, so no extra logic needed there.
+pub fn available_palette_actions(in_git_repo: bool) -> Vec<PaletteAction> {
+    PaletteAction::ALL
+        .iter()
+        .copied()
+        .filter(|a| match a {
+            PaletteAction::GitBranch => in_git_repo,
+            _ => true,
+        })
+        .collect()
 }
 
 /// Snapshot of a single running container surfaced from `docker ps`.
@@ -299,6 +392,23 @@ pub struct Application {
 pub enum AppsState {
     Loading,
     Loaded(Vec<Application>),
+    Error(String),
+}
+
+/// One local branch returned by `git for-each-ref`. `last_commit` is the
+/// formatted date string for the tip of the branch (already short — typically
+/// `YYYY-MM-DD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBranch {
+    pub name: String,
+    pub last_commit: String,
+}
+
+/// Lifecycle of the Git: branch modal. Same shape as [`DockerState`] etc.
+#[derive(Debug, Clone)]
+pub enum GitBranchesState {
+    Loading,
+    Loaded(Vec<GitBranch>),
     Error(String),
 }
 
@@ -467,6 +577,36 @@ pub fn filtered_apps<'a>(apps: &'a [Application], input: &str) -> Vec<&'a Applic
     let needle = input.to_lowercase();
     apps.iter()
         .filter(|a| a.name.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Parse `git for-each-ref --format='%(refname:short)|%(committerdate:short)'`
+/// output. The `git for-each-ref --sort=-committerdate` flag is what produces
+/// the most-recent-first ordering, so this function preserves arrival order.
+pub fn parse_git_branches(stdout: &str) -> Vec<GitBranch> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '|');
+            let name = parts.next()?.trim().to_string();
+            let last_commit = parts.next()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(GitBranch { name, last_commit })
+        })
+        .collect()
+}
+
+/// Case-insensitive substring filter over branch names.
+pub fn filtered_branches<'a>(branches: &'a [GitBranch], input: &str) -> Vec<&'a GitBranch> {
+    if input.is_empty() {
+        return branches.iter().collect();
+    }
+    let needle = input.to_lowercase();
+    branches
+        .iter()
+        .filter(|b| b.name.to_lowercase().contains(&needle))
         .collect()
 }
 
@@ -725,13 +865,16 @@ pub fn filtered_recents<'a>(recents: &'a [PathBuf], input: &str) -> Vec<&'a Path
         .collect()
 }
 
-/// Case-insensitive substring filter over the command-palette action list.
-pub fn filtered_actions(input: &str) -> Vec<PaletteAction> {
+/// Case-insensitive substring filter over a slice of palette actions. The
+/// slice is supplied by the caller (typically the result of
+/// [`available_palette_actions`]) so the modal's runtime-gated entries can
+/// drop in or out without `filtered_actions` itself knowing about them.
+pub fn filtered_actions(actions: &[PaletteAction], input: &str) -> Vec<PaletteAction> {
     if input.is_empty() {
-        return PaletteAction::ALL.to_vec();
+        return actions.to_vec();
     }
     let needle = input.to_lowercase();
-    PaletteAction::ALL
+    actions
         .iter()
         .copied()
         .filter(|a| a.label().to_lowercase().contains(&needle))
@@ -1363,25 +1506,38 @@ mod tests {
 
     #[test]
     fn filtered_actions_empty_input_returns_all() {
-        let out = filtered_actions("");
+        let out = filtered_actions(PaletteAction::ALL, "");
         assert_eq!(out.len(), PaletteAction::ALL.len());
     }
 
     #[test]
     fn filtered_actions_substring_matches_label() {
-        let out = filtered_actions("cop");
+        let out = filtered_actions(PaletteAction::ALL, "cop");
         assert_eq!(out, vec![PaletteAction::Copy]);
     }
 
     #[test]
     fn filtered_actions_is_case_insensitive() {
-        let out = filtered_actions("EXIT");
+        let out = filtered_actions(PaletteAction::ALL, "EXIT");
         assert_eq!(out, vec![PaletteAction::Exit]);
     }
 
     #[test]
     fn filtered_actions_no_match_returns_empty() {
-        let out = filtered_actions("zzzz");
+        let out = filtered_actions(PaletteAction::ALL, "zzzz");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filtered_actions_respects_supplied_subset() {
+        // Caller-supplied slice without Git: branch — filter "branch" finds
+        // nothing even though the variant exists in ALL.
+        let subset: Vec<PaletteAction> = PaletteAction::ALL
+            .iter()
+            .copied()
+            .filter(|a| *a != PaletteAction::GitBranch)
+            .collect();
+        let out = filtered_actions(&subset, "branch");
         assert!(out.is_empty());
     }
 
@@ -1436,7 +1592,7 @@ mod tests {
 
     #[test]
     fn filtered_actions_finds_docker() {
-        let out = filtered_actions("docker");
+        let out = filtered_actions(PaletteAction::ALL, "docker");
         assert_eq!(out, vec![PaletteAction::DockerContainers]);
     }
 
@@ -1488,7 +1644,7 @@ mod tests {
 
     #[test]
     fn filtered_actions_finds_processes() {
-        let out = filtered_actions("proc");
+        let out = filtered_actions(PaletteAction::ALL, "proc");
         assert_eq!(out, vec![PaletteAction::Processes]);
     }
 
@@ -1815,5 +1971,124 @@ mod tests {
     fn filtered_apps_no_match_returns_empty() {
         let apps = vec![mk_app("Slack")];
         assert!(filtered_apps(&apps, "zzz").is_empty());
+    }
+
+    #[test]
+    fn palette_action_git_branch_label() {
+        assert_eq!(PaletteAction::GitBranch.label(), "Git: branch");
+    }
+
+    #[test]
+    fn available_palette_actions_hides_git_branch_outside_repo() {
+        let out = available_palette_actions(false);
+        assert!(!out.contains(&PaletteAction::GitBranch));
+        // Other actions still present.
+        assert!(out.contains(&PaletteAction::Copy));
+        assert!(out.contains(&PaletteAction::Exit));
+    }
+
+    #[test]
+    fn available_palette_actions_includes_git_branch_in_repo() {
+        let out = available_palette_actions(true);
+        assert!(out.contains(&PaletteAction::GitBranch));
+    }
+
+    #[test]
+    fn parse_git_branches_basic() {
+        // The `--sort=-committerdate` flag does the ordering before we see
+        // the output, so the parser preserves arrival order.
+        let stdout = "main|2026-05-21\nfeature/foo|2026-05-15\nold-branch|2024-01-02\n";
+        let out = parse_git_branches(stdout);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "main");
+        assert_eq!(out[0].last_commit, "2026-05-21");
+        assert_eq!(out[1].name, "feature/foo");
+        assert_eq!(out[2].name, "old-branch");
+        assert_eq!(out[2].last_commit, "2024-01-02");
+    }
+
+    #[test]
+    fn parse_git_branches_handles_slashes_in_name() {
+        let stdout = "users/alice/feat-x|2026-05-20\n";
+        let out = parse_git_branches(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "users/alice/feat-x");
+    }
+
+    #[test]
+    fn parse_git_branches_skips_malformed_and_empty() {
+        let stdout = "\nno-pipe-here\nmain|2026-05-21\n|2026-05-20\n";
+        let out = parse_git_branches(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "main");
+    }
+
+    fn mk_branch(name: &str) -> GitBranch {
+        GitBranch {
+            name: name.to_string(),
+            last_commit: "2026-05-21".to_string(),
+        }
+    }
+
+    #[test]
+    fn filtered_branches_substring_matches() {
+        let branches = vec![mk_branch("main"), mk_branch("feature/foo"), mk_branch("bugfix")];
+        let out = filtered_branches(&branches, "fea");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "feature/foo");
+    }
+
+    #[test]
+    fn filtered_branches_empty_returns_all() {
+        let branches = vec![mk_branch("main"), mk_branch("dev")];
+        assert_eq!(filtered_branches(&branches, "").len(), 2);
+    }
+
+    #[test]
+    fn filtered_branches_is_case_insensitive() {
+        let branches = vec![mk_branch("MAIN"), mk_branch("dev")];
+        assert_eq!(filtered_branches(&branches, "main").len(), 1);
+    }
+
+    #[test]
+    fn palette_action_keyboard_shortcuts_label() {
+        assert_eq!(
+            PaletteAction::KeyboardShortcuts.label(),
+            "Keyboard shortcuts"
+        );
+    }
+
+    #[test]
+    fn keyboard_shortcuts_has_sections_and_bindings() {
+        let sections = keyboard_shortcuts();
+        assert!(!sections.is_empty(), "expected at least one section");
+        // Every section must have a title and at least one binding row, and
+        // every binding must have non-empty keys and description.
+        for (title, bindings) in &sections {
+            assert!(!title.is_empty(), "empty section title");
+            assert!(
+                !bindings.is_empty(),
+                "section {} has no bindings",
+                title
+            );
+            for (keys, desc) in bindings {
+                assert!(!keys.is_empty(), "empty keys in section {}", title);
+                assert!(!desc.is_empty(), "empty description in section {}", title);
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_shortcuts_covers_load_bearing_keys() {
+        // Quick smoke check that the modal mirrors the docs — these are the
+        // bindings most likely to surprise users by their absence.
+        let joined: String = keyboard_shortcuts()
+            .into_iter()
+            .flat_map(|(_, b)| b.into_iter().map(|(k, _)| k))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        for needle in ["⌘P", "⌘⇧P", "F4", "F5", "F10", "Tab", "Esc"] {
+            assert!(joined.contains(needle), "missing binding: {}", needle);
+        }
     }
 }
