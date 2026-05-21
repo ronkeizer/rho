@@ -10,7 +10,7 @@ use std::time::Duration;
 use iced::{Subscription, Task};
 
 use crate::domain::{
-    parse_docker_ps, parse_ps_output, DockerContainer, Entry, GitInfo, Process, Side,
+    parse_docker_ps, parse_ps_output, Application, DockerContainer, Entry, GitInfo, Process, Side,
 };
 use crate::Message;
 
@@ -571,6 +571,83 @@ fn run_kill(pid: u32) -> Result<(), String> {
 #[cfg(not(unix))]
 fn run_kill(_pid: u32) -> Result<(), String> {
     Err("Killing processes isn't supported on this platform yet.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Launch Application (macOS)
+// ---------------------------------------------------------------------------
+
+/// Discover `.app` bundles under the standard macOS application directories.
+/// Sorted later by the App layer via `sort_apps`. macOS-only; other platforms
+/// surface a friendly error in the modal.
+pub fn apps_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(scan_applications)
+                .await
+                .unwrap_or_else(|e| Err(format!("apps scan panicked: {}", e)))
+        },
+        Message::AppsListLoaded,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn scan_applications() -> Result<Vec<Application>, String> {
+    let mut dirs: Vec<PathBuf> = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/Applications/Utilities"),
+    ];
+    let home_apps = crate::config::home_dir().join("Applications");
+    if home_apps.is_dir() {
+        dirs.push(home_apps);
+    }
+
+    let mut out: Vec<Application> = Vec::new();
+    for dir in &dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("app") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            out.push(Application {
+                path: path.clone(),
+                name: name.to_string(),
+            });
+        }
+    }
+    if out.is_empty() {
+        return Err("No .app bundles found in /Applications.".to_string());
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scan_applications() -> Result<Vec<Application>, String> {
+    Err("Launching applications is macOS-only.".to_string())
+}
+
+/// Open an application bundle via macOS's `open` command. Returns once
+/// `open` has been spawned; we don't follow the launched app's lifetime.
+pub fn launch_app(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch {}: {}", path.display(), e))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("Launching applications isn't supported on this platform.".to_string())
+    }
 }
 
 #[cfg(test)]

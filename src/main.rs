@@ -21,14 +21,15 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, RowColors, SavedState,
 };
 use domain::{
-    add_recent, filtered_actions, filtered_containers, filtered_processes, filtered_recents,
-    sort_containers, sort_entries, sort_processes, DeleteFocus, DockerContainer, DockerSortBy,
-    DockerState, Entry, GitInfo, NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy,
-    ProcessesState, Prompt, RowVisual, Side, SortBy, SortDir,
+    add_recent, filtered_actions, filtered_apps, filtered_containers, filtered_processes,
+    filtered_recents, sort_apps, sort_containers, sort_entries, sort_processes, Application,
+    AppsState, DeleteFocus, DockerContainer, DockerSortBy, DockerState, Entry, GitInfo,
+    NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy, ProcessesState, Prompt, RowVisual,
+    Side, SortBy, SortDir,
 };
 use fs_ops::{
-    copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
-    file_watch_subscription, kill_process_task, loading_tasks, ps_task,
+    apps_task, copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
+    file_watch_subscription, kill_process_task, launch_app, loading_tasks, ps_task,
 };
 
 const PROMPT_ID: &str = "prompt";
@@ -114,6 +115,10 @@ enum Message {
     DockerToggleSort(DockerSortBy),
     /// User clicked a Processes column header — toggle / switch the sort.
     ProcessToggleSort(ProcessSortBy),
+    /// `scan_applications` finished (or failed) for the Apps modal.
+    AppsListLoaded(Result<Vec<Application>, String>),
+    /// User clicked Launch on an app row — `open` the bundle.
+    LaunchApp(PathBuf),
     NoOp,
 }
 
@@ -317,13 +322,18 @@ impl App {
                     other => other,
                 }
             }
-            // Open and CommandPalette both have a text_input on top and a
-            // filterable list below. text_input consumes Enter / Left / Right
-            // / Backspace / printable chars, so ↑/↓/PgUp/PgDn/Tab fall through
-            // here and we redirect them to PromptMove for list navigation.
-            // Enter is delivered via text_input's on_submit → PromptSubmit and
-            // doesn't reach this redirect.
-            (Some(Prompt::Open { .. }) | Some(Prompt::CommandPalette { .. }), m) => match m {
+            // Open, CommandPalette, and Apps all have a text_input on top
+            // and a filterable list below. text_input consumes Enter / Left
+            // / Right / Backspace / printable chars, so ↑/↓/PgUp/PgDn/Tab
+            // fall through here and we redirect them to PromptMove for list
+            // navigation. Enter is delivered via text_input's on_submit →
+            // PromptSubmit and doesn't reach this redirect.
+            (
+                Some(Prompt::Open { .. })
+                | Some(Prompt::CommandPalette { .. })
+                | Some(Prompt::Apps { .. }),
+                m,
+            ) => match m {
                 Message::MoveSelection(delta, _) => Message::PromptMove(delta),
                 Message::PageMove(dir, _) => Message::PromptMove(dir * 5),
                 Message::SwitchSide => Message::PromptMove(1),
@@ -503,6 +513,17 @@ impl App {
                         Prompt::Docker { input, .. } | Prompt::Processes { input, .. } => {
                             *input = value;
                         }
+                        Prompt::Apps {
+                            input,
+                            state,
+                            selected,
+                        } => {
+                            *input = value;
+                            if let AppsState::Loaded(list) = state {
+                                let n = filtered_apps(list, input).len();
+                                *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                            }
+                        }
                         Prompt::Delete { .. } | Prompt::NewFiles { .. } => {}
                     }
                 }
@@ -592,6 +613,35 @@ impl App {
                                 sort_dir,
                             });
                             None
+                        }
+                        // Apps modal: Enter launches the highlighted row.
+                        // If no row is selectable (empty / loading / error),
+                        // fall through to closing the modal silently.
+                        Prompt::Apps {
+                            state,
+                            input,
+                            selected,
+                        } => {
+                            let target = if let AppsState::Loaded(list) = &state {
+                                let filtered = filtered_apps(list, &input);
+                                filtered.get(selected).map(|&a| a.path.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(path) = target {
+                                if let Err(e) = launch_app(&path) {
+                                    eprintln!("launch {} failed: {}", path.display(), e);
+                                }
+                                None
+                            } else {
+                                // Nothing to launch — keep the modal open.
+                                self.prompt = Some(Prompt::Apps {
+                                    state,
+                                    input,
+                                    selected,
+                                });
+                                None
+                            }
                         }
                     }
                 } else {
@@ -752,6 +802,18 @@ impl App {
                         *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
                     }
                 }
+                Some(Prompt::Apps {
+                    state,
+                    input,
+                    selected,
+                }) => {
+                    if let AppsState::Loaded(list) = state {
+                        let n = filtered_apps(list, input).len() as i32;
+                        if n > 0 {
+                            *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                        }
+                    }
+                }
                 _ => {}
             },
             Message::OpenRecent(path) => {
@@ -849,6 +911,24 @@ impl App {
                     }
                 }
             }
+            Message::AppsListLoaded(result) => {
+                if let Some(Prompt::Apps { state, .. }) = self.prompt.as_mut() {
+                    *state = match result {
+                        Ok(mut list) => {
+                            sort_apps(&mut list);
+                            AppsState::Loaded(list)
+                        }
+                        Err(msg) => AppsState::Error(msg),
+                    };
+                }
+            }
+            Message::LaunchApp(path) => {
+                self.prompt = None;
+                self.show_next_pending();
+                if let Err(e) = launch_app(&path) {
+                    eprintln!("launch {} failed: {}", path.display(), e);
+                }
+            }
             Message::ProcessToggleSort(column) => {
                 if let Some(Prompt::Processes {
                     state,
@@ -915,6 +995,17 @@ impl App {
                 });
                 Task::batch([
                     ps_task(),
+                    text_input::focus(text_input::Id::new(PROMPT_ID)),
+                ])
+            }
+            PaletteAction::LaunchApplication => {
+                self.prompt = Some(Prompt::Apps {
+                    state: AppsState::Loading,
+                    input: String::new(),
+                    selected: 0,
+                });
+                Task::batch([
+                    apps_task(),
                     text_input::focus(text_input::Id::new(PROMPT_ID)),
                 ])
             }
@@ -1603,10 +1694,10 @@ fn compute_row_style(
 }
 
 fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
-    // Docker / Processes are table-shaped and benefit from extra horizontal
-    // room; the other modals are single-column and stay narrow.
+    // Docker / Processes / Apps are wider so the list rows have room. The
+    // other modals are single-column and stay narrow.
     let modal_width = match prompt {
-        Prompt::Docker { .. } | Prompt::Processes { .. } => 720.0,
+        Prompt::Docker { .. } | Prompt::Processes { .. } | Prompt::Apps { .. } => 720.0,
         _ => 440.0,
     };
     let dialog_inner = container(match prompt {
@@ -2147,6 +2238,107 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 header_row,
                 body,
                 text("Type to filter  ·  click a header to sort  ·  click Kill (SIGTERM)  ·  Esc dismisses").size(11),
+            ]
+            .spacing(6)
+        }
+        Prompt::Apps {
+            state,
+            input,
+            selected,
+        } => {
+            let filter_widget = text_input("filter apps…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+
+            let body: Element<'_, Message> = match state {
+                AppsState::Loading => container(text("Loading…").size(12))
+                    .padding(Padding::from([8, 8]))
+                    .into(),
+                AppsState::Error(msg) => container(
+                    text(msg.clone())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .style(|theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.extended_palette().danger.base.color),
+                        }),
+                )
+                .padding(Padding::from([8, 8]))
+                .into(),
+                AppsState::Loaded(apps) => {
+                    let filtered = filtered_apps(apps, input);
+                    if filtered.is_empty() {
+                        container(text("No apps match.").size(12))
+                            .padding(Padding::from([8, 8]))
+                            .into()
+                    } else {
+                        let list_col = filtered.iter().enumerate().fold(
+                            column![].spacing(3),
+                            |col, (i, app)| {
+                                let path = app.path.clone();
+                                let highlighted = i == *selected;
+                                let name_cell = text(app.name.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(12)
+                                    .width(Length::Fill)
+                                    .wrapping(iced::widget::text::Wrapping::None);
+                                // TODO: render an app icon here (parse the
+                                // bundle's .icns and decode to an iced
+                                // image::Handle). Skipped in v1 to avoid the
+                                // extra dep + per-app I/O on modal open.
+                                let row_widget = row![
+                                    name_cell,
+                                    button(
+                                        text("Launch")
+                                            .size(10)
+                                            .align_x(Horizontal::Center)
+                                            .width(Length::Fill),
+                                    )
+                                    .on_press(Message::LaunchApp(path))
+                                    .padding(Padding::from([2, 0]))
+                                    .width(Length::Fixed(70.0))
+                                    .style(button::primary),
+                                ]
+                                .spacing(8)
+                                .align_y(iced::Alignment::Center);
+                                col.push(
+                                    container(row_widget)
+                                        .padding(Padding::from([3, 8]))
+                                        .style(move |theme: &Theme| container::Style {
+                                            background: if highlighted {
+                                                Some(
+                                                    theme
+                                                        .extended_palette()
+                                                        .primary
+                                                        .weak
+                                                        .color
+                                                        .into(),
+                                                )
+                                            } else {
+                                                None
+                                            },
+                                            border: Border {
+                                                color: Color::TRANSPARENT,
+                                                width: 1.0,
+                                                radius: 4.0.into(),
+                                            },
+                                            ..Default::default()
+                                        }),
+                                )
+                            },
+                        );
+                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                    }
+                }
+            };
+
+            column![
+                text("Launch Application").size(15),
+                filter_widget,
+                body,
+                text("Type to filter  ·  ↑/↓ select  ·  Enter or click Launch  ·  Esc dismisses")
+                    .size(11),
             ]
             .spacing(6)
         }

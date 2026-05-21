@@ -112,6 +112,14 @@ pub enum Prompt {
         sort_by: ProcessSortBy,
         sort_dir: SortDir,
     },
+    /// "Launch Application" action (macOS only). Lists `.app` bundles under
+    /// `/Applications` (+ Utilities + `~/Applications`). `selected` is the
+    /// keyboard-navigable highlight, used by ↑/↓ + Enter to launch.
+    Apps {
+        state: AppsState,
+        input: String,
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,10 +160,25 @@ pub enum PaletteAction {
     Delete,
     DockerContainers,
     Processes,
+    /// Always present as a variant so `match` arms stay exhaustive without
+    /// `cfg` noise, but only listed in [`PaletteAction::ALL`] on macOS — on
+    /// other platforms the palette never offers it.
+    LaunchApplication,
     Exit,
 }
 
 impl PaletteAction {
+    #[cfg(target_os = "macos")]
+    pub const ALL: &'static [PaletteAction] = &[
+        PaletteAction::Copy,
+        PaletteAction::Delete,
+        PaletteAction::DockerContainers,
+        PaletteAction::Processes,
+        PaletteAction::LaunchApplication,
+        PaletteAction::Exit,
+    ];
+
+    #[cfg(not(target_os = "macos"))]
     pub const ALL: &'static [PaletteAction] = &[
         PaletteAction::Copy,
         PaletteAction::Delete,
@@ -170,6 +193,7 @@ impl PaletteAction {
             PaletteAction::Delete => "Delete",
             PaletteAction::DockerContainers => "Docker containers",
             PaletteAction::Processes => "Processes",
+            PaletteAction::LaunchApplication => "Launch Application",
             PaletteAction::Exit => "Exit",
         }
     }
@@ -258,6 +282,23 @@ pub struct Process {
 pub enum ProcessesState {
     Loading,
     Loaded(Vec<Process>),
+    Error(String),
+}
+
+/// macOS `.app` bundle discovered under one of the application directories.
+/// `icon` is reserved for a future change — v1 leaves it `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Application {
+    pub path: PathBuf,
+    pub name: String,
+}
+
+/// Lifecycle of the Launch Application modal. Same shape as [`DockerState`]
+/// and [`ProcessesState`].
+#[derive(Debug, Clone)]
+pub enum AppsState {
+    Loading,
+    Loaded(Vec<Application>),
     Error(String),
 }
 
@@ -410,6 +451,22 @@ pub fn filtered_processes<'a>(processes: &'a [Process], input: &str) -> Vec<&'a 
     processes
         .iter()
         .filter(|p| p.name.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Sort applications by name ascending (case-insensitive).
+pub fn sort_apps(apps: &mut [Application]) {
+    apps.sort_by_cached_key(|a| a.name.to_lowercase());
+}
+
+/// Case-insensitive substring filter over application names.
+pub fn filtered_apps<'a>(apps: &'a [Application], input: &str) -> Vec<&'a Application> {
+    if input.is_empty() {
+        return apps.iter().collect();
+    }
+    let needle = input.to_lowercase();
+    apps.iter()
+        .filter(|a| a.name.to_lowercase().contains(&needle))
         .collect()
 }
 
@@ -1692,4 +1749,71 @@ mod tests {
         assert_eq!(v[2].name, "Charlie");
     }
 
+    #[test]
+    fn palette_action_launch_application_label() {
+        assert_eq!(
+            PaletteAction::LaunchApplication.label(),
+            "Launch Application"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn palette_all_includes_launch_application_on_macos() {
+        assert!(PaletteAction::ALL.contains(&PaletteAction::LaunchApplication));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn palette_all_excludes_launch_application_off_macos() {
+        assert!(!PaletteAction::ALL.contains(&PaletteAction::LaunchApplication));
+    }
+
+    fn mk_app(name: &str) -> Application {
+        Application {
+            path: PathBuf::from(format!("/Applications/{}.app", name)),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn sort_apps_case_insensitive_by_name() {
+        let mut v = vec![mk_app("Slack"), mk_app("calculator"), mk_app("Xcode")];
+        sort_apps(&mut v);
+        assert_eq!(v[0].name, "calculator");
+        assert_eq!(v[1].name, "Slack");
+        assert_eq!(v[2].name, "Xcode");
+    }
+
+    #[test]
+    fn filtered_apps_substring_matches() {
+        let apps = vec![
+            mk_app("Slack"),
+            mk_app("Google Chrome"),
+            mk_app("Terminal"),
+        ];
+        let out = filtered_apps(&apps, "chrome");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "Google Chrome");
+    }
+
+    #[test]
+    fn filtered_apps_empty_returns_all() {
+        let apps = vec![mk_app("Slack"), mk_app("Terminal")];
+        let out = filtered_apps(&apps, "");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn filtered_apps_is_case_insensitive() {
+        let apps = vec![mk_app("Visual Studio Code")];
+        assert_eq!(filtered_apps(&apps, "VISUAL").len(), 1);
+        assert_eq!(filtered_apps(&apps, "code").len(), 1);
+    }
+
+    #[test]
+    fn filtered_apps_no_match_returns_empty() {
+        let apps = vec![mk_app("Slack")];
+        assert!(filtered_apps(&apps, "zzz").is_empty());
+    }
 }

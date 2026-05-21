@@ -73,7 +73,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -87,6 +87,7 @@ Inside a modal, the navigation keys behave differently:
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
 | Processes | Type to filter (substring against name). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
+| Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
 
 ### Docker containers modal
 
@@ -139,3 +140,17 @@ The modal is Unix-only in v1 (macOS + Linux). On other platforms it
 displays an explanatory message instead of a list — wiring up `tasklist`
 + `taskkill` on Windows is left for a future change.
 
+### Launch Application modal (macOS only)
+
+Picking **Launch Application** from the command palette scans
+`/Applications`, `/Applications/Utilities`, and `~/Applications` for
+`.app` bundles and lists them sorted by name. A filter input narrows by
+substring (case-insensitive). `↑`/`↓`/`Tab` (and `PageUp`/`PageDown` for
+5-row jumps) move the highlight; `Enter` or clicking the per-row
+`Launch` button calls `open <bundle>` and dismisses the modal.
+
+The action is hidden from the command palette on non-macOS platforms;
+launching macOS `.app` bundles isn't meaningful elsewhere.
+
+App icons are not rendered in v1 — supporting them needs `.icns` parsing
+(adds a dependency) plus per-app I/O on modal open. Likely added later.
