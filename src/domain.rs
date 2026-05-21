@@ -63,8 +63,14 @@ pub enum RowVisual {
 /// Modal flavors. Each carries the data the modal needs.
 #[derive(Debug, Clone)]
 pub enum Prompt {
+    /// "Go to folder" — typed input plus a filterable list of recent locations
+    /// (captured at open time). Submit prefers the typed path if it resolves
+    /// to a real directory; otherwise opens the highlighted recent.
     Open {
         input: String,
+        recents: Vec<PathBuf>,
+        /// Index into the *filtered* list of recents.
+        selected: usize,
     },
     Copy {
         input: String,
@@ -80,7 +86,10 @@ pub enum Prompt {
         files: Vec<String>,
         focus: NewFilesFocus,
     },
+    /// Action picker with a filter input. `selected` is an index into the
+    /// *filtered* list of actions.
     CommandPalette {
+        input: String,
         selected: usize,
     },
 }
@@ -379,6 +388,43 @@ pub fn sort_entries(entries: &mut [Entry], by: SortBy, dir: SortDir) {
         (SortBy::Modified, SortDir::Desc) => {
             entries.sort_by_key(|e| (!e.is_dir, Reverse(e.modified)));
         }
+    }
+}
+
+/// Case-insensitive substring filter over a slice of paths.
+/// Empty `input` returns every entry in arrival order.
+pub fn filtered_recents<'a>(recents: &'a [PathBuf], input: &str) -> Vec<&'a PathBuf> {
+    if input.is_empty() {
+        return recents.iter().collect();
+    }
+    let needle = input.to_lowercase();
+    recents
+        .iter()
+        .filter(|p| p.display().to_string().to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Case-insensitive substring filter over the command-palette action list.
+pub fn filtered_actions(input: &str) -> Vec<PaletteAction> {
+    if input.is_empty() {
+        return PaletteAction::ALL.to_vec();
+    }
+    let needle = input.to_lowercase();
+    PaletteAction::ALL
+        .iter()
+        .copied()
+        .filter(|a| a.label().to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Insert `path` at the front of `recents` (move-to-front if already present)
+/// and truncate to `cap` entries. `path` should be a directory you actually
+/// navigated to — the caller is responsible for that filtering.
+pub fn add_recent(recents: &mut Vec<PathBuf>, path: PathBuf, cap: usize) {
+    recents.retain(|p| p != &path);
+    recents.insert(0, path);
+    if recents.len() > cap {
+        recents.truncate(cap);
     }
 }
 
@@ -954,5 +1000,111 @@ mod tests {
         p.anchor = 0;
         p.selected = 0;
         assert!(p.marked_paths().is_empty());
+    }
+
+    #[test]
+    fn filtered_recents_empty_input_returns_all() {
+        let recents = vec![
+            PathBuf::from("/etc"),
+            PathBuf::from("/usr/local"),
+            PathBuf::from("/home/me"),
+        ];
+        let out = filtered_recents(&recents, "");
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn filtered_recents_substring_matches() {
+        let recents = vec![
+            PathBuf::from("/etc"),
+            PathBuf::from("/usr/local"),
+            PathBuf::from("/home/me"),
+        ];
+        let out = filtered_recents(&recents, "local");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], &PathBuf::from("/usr/local"));
+    }
+
+    #[test]
+    fn filtered_recents_is_case_insensitive() {
+        let recents = vec![PathBuf::from("/Etc"), PathBuf::from("/Usr/Local")];
+        let out = filtered_recents(&recents, "etc");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], &PathBuf::from("/Etc"));
+    }
+
+    #[test]
+    fn filtered_recents_no_match_returns_empty() {
+        let recents = vec![PathBuf::from("/etc"), PathBuf::from("/usr/local")];
+        let out = filtered_recents(&recents, "zzz");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filtered_actions_empty_input_returns_all() {
+        let out = filtered_actions("");
+        assert_eq!(out.len(), PaletteAction::ALL.len());
+    }
+
+    #[test]
+    fn filtered_actions_substring_matches_label() {
+        let out = filtered_actions("cop");
+        assert_eq!(out, vec![PaletteAction::Copy]);
+    }
+
+    #[test]
+    fn filtered_actions_is_case_insensitive() {
+        let out = filtered_actions("EXIT");
+        assert_eq!(out, vec![PaletteAction::Exit]);
+    }
+
+    #[test]
+    fn filtered_actions_no_match_returns_empty() {
+        let out = filtered_actions("zzzz");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn add_recent_inserts_at_front() {
+        let mut r: Vec<PathBuf> = Vec::new();
+        add_recent(&mut r, PathBuf::from("/a"), 10);
+        add_recent(&mut r, PathBuf::from("/b"), 10);
+        assert_eq!(r, vec![PathBuf::from("/b"), PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn add_recent_moves_existing_to_front() {
+        let mut r = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+        add_recent(&mut r, PathBuf::from("/b"), 10);
+        // /b moved from middle to front; no duplicate.
+        assert_eq!(
+            r,
+            vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_recent_respects_cap() {
+        let mut r: Vec<PathBuf> = (0..5).map(|i| PathBuf::from(format!("/p{}", i))).collect();
+        add_recent(&mut r, PathBuf::from("/new"), 3);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0], PathBuf::from("/new"));
+    }
+
+    #[test]
+    fn add_recent_repeated_same_path_is_idempotent() {
+        let mut r: Vec<PathBuf> = Vec::new();
+        add_recent(&mut r, PathBuf::from("/a"), 10);
+        add_recent(&mut r, PathBuf::from("/a"), 10);
+        add_recent(&mut r, PathBuf::from("/a"), 10);
+        assert_eq!(r, vec![PathBuf::from("/a")]);
     }
 }

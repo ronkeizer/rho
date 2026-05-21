@@ -14,6 +14,10 @@ machine-managed and you generally shouldn't touch it.
 left: /Users/you/projects
 right: /Users/you/Downloads
 active: left
+recent:
+  - /Users/you/projects
+  - /Users/you/Downloads
+  - /etc
 ```
 
 | Key | Type | Notes |
@@ -21,6 +25,7 @@ active: left
 | `left` | path | Folder shown in the left pane. |
 | `right` | path | Folder shown in the right pane. |
 | `active` | `left` \| `right` | Which pane has focus. Defaults to `left` if missing (older state files written before this field existed will still load). |
+| `recent` | list of paths | Recently-navigated directories, most-recent first. Used by the `⌘P` "Go to folder" modal as filterable suggestions. Capped at 50 entries; the same path is only ever listed once (move-to-front on revisit). Defaults to an empty list. |
 
 ## Recovery behaviour
 

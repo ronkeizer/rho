@@ -98,6 +98,11 @@ pub struct SavedState {
     pub right: PathBuf,
     #[serde(default = "default_active_side")]
     pub active: Side,
+    /// Recently-navigated directories, most-recent first. Used by the
+    /// "Go to folder" modal as filterable suggestions. Maintained via
+    /// [`crate::domain::add_recent`].
+    #[serde(default)]
+    pub recent: Vec<PathBuf>,
 }
 
 pub fn default_active_side() -> Side {
@@ -487,23 +492,27 @@ mod tests {
             left: PathBuf::from("/tmp/left"),
             right: PathBuf::from("/tmp/right"),
             active: Side::Right,
+            recent: vec![PathBuf::from("/etc"), PathBuf::from("/usr/local")],
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         let parsed: SavedState = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.left, state.left);
         assert_eq!(parsed.right, state.right);
         assert_eq!(parsed.active, state.active);
+        assert_eq!(parsed.recent, state.recent);
     }
 
     #[test]
     fn saved_state_active_field_defaults_when_missing() {
-        // Older state files (or hand-edited ones) may omit `active`. The
-        // serde default should fill in Side::Left rather than failing.
+        // Older state files (or hand-edited ones) may omit `active` and
+        // `recent`. The serde defaults should fill in Side::Left and an
+        // empty list rather than failing.
         let yaml = "left: /a\nright: /b\n";
         let parsed: SavedState = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(parsed.left, PathBuf::from("/a"));
         assert_eq!(parsed.right, PathBuf::from("/b"));
         assert_eq!(parsed.active, Side::Left);
+        assert!(parsed.recent.is_empty());
     }
 
     #[test]
@@ -512,6 +521,7 @@ mod tests {
             left: PathBuf::from("/x"),
             right: PathBuf::from("/y"),
             active: Side::Right,
+            recent: Vec::new(),
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         // serde(rename_all = "lowercase") should produce "right" not "Right".

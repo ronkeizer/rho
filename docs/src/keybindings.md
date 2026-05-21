@@ -72,8 +72,8 @@ Directories always cluster before files regardless of sort column.
 
 | Key | Action |
 |---|---|
-| `⌘P` | "Go to folder" prompt — type a path (with `~` expansion), Enter to open |
-| `⌘⇧P` | Command palette (Copy / Delete / Exit) |
+| `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -81,7 +81,7 @@ Inside a modal, the navigation keys behave differently:
 
 | Modal | Keys |
 |---|---|
-| Open / Copy (text input) | `Enter` submit, `Esc` cancel |
+| Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
+| Copy (text input only) | `Enter` submit, `Esc` cancel |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
-| Command palette | `↑` / `↓` / `Tab` move the highlight, `Enter` activates, `Esc` dismisses |

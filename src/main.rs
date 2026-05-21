@@ -21,12 +21,13 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, RowColors, SavedState,
 };
 use domain::{
-    sort_entries, DeleteFocus, Entry, GitInfo, NewFilesFocus, PaletteAction, Pane, Prompt,
-    RowVisual, Side, SortBy, SortDir,
+    add_recent, filtered_actions, filtered_recents, sort_entries, DeleteFocus, Entry, GitInfo,
+    NewFilesFocus, PaletteAction, Pane, Prompt, RowVisual, Side, SortBy, SortDir,
 };
 use fs_ops::{copy_task, delete_task, file_watch_subscription, loading_tasks};
 
 const PROMPT_ID: &str = "prompt";
+const RECENT_CAP: usize = 50;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -83,9 +84,12 @@ enum Message {
     NewFilesPickSide(Side),
     /// Open the command-palette modal (Cmd+Shift+P).
     OpenCommandPalette,
-    /// Move the palette cursor by `delta` rows (wraps).
-    PaletteMove(i32),
-    /// User selected an action from the command palette.
+    /// Move the highlight in the current filterable modal (Open / CommandPalette)
+    /// by `delta` rows (wraps).
+    PromptMove(i32),
+    /// User clicked a recent location in the Open modal — open it directly.
+    OpenRecent(PathBuf),
+    /// User clicked an action in the command palette — activate it directly.
     PaletteSelect(PaletteAction),
     NoOp,
 }
@@ -110,6 +114,9 @@ struct App {
     /// New-file detections that arrived while another modal was open. Drained
     /// FIFO when the current modal closes.
     pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
+    /// Most-recently-visited directories, front-first. Persisted to
+    /// `~/.fm-state.yaml`. Updated on every successful navigate.
+    recent_locations: Vec<PathBuf>,
 }
 
 impl App {
@@ -134,6 +141,10 @@ impl App {
             .filter(|p| p.is_dir())
             .unwrap_or_else(|| home.clone());
         let active = saved.as_ref().map(|s| s.active).unwrap_or(Side::Left);
+        let recent_locations = saved
+            .as_ref()
+            .map(|s| s.recent.clone())
+            .unwrap_or_default();
 
         let app = Self {
             config,
@@ -147,6 +158,7 @@ impl App {
             copy_in_progress: None,
             delete_in_progress: None,
             pending_new_files: std::collections::VecDeque::new(),
+            recent_locations,
         };
         // Pane::empty starts at load_generation 0; the initial loads tag
         // their chunks the same way so they're accepted.
@@ -162,6 +174,7 @@ impl App {
             left: self.left.path.clone(),
             right: self.right.path.clone(),
             active: self.active,
+            recent: self.recent_locations.clone(),
         });
     }
 
@@ -181,6 +194,7 @@ impl App {
 
     fn navigate(&mut self, side: Side, path: PathBuf) -> Task<Message> {
         let generation = self.pane_mut(side).navigate(path.clone());
+        add_recent(&mut self.recent_locations, path.clone(), RECENT_CAP);
         self.save_state();
         Task::batch([
             loading_tasks(side, path, generation),
@@ -280,19 +294,18 @@ impl App {
                     other => other,
                 }
             }
-            (Some(Prompt::CommandPalette { selected }), m) => {
-                let selected = *selected;
-                match m {
-                    // Enter activates the currently highlighted action.
-                    Message::ActivateSelection => {
-                        Message::PaletteSelect(PaletteAction::ALL[selected])
-                    }
-                    // Arrow keys + Tab cycle the selection (handled as PaletteMove).
-                    Message::MoveSelection(delta, _) => Message::PaletteMove(delta),
-                    Message::SwitchSide => Message::PaletteMove(1),
-                    other => other,
-                }
-            }
+            // Open and CommandPalette both have a text_input on top and a
+            // filterable list below. text_input consumes Enter / Left / Right
+            // / Backspace / printable chars, so ↑/↓/PgUp/PgDn/Tab fall through
+            // here and we redirect them to PromptMove for list navigation.
+            // Enter is delivered via text_input's on_submit → PromptSubmit and
+            // doesn't reach this redirect.
+            (Some(Prompt::Open { .. }) | Some(Prompt::CommandPalette { .. }), m) => match m {
+                Message::MoveSelection(delta, _) => Message::PromptMove(delta),
+                Message::PageMove(dir, _) => Message::PromptMove(dir * 5),
+                Message::SwitchSide => Message::PromptMove(1),
+                other => other,
+            },
             (_, m) => m,
         };
 
@@ -398,8 +411,11 @@ impl App {
                 pane.viewport_height = Some(vh);
             }
             Message::OpenPrompt => {
-                let current = self.pane(self.active).path.display().to_string();
-                self.prompt = Some(Prompt::Open { input: current });
+                self.prompt = Some(Prompt::Open {
+                    input: String::new(),
+                    recents: self.recent_locations.clone(),
+                    selected: 0,
+                });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenCopyPrompt => {
@@ -442,25 +458,51 @@ impl App {
             Message::PromptChanged(value) => {
                 if let Some(prompt) = self.prompt.as_mut() {
                     match prompt {
-                        Prompt::Open { input } | Prompt::Copy { input } => {
+                        Prompt::Open {
+                            input,
+                            recents,
+                            selected,
+                        } => {
+                            *input = value;
+                            // The filtered view just shrank or grew — clamp
+                            // the highlight so it points at a real row.
+                            let n = filtered_recents(recents, input).len();
+                            *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                        }
+                        Prompt::Copy { input } => {
                             *input = value;
                         }
-                        Prompt::Delete { .. }
-                        | Prompt::NewFiles { .. }
-                        | Prompt::CommandPalette { .. } => {}
+                        Prompt::CommandPalette { input, selected } => {
+                            *input = value;
+                            let n = filtered_actions(input).len();
+                            *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                        }
+                        Prompt::Delete { .. } | Prompt::NewFiles { .. } => {}
                     }
                 }
             }
             Message::PromptSubmit => {
                 let task = if let Some(prompt) = self.prompt.take() {
                     match prompt {
-                        Prompt::Open { input } => {
-                            let path = PathBuf::from(expand_tilde(input.trim()));
-                            if path.is_dir() {
-                                Some(self.navigate(self.active, path))
+                        Prompt::Open {
+                            input,
+                            recents,
+                            selected,
+                        } => {
+                            // Priority: typed input first (if it resolves to
+                            // a real directory), otherwise the highlighted
+                            // recent. This lets the user type a fresh path
+                            // even when a substring matches an existing one.
+                            let typed = PathBuf::from(expand_tilde(input.trim()));
+                            let target = if typed.is_dir() {
+                                Some(typed)
                             } else {
-                                None
-                            }
+                                let filtered = filtered_recents(&recents, &input);
+                                filtered.get(selected).map(|&p| p.clone())
+                            };
+                            target
+                                .filter(|p| p.is_dir())
+                                .map(|p| self.navigate(self.active, p))
                         }
                         Prompt::Copy { input } => {
                             let dest = PathBuf::from(expand_tilde(input.trim()));
@@ -487,9 +529,13 @@ impl App {
                         // NewFiles uses NewFilesPickSide / PromptCancel, never
                         // PromptSubmit. If we somehow get here, just drop it.
                         Prompt::NewFiles { .. } => None,
-                        // CommandPalette has its own action messages; PromptSubmit
-                        // is a no-op here.
-                        Prompt::CommandPalette { .. } => None,
+                        Prompt::CommandPalette { input, selected } => {
+                            let filtered = filtered_actions(&input);
+                            if let Some(action) = filtered.get(selected).copied() {
+                                return self.execute_palette_action(action);
+                            }
+                            None
+                        }
                     }
                 } else {
                     None
@@ -626,40 +672,69 @@ impl App {
                 }
             }
             Message::OpenCommandPalette => {
-                self.prompt = Some(Prompt::CommandPalette { selected: 0 });
+                self.prompt = Some(Prompt::CommandPalette {
+                    input: String::new(),
+                    selected: 0,
+                });
+                return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
-            Message::PaletteMove(delta) => {
-                if let Some(Prompt::CommandPalette { selected }) = self.prompt.as_mut() {
-                    let n = PaletteAction::ALL.len() as i32;
-                    *selected = ((*selected as i32 + delta).rem_euclid(n)) as usize;
+            Message::PromptMove(delta) => match self.prompt.as_mut() {
+                Some(Prompt::Open {
+                    input,
+                    recents,
+                    selected,
+                }) => {
+                    let n = filtered_recents(recents, input).len() as i32;
+                    if n > 0 {
+                        *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                    }
+                }
+                Some(Prompt::CommandPalette { input, selected }) => {
+                    let n = filtered_actions(input).len() as i32;
+                    if n > 0 {
+                        *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                    }
+                }
+                _ => {}
+            },
+            Message::OpenRecent(path) => {
+                self.prompt = None;
+                self.show_next_pending();
+                if path.is_dir() {
+                    return self.navigate(self.active, path);
                 }
             }
             Message::PaletteSelect(action) => {
-                self.prompt = None;
-                match action {
-                    PaletteAction::Copy => {
-                        let other = self.active.other();
-                        let dest = self.pane(other).path.display().to_string();
-                        self.prompt = Some(Prompt::Copy { input: dest });
-                        return text_input::focus(text_input::Id::new(PROMPT_ID));
-                    }
-                    PaletteAction::Delete => {
-                        let paths = self.pane(self.active).marked_paths();
-                        if !paths.is_empty() {
-                            self.prompt = Some(Prompt::Delete {
-                                paths,
-                                focus: DeleteFocus::Cancel,
-                            });
-                        }
-                    }
-                    PaletteAction::Exit => {
-                        return window::get_oldest().and_then(window::close);
-                    }
-                }
+                return self.execute_palette_action(action);
             }
             Message::NoOp => {}
         }
         Task::none()
+    }
+
+    /// Dispatch a command-palette action. Shared between direct clicks
+    /// (`PaletteSelect`) and Enter-on-highlighted (`PromptSubmit`).
+    fn execute_palette_action(&mut self, action: PaletteAction) -> Task<Message> {
+        self.prompt = None;
+        match action {
+            PaletteAction::Copy => {
+                let other = self.active.other();
+                let dest = self.pane(other).path.display().to_string();
+                self.prompt = Some(Prompt::Copy { input: dest });
+                text_input::focus(text_input::Id::new(PROMPT_ID))
+            }
+            PaletteAction::Delete => {
+                let paths = self.pane(self.active).marked_paths();
+                if !paths.is_empty() {
+                    self.prompt = Some(Prompt::Delete {
+                        paths,
+                        focus: DeleteFocus::Cancel,
+                    });
+                }
+                Task::none()
+            }
+            PaletteAction::Exit => window::get_oldest().and_then(window::close),
+        }
     }
 
     /// If the currently-displayed modal has just closed and we have queued
@@ -1344,55 +1419,114 @@ fn compute_row_style(
 
 fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
     let dialog_inner = container(match prompt {
-        Prompt::Open { input } | Prompt::Copy { input } => {
-            let (title, placeholder, hint) = match prompt {
-                Prompt::Open { .. } => (
-                    "Go to folder",
-                    "/path/to/folder",
-                    "Enter to open  ·  Esc or click outside to cancel",
-                ),
-                Prompt::Copy { .. } => (
-                    "Copy selected to",
-                    "/path/to/destination",
-                    "Enter to copy  ·  Esc or click outside to cancel",
-                ),
-                Prompt::Delete { .. } | Prompt::NewFiles { .. } | Prompt::CommandPalette { .. } => {
-                    unreachable!()
-                }
+        Prompt::Open {
+            input,
+            recents,
+            selected,
+        } => {
+            let filtered = filtered_recents(recents, input);
+            let input_widget = text_input("type a path or filter recents…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+
+            let list_body: Element<'_, Message> = if filtered.is_empty() {
+                container(
+                    text(if recents.is_empty() {
+                        "No recent locations yet — type a path and press Enter."
+                    } else {
+                        "No recent locations match — type a path and press Enter."
+                    })
+                    .size(11),
+                )
+                .padding(Padding::from([4, 8]))
+                .into()
+            } else {
+                let list_col = filtered.iter().enumerate().fold(
+                    column![].spacing(2),
+                    |col, (i, path)| {
+                        let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
+                            button::primary
+                        } else {
+                            button::secondary
+                        };
+                        col.push(
+                            button(
+                                text(path.display().to_string())
+                                    .font(Font::MONOSPACE)
+                                    .size(12)
+                                    .wrapping(iced::widget::text::Wrapping::None),
+                            )
+                            .on_press(Message::OpenRecent((*path).clone()))
+                            .padding(Padding::from([4, 8]))
+                            .width(Length::Fill)
+                            .style(style),
+                        )
+                    },
+                );
+                scrollable(list_col)
+                    .height(Length::Fixed(240.0))
+                    .into()
             };
+
             column![
-                text(title).size(15),
-                text_input(placeholder, input)
-                    .id(text_input::Id::new(PROMPT_ID))
-                    .on_input(Message::PromptChanged)
-                    .on_submit(Message::PromptSubmit)
-                    .padding(8),
-                text(hint).size(11),
+                text("Go to folder").size(15),
+                input_widget,
+                list_body,
+                text("↑/↓ or Tab select  ·  Enter open  ·  Esc cancel").size(11),
             ]
             .spacing(10)
         }
-        Prompt::CommandPalette { selected } => {
-            let actions_col = PaletteAction::ALL.iter().enumerate().fold(
-                column![].spacing(4),
-                |col, (i, action)| {
-                    let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
-                        button::primary
-                    } else {
-                        button::secondary
-                    };
-                    col.push(
-                        button(text(action.label()))
-                            .on_press(Message::PaletteSelect(*action))
-                            .padding(Padding::from([8, 20]))
-                            .width(Length::Fill)
-                            .style(style),
-                    )
-                },
-            );
+        Prompt::Copy { input } => column![
+            text("Copy selected to").size(15),
+            text_input("/path/to/destination", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8),
+            text("Enter to copy  ·  Esc or click outside to cancel").size(11),
+        ]
+        .spacing(10),
+        Prompt::CommandPalette { input, selected } => {
+            let filtered = filtered_actions(input);
+            let input_widget = text_input("filter actions…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+
+            let list_body: Element<'_, Message> = if filtered.is_empty() {
+                container(text("No actions match.").size(11))
+                    .padding(Padding::from([4, 8]))
+                    .into()
+            } else {
+                let actions_col = filtered.iter().enumerate().fold(
+                    column![].spacing(4),
+                    |col, (i, action)| {
+                        let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
+                            button::primary
+                        } else {
+                            button::secondary
+                        };
+                        col.push(
+                            button(text(action.label()))
+                                .on_press(Message::PaletteSelect(*action))
+                                .padding(Padding::from([8, 20]))
+                                .width(Length::Fill)
+                                .style(style),
+                        )
+                    },
+                );
+                actions_col.into()
+            };
+
             column![
                 text("Command Palette").size(15),
-                actions_col,
-                text("↑/↓ or Tab navigate  ·  Enter activate  ·  Esc dismiss").size(11),
+                input_widget,
+                list_body,
+                text("Type to filter  ·  ↑/↓ or Tab select  ·  Enter activate  ·  Esc dismiss")
+                    .size(11),
             ]
             .spacing(10)
         }
