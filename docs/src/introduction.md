@@ -40,8 +40,12 @@ input device.
 
 **File operations**
 
-- Copy (`F5`) and delete (`Delete`) with a confirmation modal for
-  delete.
+- Copy (`F5`), move (`F6`), and delete (`Delete`) with a confirmation
+  modal for delete. Move uses `fs::rename` and falls back to copy +
+  delete when the source and destination are on different filesystems.
+- Compress marked files / folders into a `.zip` (palette → Compress);
+  extract `.zip` / `.tar.gz` archives (palette → Uncompress). Both
+  default the destination to the other pane.
 - "Go to folder" prompt (`⌘P`) with a recent-locations cache —
   filter-as-you-type and arrow-key picker; typing a fresh path also
   just works.

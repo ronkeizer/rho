@@ -39,6 +39,7 @@ selection just means "this row".
 | `F4` | Edit the cursor row's file in `$VISUAL` / `$EDITOR` (falls back to `open -t` on macOS) |
 | `Space` | Quick Look preview the cursor row's file (macOS only; no-op elsewhere) |
 | `F5` | Open the copy modal (destination defaults to the other pane's directory) |
+| `F6` | Open the move modal (destination defaults to the other pane's directory) |
 | `F10` | Quit the app immediately. Works even with a modal open — no confirmation. |
 | `Delete` | Open the delete-confirm modal for the current mark |
 
@@ -74,7 +75,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -83,7 +84,8 @@ Inside a modal, the navigation keys behave differently:
 | Modal | Keys |
 |---|---|
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
-| Copy (text input only) | `Enter` submit, `Esc` cancel |
+| Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. |
+| Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
@@ -92,6 +94,26 @@ Inside a modal, the navigation keys behave differently:
 | Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
 | Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
 | Connect to SSH server | Type to filter (substring against alias or hostname). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Connect` opens a new terminal running `ssh <alias>`. `Esc` dismisses. |
+
+### Compress / Uncompress modals
+
+**Compress** bundles the marked files and folders into a single `.zip`.
+The destination text input is pre-filled with `<other-pane>/<first-mark-stem>.zip`
+— for `report.tar.gz` you get `report.zip`, for the folder `MyApp` you
+get `MyApp.zip`. The full `.tar.gz` / `.tar.bz2` compound extension is
+stripped, not just the trailing `.gz` / `.bz2`. `zip -r` is invoked with
+the active pane as its working directory so paths *inside* the archive
+are relative (you get `report.pdf`, not `/Users/me/project/report.pdf`).
+
+**Uncompress** extracts every marked archive into the destination
+directory (defaults to the other pane). Per archive: `.zip` is dispatched
+to `unzip -d`, `.tar.gz` / `.tgz` to `tar -xzf -C`. Unknown extensions
+fail per-archive without blocking the others.
+
+Both actions require their respective CLIs (`zip`, `unzip`, `tar`) to be
+on `PATH`. macOS ships all three; most Linux distros do too. On Windows
+`tar` is built-in but `zip` / `unzip` need to be installed separately
+(or the actions will error out with "not found in PATH").
 
 ### Docker containers modal
 

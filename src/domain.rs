@@ -75,6 +75,22 @@ pub enum Prompt {
     Copy {
         input: String,
     },
+    /// Same shape as `Copy` — pre-filled destination path, no
+    /// confirmation. The submit handler runs `move_task` instead of
+    /// `copy_task`.
+    Move {
+        input: String,
+    },
+    /// `Compress`: pre-filled destination zip path (defaults to other-pane
+    /// + first-mark-stem.zip). On submit, runs `zip -r` on the marks.
+    Compress {
+        input: String,
+    },
+    /// `Uncompress`: pre-filled destination directory (defaults to other
+    /// pane). On submit, runs `unzip` / `tar -xzf` per marked archive.
+    Uncompress {
+        input: String,
+    },
     Delete {
         paths: Vec<PathBuf>,
         focus: DeleteFocus,
@@ -181,7 +197,10 @@ impl NewFilesFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteAction {
     Copy,
+    Move,
     Delete,
+    Compress,
+    Uncompress,
     DockerContainers,
     Processes,
     /// Always present as a variant so `match` arms stay exhaustive without
@@ -201,7 +220,10 @@ impl PaletteAction {
     #[cfg(target_os = "macos")]
     pub const ALL: &'static [PaletteAction] = &[
         PaletteAction::Copy,
+        PaletteAction::Move,
         PaletteAction::Delete,
+        PaletteAction::Compress,
+        PaletteAction::Uncompress,
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
         PaletteAction::LaunchApplication,
@@ -215,7 +237,10 @@ impl PaletteAction {
     #[cfg(not(target_os = "macos"))]
     pub const ALL: &'static [PaletteAction] = &[
         PaletteAction::Copy,
+        PaletteAction::Move,
         PaletteAction::Delete,
+        PaletteAction::Compress,
+        PaletteAction::Uncompress,
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
         PaletteAction::GitBranch,
@@ -228,7 +253,10 @@ impl PaletteAction {
     pub fn label(self) -> &'static str {
         match self {
             PaletteAction::Copy => "Copy",
+            PaletteAction::Move => "Move",
             PaletteAction::Delete => "Delete",
+            PaletteAction::Compress => "Compress",
+            PaletteAction::Uncompress => "Uncompress",
             PaletteAction::DockerContainers => "Docker containers",
             PaletteAction::Processes => "Processes",
             PaletteAction::LaunchApplication => "Launch Application",
@@ -239,6 +267,58 @@ impl PaletteAction {
             PaletteAction::Exit => "Exit",
         }
     }
+}
+
+/// Archive formats the Uncompress action understands. Detected via file
+/// extension by [`detect_archive_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Zip,
+    TarGz,
+}
+
+/// Recognize `.zip`, `.tar.gz`, and `.tgz` by extension. Case-insensitive.
+pub fn detect_archive_format(filename: &str) -> Option<ArchiveFormat> {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".zip") {
+        Some(ArchiveFormat::Zip)
+    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some(ArchiveFormat::TarGz)
+    } else {
+        None
+    }
+}
+
+/// Default filename for the Compress modal — takes the stem of the first
+/// marked path and appends `.zip`. Falls back to `archive.zip` for an empty
+/// list. The "stem" strips the longest extension we can (so
+/// `report.tar.gz` → `report`, not `report.tar`).
+pub fn default_zip_filename(srcs: &[PathBuf]) -> String {
+    let Some(first) = srcs.first() else {
+        return "archive.zip".to_string();
+    };
+    let name = first
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".to_string());
+    // Strip the longest extension we recognize, then anything after the
+    // last `.`. E.g. report.tar.gz → report; image.jpeg → image; LICENSE
+    // (no extension) stays LICENSE.
+    let lower = name.to_lowercase();
+    let stem = if lower.ends_with(".tar.gz") {
+        &name[..name.len() - 7]
+    } else if lower.ends_with(".tar.bz2") {
+        &name[..name.len() - 8]
+    } else if let Some(dot) = name.rfind('.') {
+        if dot > 0 {
+            &name[..dot]
+        } else {
+            name.as_str()
+        }
+    } else {
+        name.as_str()
+    };
+    format!("{}.zip", stem)
 }
 
 /// Static reference for the in-app "Keyboard shortcuts" modal. Mirror of the
@@ -269,6 +349,7 @@ pub fn keyboard_shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static st
                 ("F4", "Edit the cursor file in $VISUAL / $EDITOR"),
                 ("Space", "Quick Look preview (macOS only)"),
                 ("F5", "Open the copy modal"),
+                ("F6", "Open the move modal"),
                 ("Delete", "Open the delete-confirm modal"),
                 ("F10", "Quit the app immediately"),
             ],
@@ -2412,5 +2493,91 @@ Host work
             PaletteAction::OpenClaudeCode.label(),
             "Open Claude Code in this folder"
         );
+    }
+
+    #[test]
+    fn palette_action_move_label() {
+        assert_eq!(PaletteAction::Move.label(), "Move");
+    }
+
+    #[test]
+    fn palette_all_includes_move() {
+        assert!(PaletteAction::ALL.contains(&PaletteAction::Move));
+    }
+
+    #[test]
+    fn palette_action_compress_labels() {
+        assert_eq!(PaletteAction::Compress.label(), "Compress");
+        assert_eq!(PaletteAction::Uncompress.label(), "Uncompress");
+    }
+
+    #[test]
+    fn detect_archive_format_zip() {
+        assert_eq!(detect_archive_format("file.zip"), Some(ArchiveFormat::Zip));
+        assert_eq!(detect_archive_format("FILE.ZIP"), Some(ArchiveFormat::Zip));
+    }
+
+    #[test]
+    fn detect_archive_format_tar_gz() {
+        assert_eq!(
+            detect_archive_format("file.tar.gz"),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(detect_archive_format("file.tgz"), Some(ArchiveFormat::TarGz));
+        // Mixed case still matches.
+        assert_eq!(
+            detect_archive_format("File.Tar.Gz"),
+            Some(ArchiveFormat::TarGz)
+        );
+    }
+
+    #[test]
+    fn detect_archive_format_unknown() {
+        assert_eq!(detect_archive_format("file.rar"), None);
+        assert_eq!(detect_archive_format("file"), None);
+        assert_eq!(detect_archive_format(""), None);
+    }
+
+    #[test]
+    fn default_zip_filename_strips_simple_extension() {
+        let srcs = vec![PathBuf::from("/tmp/report.pdf")];
+        assert_eq!(default_zip_filename(&srcs), "report.zip");
+    }
+
+    #[test]
+    fn default_zip_filename_strips_tar_gz() {
+        // The full `.tar.gz` extension is stripped, not just `.gz`.
+        let srcs = vec![PathBuf::from("/tmp/archive.tar.gz")];
+        assert_eq!(default_zip_filename(&srcs), "archive.zip");
+    }
+
+    #[test]
+    fn default_zip_filename_directory_name_stays() {
+        // Directory without an extension keeps its full name + .zip.
+        let srcs = vec![PathBuf::from("/tmp/MyFolder")];
+        assert_eq!(default_zip_filename(&srcs), "MyFolder.zip");
+    }
+
+    #[test]
+    fn default_zip_filename_uses_first_marked() {
+        // Only the first src's name informs the default.
+        let srcs = vec![
+            PathBuf::from("/tmp/first.txt"),
+            PathBuf::from("/tmp/second.txt"),
+        ];
+        assert_eq!(default_zip_filename(&srcs), "first.zip");
+    }
+
+    #[test]
+    fn default_zip_filename_empty_falls_back() {
+        assert_eq!(default_zip_filename(&[]), "archive.zip");
+    }
+
+    #[test]
+    fn default_zip_filename_dotfile_keeps_name() {
+        // `.gitignore` has no separating extension — treat the whole thing
+        // as the stem so we don't end up with an empty filename.
+        let srcs = vec![PathBuf::from("/tmp/.gitignore")];
+        assert_eq!(default_zip_filename(&srcs), ".gitignore.zip");
     }
 }

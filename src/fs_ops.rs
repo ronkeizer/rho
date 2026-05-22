@@ -10,8 +10,9 @@ use std::time::Duration;
 use iced::{Subscription, Task};
 
 use crate::domain::{
-    parse_docker_ps, parse_git_branches, parse_ps_output, parse_ssh_config, Application,
-    DockerContainer, Entry, GitBranch, GitInfo, Process, Side, SshServer,
+    detect_archive_format, parse_docker_ps, parse_git_branches, parse_ps_output, parse_ssh_config,
+    Application, ArchiveFormat, DockerContainer, Entry, GitBranch, GitInfo, Process, Side,
+    SshServer,
 };
 use crate::Message;
 
@@ -231,6 +232,31 @@ pub fn copy_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
     )
 }
 
+pub fn move_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                srcs.into_iter()
+                    .map(|src| {
+                        let name = match src.file_name() {
+                            Some(n) => n.to_owned(),
+                            None => {
+                                return (src.clone(), Err("source has no file name".to_string()))
+                            }
+                        };
+                        let target = dest_dir.join(name);
+                        let res = move_path(&src, &target).map_err(|e| e.to_string());
+                        (src, res)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        },
+        Message::MoveFinished,
+    )
+}
+
 pub fn delete_task(paths: Vec<PathBuf>) -> Task<Message> {
     Task::perform(
         async move {
@@ -273,6 +299,144 @@ pub fn delete_path(path: &Path) -> std::io::Result<()> {
     } else {
         std::fs::remove_file(path)
     }
+}
+
+/// Move `src` to `dst`. Tries `fs::rename` first (atomic on the same
+/// filesystem) and falls back to `copy_recursive` + `delete_path` when
+/// rename fails with EXDEV (Linux/macOS = 18, Windows = 17 / ERROR_NOT_
+/// SAME_DEVICE). Any other rename error is propagated unchanged — we
+/// don't want to mask, say, a permissions error with a misleading copy
+/// failure later in the fallback.
+pub fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.raw_os_error(), Some(17) | Some(18)) => {
+            copy_recursive(src, dst)?;
+            delete_path(src)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compress / uncompress (zip + tar.gz)
+// ---------------------------------------------------------------------------
+
+/// `zip -r <output> <srcs basenames…>` invoked with the current directory
+/// set to the active pane's path, so paths inside the archive are relative
+/// (you get `report.pdf` in the zip, not `/Users/me/proj/report.pdf`). All
+/// srcs are bundled into one output archive — `CompressFinished` carries a
+/// single Result<PathBuf>.
+pub fn compress_task(
+    srcs: Vec<PathBuf>,
+    output: PathBuf,
+    working_dir: PathBuf,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result_output = output.clone();
+            tokio::task::spawn_blocking(move || run_zip(&srcs, &output, &working_dir))
+                .await
+                .unwrap_or_else(|e| Err(format!("zip task panicked: {}", e)))
+                .map(|()| result_output)
+        },
+        Message::CompressFinished,
+    )
+}
+
+fn run_zip(srcs: &[PathBuf], output: &Path, working_dir: &Path) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("zip");
+    cmd.current_dir(working_dir).arg("-r").arg(output);
+    for src in srcs {
+        let Some(name) = src.file_name() else {
+            return Err(format!("source has no file name: {}", src.display()));
+        };
+        cmd.arg(name);
+    }
+    let proc_out = cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            "`zip` isn't installed (not found in PATH).".to_string()
+        }
+        _ => format!("failed to run `zip`: {}", e),
+    })?;
+    if !proc_out.status.success() {
+        let stderr = String::from_utf8_lossy(&proc_out.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`zip` exited with status {}", proc_out.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(())
+}
+
+/// Per-archive extraction: each `.zip` runs `unzip -d <dest>`, each
+/// `.tar.gz` / `.tgz` runs `tar -xzf -C <dest>`. Unknown extensions return a
+/// per-archive error so the rest still process. The `UncompressFinished`
+/// message carries the full list of `(archive_path, result)`.
+pub fn uncompress_task(archives: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                archives
+                    .into_iter()
+                    .map(|archive| {
+                        let res = run_extract(&archive, &dest_dir);
+                        (archive, res)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        },
+        Message::UncompressFinished,
+    )
+}
+
+fn run_extract(archive: &Path, dest: &Path) -> Result<(), String> {
+    let name = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let Some(format) = detect_archive_format(name) else {
+        return Err(format!(
+            "unsupported archive format: {} (only .zip / .tar.gz / .tgz)",
+            name
+        ));
+    };
+    let (prog, args): (&str, Vec<&std::ffi::OsStr>) = match format {
+        ArchiveFormat::Zip => (
+            "unzip",
+            vec![archive.as_os_str(), "-d".as_ref(), dest.as_os_str()],
+        ),
+        ArchiveFormat::TarGz => (
+            "tar",
+            vec![
+                "-xzf".as_ref(),
+                archive.as_os_str(),
+                "-C".as_ref(),
+                dest.as_os_str(),
+            ],
+        ),
+    };
+    let proc_out = std::process::Command::new(prog)
+        .args(&args)
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("`{}` isn't installed (not found in PATH).", prog)
+            }
+            _ => format!("failed to run `{}`: {}", prog, e),
+        })?;
+    if !proc_out.status.success() {
+        let stderr = String::from_utf8_lossy(&proc_out.stderr).into_owned();
+        return Err(if stderr.trim().is_empty() {
+            format!("`{}` exited with status {}", prog, proc_out.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    Ok(())
 }
 
 /// Probe the directory for git status. Returns None when `path` isn't inside
@@ -1003,6 +1167,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("not-here");
         assert!(delete_path(&missing).is_err());
+    }
+
+    #[test]
+    fn move_path_renames_a_file_within_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&src, b"contents").unwrap();
+        move_path(&src, &dst).unwrap();
+        assert!(!src.exists(), "source should be gone after move");
+        assert!(dst.exists(), "destination should exist");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn move_path_works_on_directory_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
+
+        move_path(&src, &dst).unwrap();
+
+        assert!(!src.exists());
+        assert!(dst.join("a.txt").exists());
+        assert!(dst.join("sub/b.txt").exists());
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+    }
+
+    #[test]
+    fn move_path_missing_source_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let dst = dir.path().join("dst");
+        assert!(move_path(&missing, &dst).is_err());
     }
 
     #[cfg(target_os = "macos")]

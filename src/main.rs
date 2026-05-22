@@ -21,17 +21,18 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, RowColors, SavedState,
 };
 use domain::{
-    add_recent, available_palette_actions, filtered_actions, filtered_apps, filtered_branches,
-    filtered_containers, filtered_processes, filtered_recents, filtered_servers,
+    add_recent, available_palette_actions, default_zip_filename, filtered_actions, filtered_apps,
+    filtered_branches, filtered_containers, filtered_processes, filtered_recents, filtered_servers,
     keyboard_shortcuts, sort_apps, sort_containers, sort_entries, sort_processes, Application,
     AppsState, DeleteFocus, DockerContainer, DockerSortBy, DockerState, Entry, GitBranch,
     GitBranchesState, GitInfo, NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy,
     ProcessesState, Prompt, RowVisual, Side, SortBy, SortDir, SshServer, SshServersState,
 };
 use fs_ops::{
-    apps_task, copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
-    file_watch_subscription, git_branches_task, git_checkout_task, kill_process_task, launch_app,
-    loading_tasks, open_claude_code, ps_task, ssh_connect, ssh_servers_task,
+    apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
+    docker_shell, file_watch_subscription, git_branches_task, git_checkout_task,
+    kill_process_task, launch_app, loading_tasks, move_task, open_claude_code, ps_task,
+    ssh_connect, ssh_servers_task, uncompress_task,
 };
 
 const PROMPT_ID: &str = "prompt";
@@ -70,6 +71,7 @@ enum Message {
     Scrolled(Side, f32, f32),
     OpenPrompt,
     OpenCopyPrompt,
+    OpenMovePrompt,
     OpenDeletePrompt,
     SwitchPromptFocus,
     OpenSettingsFile,
@@ -84,7 +86,12 @@ enum Message {
     EditFile,
     QuickLook,
     CopyFinished(Vec<(PathBuf, Result<(), String>)>),
+    MoveFinished(Vec<(PathBuf, Result<(), String>)>),
     DeleteFinished(Vec<(PathBuf, Result<(), String>)>),
+    /// `zip` task completed — `Ok(path)` is the new archive's path.
+    CompressFinished(Result<PathBuf, String>),
+    /// Per-archive extraction results.
+    UncompressFinished(Vec<(PathBuf, Result<(), String>)>),
     Resized(Size),
     /// The watcher subscription noticed new files in `folder`.
     NewFilesDetected(PathBuf, Vec<String>),
@@ -151,8 +158,14 @@ struct App {
     settings_mtime: Option<SystemTime>,
     /// (count, dest) while a copy task is in flight.
     copy_in_progress: Option<(usize, PathBuf)>,
+    /// (count, dest) while a move task is in flight.
+    move_in_progress: Option<(usize, PathBuf)>,
     /// File count while a delete task is in flight.
     delete_in_progress: Option<usize>,
+    /// (count, output_zip) while a compress task is in flight.
+    compress_in_progress: Option<(usize, PathBuf)>,
+    /// (count, dest_dir) while an uncompress task is in flight.
+    uncompress_in_progress: Option<(usize, PathBuf)>,
     /// New-file detections that arrived while another modal was open. Drained
     /// FIFO when the current modal closes.
     pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
@@ -198,7 +211,10 @@ impl App {
             window_size,
             settings_mtime,
             copy_in_progress: None,
+            move_in_progress: None,
             delete_in_progress: None,
+            compress_in_progress: None,
+            uncompress_in_progress: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
         };
@@ -385,6 +401,7 @@ impl App {
                 | Message::EditFile
                 | Message::QuickLook
                 | Message::OpenCopyPrompt
+                | Message::OpenMovePrompt
                 | Message::OpenDeletePrompt
                 | Message::OpenCommandPalette
                 | Message::FilterAppend(..) => return Task::none(),
@@ -495,6 +512,12 @@ impl App {
                 self.prompt = Some(Prompt::Copy { input: dest });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
+            Message::OpenMovePrompt => {
+                let other = self.active.other();
+                let dest = self.pane(other).path.display().to_string();
+                self.prompt = Some(Prompt::Move { input: dest });
+                return text_input::focus(text_input::Id::new(PROMPT_ID));
+            }
             Message::OpenDeletePrompt => {
                 let paths = self.pane(self.active).marked_paths();
                 if !paths.is_empty() {
@@ -540,7 +563,10 @@ impl App {
                             let n = filtered_recents(recents, input).len();
                             *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                         }
-                        Prompt::Copy { input } => {
+                        Prompt::Copy { input }
+                        | Prompt::Move { input }
+                        | Prompt::Compress { input }
+                        | Prompt::Uncompress { input } => {
                             *input = value;
                         }
                         Prompt::CommandPalette {
@@ -625,6 +651,46 @@ impl App {
                                 if !srcs.is_empty() {
                                     self.copy_in_progress = Some((srcs.len(), dest.clone()));
                                     Some(copy_task(srcs, dest))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        Prompt::Move { input } => {
+                            let dest = PathBuf::from(expand_tilde(input.trim()));
+                            if dest.is_dir() {
+                                let srcs = self.pane(self.active).marked_paths();
+                                if !srcs.is_empty() {
+                                    self.move_in_progress = Some((srcs.len(), dest.clone()));
+                                    Some(move_task(srcs, dest))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        Prompt::Compress { input } => {
+                            let output = PathBuf::from(expand_tilde(input.trim()));
+                            let srcs = self.pane(self.active).marked_paths();
+                            let working_dir = self.pane(self.active).path.clone();
+                            if !srcs.is_empty() {
+                                self.compress_in_progress = Some((srcs.len(), output.clone()));
+                                Some(compress_task(srcs, output, working_dir))
+                            } else {
+                                None
+                            }
+                        }
+                        Prompt::Uncompress { input } => {
+                            let dest = PathBuf::from(expand_tilde(input.trim()));
+                            if dest.is_dir() {
+                                let archives = self.pane(self.active).marked_paths();
+                                if !archives.is_empty() {
+                                    self.uncompress_in_progress =
+                                        Some((archives.len(), dest.clone()));
+                                    Some(uncompress_task(archives, dest))
                                 } else {
                                     None
                                 }
@@ -881,6 +947,31 @@ impl App {
                 for (src, res) in &results {
                     if let Err(e) = res {
                         eprintln!("copy {} failed: {}", src.display(), e);
+                    }
+                }
+                return self.reload_both_panes();
+            }
+            Message::MoveFinished(results) => {
+                self.move_in_progress = None;
+                for (src, res) in &results {
+                    if let Err(e) = res {
+                        eprintln!("move {} failed: {}", src.display(), e);
+                    }
+                }
+                return self.reload_both_panes();
+            }
+            Message::CompressFinished(result) => {
+                self.compress_in_progress = None;
+                if let Err(e) = &result {
+                    eprintln!("compress failed: {}", e);
+                }
+                return self.reload_both_panes();
+            }
+            Message::UncompressFinished(results) => {
+                self.uncompress_in_progress = None;
+                for (archive, res) in &results {
+                    if let Err(e) = res {
+                        eprintln!("uncompress {} failed: {}", archive.display(), e);
                     }
                 }
                 return self.reload_both_panes();
@@ -1200,6 +1291,12 @@ impl App {
                 self.prompt = Some(Prompt::Copy { input: dest });
                 text_input::focus(text_input::Id::new(PROMPT_ID))
             }
+            PaletteAction::Move => {
+                let other = self.active.other();
+                let dest = self.pane(other).path.display().to_string();
+                self.prompt = Some(Prompt::Move { input: dest });
+                text_input::focus(text_input::Id::new(PROMPT_ID))
+            }
             PaletteAction::Delete => {
                 let paths = self.pane(self.active).marked_paths();
                 if !paths.is_empty() {
@@ -1209,6 +1306,29 @@ impl App {
                     });
                 }
                 Task::none()
+            }
+            PaletteAction::Compress => {
+                let marked = self.pane(self.active).marked_paths();
+                if marked.is_empty() {
+                    return Task::none();
+                }
+                let other = self.active.other();
+                let dest_dir = self.pane(other).path.clone();
+                let default_path = dest_dir.join(default_zip_filename(&marked));
+                self.prompt = Some(Prompt::Compress {
+                    input: default_path.display().to_string(),
+                });
+                text_input::focus(text_input::Id::new(PROMPT_ID))
+            }
+            PaletteAction::Uncompress => {
+                let marked = self.pane(self.active).marked_paths();
+                if marked.is_empty() {
+                    return Task::none();
+                }
+                let other = self.active.other();
+                let dest = self.pane(other).path.display().to_string();
+                self.prompt = Some(Prompt::Uncompress { input: dest });
+                text_input::focus(text_input::Id::new(PROMPT_ID))
             }
             PaletteAction::DockerContainers => {
                 self.prompt = Some(Prompt::Docker {
@@ -1310,6 +1430,28 @@ impl App {
         if let Some((count, dest)) = &self.copy_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
             return Some(format!("Copying {} {} to {}…", count, noun, dest.display()));
+        }
+        if let Some((count, dest)) = &self.move_in_progress {
+            let noun = if *count == 1 { "file" } else { "files" };
+            return Some(format!("Moving {} {} to {}…", count, noun, dest.display()));
+        }
+        if let Some((count, output)) = &self.compress_in_progress {
+            let noun = if *count == 1 { "file" } else { "files" };
+            return Some(format!(
+                "Compressing {} {} → {}…",
+                count,
+                noun,
+                output.display()
+            ));
+        }
+        if let Some((count, dest)) = &self.uncompress_in_progress {
+            let noun = if *count == 1 { "archive" } else { "archives" };
+            return Some(format!(
+                "Extracting {} {} to {}…",
+                count,
+                noun,
+                dest.display()
+            ));
         }
         if let Some(count) = self.delete_in_progress {
             let noun = if count == 1 { "file" } else { "files" };
@@ -1414,6 +1556,7 @@ impl App {
                 Key::Named(Named::F4) => Some(Message::EditFile),
                 Key::Named(Named::Space) => Some(Message::QuickLook),
                 Key::Named(Named::F5) => Some(Message::OpenCopyPrompt),
+                Key::Named(Named::F6) => Some(Message::OpenMovePrompt),
                 Key::Named(Named::F10) => Some(Message::ExitApp),
                 // Plain character keys (no Ctrl/Cmd/Alt) feed the type-to-filter.
                 // The earlier Cmd+P / Cmd+, guards have already matched before
@@ -2093,6 +2236,42 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 .on_submit(Message::PromptSubmit)
                 .padding(8),
             text("Enter to copy  ·  Esc or click outside to cancel").size(11),
+        ]
+        .spacing(10),
+        Prompt::Move { input } => column![
+            text("Move selected to").size(15),
+            text_input("/path/to/destination", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8),
+            text("Enter to move  ·  Esc or click outside to cancel").size(11),
+        ]
+        .spacing(10),
+        Prompt::Compress { input } => column![
+            text("Compress selected to").size(15),
+            text_input("/path/to/output.zip", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8),
+            text(
+                "Bundled into one .zip (uses `zip -r`)  ·  Enter to compress  ·  Esc cancels",
+            )
+            .size(11),
+        ]
+        .spacing(10),
+        Prompt::Uncompress { input } => column![
+            text("Extract selected to").size(15),
+            text_input("/path/to/destination", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8),
+            text(
+                "Each .zip / .tar.gz extracts to the destination directory  ·  Enter  ·  Esc cancels",
+            )
+            .size(11),
         ]
         .spacing(10),
         Prompt::CommandPalette {
