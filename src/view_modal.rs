@@ -903,6 +903,7 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                             column![].spacing(3),
                             |col, (i, server)| {
                                 let alias = server.alias.clone();
+                                let alias_for_open = server.alias.clone();
                                 let highlighted = i == *selected;
                                 let user_host = match (&server.user, &server.hostname) {
                                     (Some(u), Some(h)) => format!("{}@{}", u, h),
@@ -936,6 +937,16 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                                     alias_cell,
                                     host_cell,
                                     identity_cell,
+                                    button(
+                                        text("Open")
+                                            .size(10)
+                                            .align_x(Horizontal::Center)
+                                            .width(Length::Fill),
+                                    )
+                                    .on_press(Message::SshOpenInPane(alias_for_open))
+                                    .padding(Padding::from([2, 0]))
+                                    .width(Length::Fixed(70.0))
+                                    .style(button::secondary),
                                     button(
                                         text("Connect")
                                             .size(10)
@@ -984,7 +995,7 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 text("Connect to SSH server").size(15),
                 filter_widget,
                 body,
-                text("Type to filter  ·  ↑/↓ select  ·  Enter or click Connect  ·  Esc dismisses")
+                text("Type to filter  ·  ↑/↓ select  ·  Enter / Connect launches terminal  ·  Open lists the host in this pane  ·  Esc dismisses")
                     .size(11),
             ]
             .spacing(6)

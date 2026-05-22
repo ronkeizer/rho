@@ -18,7 +18,7 @@ use config::{
 use domain::{
     add_recent, available_palette_actions, default_zip_filename, filtered_actions, filtered_apps,
     filtered_branches, filtered_recents, filtered_servers, sort_apps,
-    sort_containers, sort_entries, sort_processes, Application, AppsState, DeleteFocus,
+    sort_containers, sort_entries, sort_processes, Application, AppsState, BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
     Location, NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy, ProcessesState, Prompt,
     Side, SortBy, SortDir, SshServer, SshServersState,
@@ -141,6 +141,9 @@ pub(crate) enum Message {
     SshServersLoaded(Result<Vec<SshServer>, String>),
     /// User clicked Connect on an SSH server row — spawn a terminal.
     SshConnect(String),
+    /// User clicked Open on an SSH server row — point the active pane
+    /// at the host's home directory via the remote backend dispatch.
+    SshOpenInPane(String),
     /// Global "quit the app" — currently bound to F10.
     ExitApp,
     NoOp,
@@ -187,24 +190,23 @@ impl App {
             .and_then(|m| m.modified())
             .ok();
 
-        // Restore last-used folders + active side. Any saved path that no
-        // longer exists falls back to the home directory. Phase 1 only
-        // accepts Local saved locations — a saved Remote (if a future
-        // version wrote one and we somehow downgraded) silently falls
-        // back to home until Phase 2 wires up the SSH backend.
+        // Restore last-used folders + active side. Local paths that no
+        // longer exist on disk fall back to home; remote locations
+        // always restore (we can't cheaply pre-check the host).
         let saved = load_saved_state();
-        let saved_local = |loc: &Location| match loc {
-            Location::Local(p) if p.is_dir() => Some(p.clone()),
-            _ => None,
+        let restore = |loc: &Location| match loc {
+            Location::Local(p) if p.is_dir() => Some(loc.clone()),
+            Location::Local(_) => None,
+            Location::Remote { .. } => Some(loc.clone()),
         };
-        let left_path = saved
+        let left_loc = saved
             .as_ref()
-            .and_then(|s| saved_local(&s.left))
-            .unwrap_or_else(|| home.clone());
-        let right_path = saved
+            .and_then(|s| restore(&s.left))
+            .unwrap_or_else(|| Location::Local(home.clone()));
+        let right_loc = saved
             .as_ref()
-            .and_then(|s| saved_local(&s.right))
-            .unwrap_or_else(|| home.clone());
+            .and_then(|s| restore(&s.right))
+            .unwrap_or_else(|| Location::Local(home.clone()));
         let active = saved.as_ref().map(|s| s.active).unwrap_or(Side::Left);
         let recent_locations = saved
             .as_ref()
@@ -213,8 +215,8 @@ impl App {
 
         let app = Self {
             config,
-            left: Pane::empty(Location::Local(left_path.clone())),
-            right: Pane::empty(Location::Local(right_path.clone())),
+            left: Pane::empty(left_loc.clone()),
+            right: Pane::empty(right_loc.clone()),
             active,
             prompt: None,
             shift_held: false,
@@ -237,8 +239,8 @@ impl App {
         // Pane::empty starts at load_generation 0; the initial loads tag
         // their chunks the same way so they're accepted.
         let init = Task::batch([
-            loading_tasks(Side::Left, left_path, 0),
-            loading_tasks(Side::Right, right_path, 0),
+            loading_tasks(Side::Left, left_loc, 0),
+            loading_tasks(Side::Right, right_loc, 0),
         ]);
         (app, init)
     }
@@ -266,6 +268,13 @@ impl App {
         self.pane(self.active).git_info.is_some()
     }
 
+    /// True iff both panes point at local paths. Cross-pane ops (copy,
+    /// move, compress, uncompress) need this in Phase 2 because their
+    /// implementations only know how to talk to the local filesystem.
+    fn both_panes_local(&self) -> bool {
+        self.left.location.is_local() && self.right.location.is_local()
+    }
+
     fn pane_mut(&mut self, side: Side) -> &mut Pane {
         match side {
             Side::Left => &mut self.left,
@@ -273,19 +282,18 @@ impl App {
         }
     }
 
-    fn navigate(&mut self, side: Side, path: PathBuf) -> Task<Message> {
-        // Phase 1: every navigate target is a local path. When Phase 2
-        // adds an "Open remote folder" entry point, it'll call
-        // `Pane::navigate(Location::Remote { … })` directly (or this
-        // helper will grow a `Location` overload).
-        let generation = self
-            .pane_mut(side)
-            .navigate(Location::Local(path.clone()));
+    fn navigate(&mut self, side: Side, location: Location) -> Task<Message> {
+        let generation = self.pane_mut(side).navigate(location.clone());
         refresh_claude_marker(self.pane_mut(side));
-        add_recent(&mut self.recent_locations, path.clone(), RECENT_CAP);
+        // The "Go to folder" recents list stays PathBuf-shaped, so
+        // only local navigations feed it. Remote panes are reachable
+        // via the SSH-server picker instead.
+        if let Location::Local(p) = &location {
+            add_recent(&mut self.recent_locations, p.clone(), RECENT_CAP);
+        }
         self.save_state();
         Task::batch([
-            loading_tasks(side, path, generation),
+            loading_tasks(side, location, generation),
             self.ensure_active_visible(),
         ])
     }
@@ -345,15 +353,13 @@ impl App {
     fn reload_both_panes(&mut self) -> Task<Message> {
         let left_loc = self.left.location.clone();
         let right_loc = self.right.location.clone();
-        let left_path = left_loc.path().to_path_buf();
-        let right_path = right_loc.path().to_path_buf();
-        let left_gen = self.left.navigate(left_loc);
-        let right_gen = self.right.navigate(right_loc);
+        let left_gen = self.left.navigate(left_loc.clone());
+        let right_gen = self.right.navigate(right_loc.clone());
         refresh_claude_marker(&mut self.left);
         refresh_claude_marker(&mut self.right);
         Task::batch([
-            loading_tasks(Side::Left, left_path, left_gen),
-            loading_tasks(Side::Right, right_path, right_gen),
+            loading_tasks(Side::Left, left_loc, left_gen),
+            loading_tasks(Side::Right, right_loc, right_gen),
         ])
     }
 
@@ -481,7 +487,7 @@ impl App {
                     // newly-matching rows are visible. See FilterAppend.
                     return self.ensure_active_visible();
                 }
-                if let Some(parent) = self.pane(side).path().parent().map(|p| p.to_path_buf()) {
+                if let Some(parent) = self.pane(side).location.parent() {
                     return self.navigate(side, parent);
                 }
             }
@@ -504,20 +510,24 @@ impl App {
             Message::ActivateSelection => {
                 let side = self.active;
                 if self.pane(side).selected == 0 {
-                    if let Some(parent) = self.pane(side).path().parent().map(|p| p.to_path_buf()) {
+                    if let Some(parent) = self.pane(side).location.parent() {
                         return self.navigate(side, parent);
                     }
                     return Task::none();
                 }
                 let pane = self.pane(side);
                 if let Some(entry) = pane.entry_at(pane.selected) {
-                    let path = pane.path().join(&entry.name);
                     if entry.is_dir {
-                        return self.navigate(side, path);
+                        return self.navigate(side, pane.location.join(&entry.name));
                     }
-                    // Enter on a .zip extracts to /tmp and browses the result.
-                    // Large archives (>100 MiB) pop a confirmation first so
-                    // the user doesn't accidentally kick off a long unpack.
+                    // Files: every action below (zip extract, open in
+                    // default app) is local-only. Phase 2 lists remote
+                    // panes but can't yet pull a remote file down to
+                    // open it — bail quietly.
+                    if !pane.location.is_local() {
+                        return Task::none();
+                    }
+                    let path = pane.path().join(&entry.name);
                     if is_zip(&path) {
                         let size = entry.size.unwrap_or(0);
                         if size > LARGE_ARCHIVE_THRESHOLD {
@@ -555,18 +565,28 @@ impl App {
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenCopyPrompt => {
+                // Phase 2 MVP: no remote ↔ local file transfer yet.
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
                 let other = self.active.other();
                 let dest = self.pane(other).path().display().to_string();
                 self.prompt = Some(Prompt::Copy { input: dest });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenMovePrompt => {
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
                 let other = self.active.other();
                 let dest = self.pane(other).path().display().to_string();
                 self.prompt = Some(Prompt::Move { input: dest });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenDeletePrompt => {
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
                 let paths = self.pane(self.active).marked_paths();
                 if !paths.is_empty() {
                     // Default focus on Cancel: a stray Enter shouldn't delete.
@@ -692,7 +712,7 @@ impl App {
                             };
                             target
                                 .filter(|p| p.is_dir())
-                                .map(|p| self.navigate(self.active, p))
+                                .map(|p| self.navigate(self.active, Location::Local(p)))
                         }
                         Prompt::Copy { input } => {
                             let dest = PathBuf::from(expand_tilde(input.trim()));
@@ -977,6 +997,9 @@ impl App {
             }
             Message::EditFile => {
                 let pane = self.pane(self.active);
+                if !pane.location.is_local() {
+                    return Task::none();
+                }
                 if let Some(entry) = pane.entry_at(pane.selected) {
                     if entry.is_dir {
                         return Task::none();
@@ -989,6 +1012,9 @@ impl App {
             }
             Message::QuickLook => {
                 let pane = self.pane(self.active);
+                if !pane.location.is_local() {
+                    return Task::none();
+                }
                 if let Some(entry) = pane.entry_at(pane.selected) {
                     let path = pane.path().join(&entry.name);
                     if let Err(e) = quick_look(&path) {
@@ -1035,7 +1061,7 @@ impl App {
                 match result {
                     Ok(()) => {
                         let side = self.active;
-                        return self.navigate(side, dest);
+                        return self.navigate(side, Location::Local(dest));
                     }
                     Err(e) => {
                         let name = archive
@@ -1075,7 +1101,7 @@ impl App {
             }
             Message::NewFilesPickSide(side) => {
                 if let Some(Prompt::NewFiles { folder, files, .. }) = self.prompt.take() {
-                    let task = self.navigate(side, folder);
+                    let task = self.navigate(side, Location::Local(folder));
                     // The watcher accumulates names in arrival order within a
                     // burst, so `.last()` is the most-recently-added file.
                     // navigate() just cleared pending_focus; set it after.
@@ -1161,7 +1187,7 @@ impl App {
                 self.prompt = None;
                 self.show_next_pending();
                 if path.is_dir() {
-                    return self.navigate(self.active, path);
+                    return self.navigate(self.active, Location::Local(path));
                 }
             }
             Message::PaletteSelect(action) => {
@@ -1304,6 +1330,22 @@ impl App {
                     eprintln!("ssh connect {} failed: {}", alias, e);
                 }
             }
+            Message::SshOpenInPane(alias) => {
+                // Close the modal, then point the active pane at the host's
+                // home directory. `~` gets expanded by the remote login
+                // shell during the first `ls`, so we don't need a separate
+                // `pwd` round-trip up-front.
+                self.prompt = None;
+                self.show_next_pending();
+                let side = self.active;
+                return self.navigate(
+                    side,
+                    Location::Remote {
+                        backend: BackendId::new(alias),
+                        path: PathBuf::from("~"),
+                    },
+                );
+            }
             Message::GitCheckoutFinished(branch, result) => {
                 match result {
                     Ok(()) => {
@@ -1356,18 +1398,27 @@ impl App {
         self.prompt = None;
         match action {
             PaletteAction::Copy => {
+                if !self.both_panes_local() {
+                    return Task::none();
+                }
                 let other = self.active.other();
                 let dest = self.pane(other).path().display().to_string();
                 self.prompt = Some(Prompt::Copy { input: dest });
                 text_input::focus(text_input::Id::new(PROMPT_ID))
             }
             PaletteAction::Move => {
+                if !self.both_panes_local() {
+                    return Task::none();
+                }
                 let other = self.active.other();
                 let dest = self.pane(other).path().display().to_string();
                 self.prompt = Some(Prompt::Move { input: dest });
                 text_input::focus(text_input::Id::new(PROMPT_ID))
             }
             PaletteAction::Delete => {
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
                 let paths = self.pane(self.active).marked_paths();
                 if !paths.is_empty() {
                     self.prompt = Some(Prompt::Delete {
@@ -1378,6 +1429,9 @@ impl App {
                 Task::none()
             }
             PaletteAction::Compress => {
+                if !self.both_panes_local() {
+                    return Task::none();
+                }
                 let marked = self.pane(self.active).marked_paths();
                 if marked.is_empty() {
                     return Task::none();
@@ -1391,6 +1445,9 @@ impl App {
                 text_input::focus(text_input::Id::new(PROMPT_ID))
             }
             PaletteAction::Uncompress => {
+                if !self.both_panes_local() {
+                    return Task::none();
+                }
                 let marked = self.pane(self.active).marked_paths();
                 if marked.is_empty() {
                     return Task::none();
@@ -1436,6 +1493,9 @@ impl App {
                 ])
             }
             PaletteAction::GitBranch => {
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
                 let repo_path = self.pane(self.active).path().to_path_buf();
                 self.prompt = Some(Prompt::GitBranches {
                     state: GitBranchesState::Loading,
@@ -1467,6 +1527,9 @@ impl App {
                 // Fire-and-forget: spawn a terminal with `claude` running in
                 // the active pane's directory. No modal — the action just
                 // launches and closes the palette.
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
                 let path = self.pane(self.active).path().to_path_buf();
                 if let Err(e) = open_claude_code(&path, self.config.terminal_app.as_deref()) {
                     eprintln!("open Claude Code in {} failed: {}", path.display(), e);
@@ -1541,7 +1604,7 @@ impl App {
                 Side::Right
             };
             let p = self.pane(loading_side);
-            return Some(format!("Loading {}…", p.path().display()));
+            return Some(format!("Loading {}…", p.location));
         }
         None
     }
@@ -1701,10 +1764,16 @@ impl App {
 
 /// Stat `pane.path()` for the Claude context markers (`CLAUDE.md` /
 /// `.claude/`) and update the pane's cached booleans. Called on every
-/// navigate / reload — same lifecycle as `git_info`. Phase 1 always
-/// sees a local pane, so the inner-path stat is correct; Phase 2 will
-/// gate this behind `pane.location.is_local()` once remote panes exist.
+/// navigate / reload — same lifecycle as `git_info`. Skipped for remote
+/// panes: stat'ing the *local* filesystem at the remote path would be
+/// meaningless, and probing the marker over ssh isn't worth the round-
+/// trip for Phase 2 MVP.
 fn refresh_claude_marker(pane: &mut Pane) {
+    if !pane.location.is_local() {
+        pane.has_claude_md = false;
+        pane.has_claude_dir = false;
+        return;
+    }
     pane.has_claude_md = pane.path().join("CLAUDE.md").is_file();
     pane.has_claude_dir = pane.path().join(".claude").is_dir();
 }

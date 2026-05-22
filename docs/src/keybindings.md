@@ -94,7 +94,7 @@ Inside a modal, the navigation keys behave differently:
 | Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
 | Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
 | Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
-| Connect to SSH server | Type to filter (substring against alias or hostname). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Connect` opens a new terminal running `ssh <alias>`. `Esc` dismisses. |
+| Connect to SSH server | Type to filter (substring against alias or hostname). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Connect` opens a new terminal running `ssh <alias>`. `Open` lists the host's home directory in the active pane (listing only — no remote file ops yet). `Esc` dismisses. |
 
 ### Compress / Uncompress modals
 
@@ -239,6 +239,17 @@ apply to every host, not specific servers. `Include` directives are
 not followed in v1: only the top-level `~/.ssh/config` is parsed.
 When a `Host` line lists multiple patterns (e.g. `Host alpha *.foo`),
 the first non-wildcard pattern becomes the entry's alias.
+
+- **Open** — lists the remote host's home directory in the active
+  pane. The pane's path header switches to `<alias>:<path>` and
+  navigation (`Enter`, `Backspace`, arrow keys) works as normal, with
+  each step running a fresh `ssh <alias> ls -la --time-style=full-iso`
+  against the remote. Listing-only in the current release: file
+  operations (copy / move / delete / compress / edit / Quick Look /
+  open Claude Code / git branch) silently no-op while the active pane
+  is remote, since rho can't yet transfer files between local and
+  remote. The remote host needs GNU `ls` (any Linux distro) — BSD-style
+  `ls` doesn't accept `--time-style=full-iso`.
 
 - **Connect** — opens a new terminal window with `ssh <alias>` as its
   main process. Per OS:

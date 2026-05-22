@@ -46,6 +46,47 @@ resolve a visible row back to an `Entry`.
 `sort_by`, or `sort_dir`. It tries to keep the cursor on the entry it was
 previously on, looked up by name.
 
+## Locations: local + remote
+
+`Pane.location` is a `Location` enum, not a `PathBuf`:
+
+- `Location::Local(PathBuf)` — a path on the local filesystem.
+- `Location::Remote { backend: BackendId, path: PathBuf }` — a path on a
+  registered backend. Today's only backend is **SSH** (the backend ID is
+  an alias from `~/.ssh/config`).
+
+The two variants share helpers (`location.path()`, `location.parent()`,
+`location.join(name)`) for purely-syntactic operations; the helpers
+preserve the backend, so navigating up from `alice.dev:/var/log` lands
+on `alice.dev:/var`. I/O code that *runs* against the location (listing,
+git probe, file ops) must dispatch on the variant.
+
+The dispatch point is `fs_ops::loading_tasks(side, location, generation)`:
+
+- `Local(path)` → `load_dir_task` (the streaming reader) plus a
+  `git_info_task`.
+- `Remote { backend, path }` → `load_remote_dir_task`, which spawns
+  `ssh <backend> ls -la --time-style=full-iso -- <quoted-path>` in a
+  blocking thread, parses the stdout with `parse_ls_la` (in `domain.rs`,
+  unit-tested), and emits a single `EntriesChunk` + `EntriesDone`. No
+  git info for remote panes — it's not worth the round-trip in the MVP.
+
+**Scope of remote-pane support today**: listing only. Operations that
+touch local files (copy, move, delete, compress/uncompress, edit, Quick
+Look, "open Claude Code", git branch) early-return when the active pane
+(or, for cross-pane ops, either pane) is remote. The Claude-marker
+probe also short-circuits for remote panes. Plumbing for remote file
+transfer (scp/sftp) is a future phase.
+
+**Entry point**: the existing "Connect to SSH server" palette modal
+(`⌘P` → SSH) grew a second per-row button, **Open**, that fires
+`Message::SshOpenInPane(alias)` and navigates the active pane to
+`Location::Remote { backend: alias, path: "~" }`. The remote shell
+expands `~` on the first `ls`, so there's no separate `pwd` round-trip
+to resolve home up-front. Tilde expansion is preserved by
+`fs_ops::quote_remote_path`, which leaves a leading `~` segment
+unquoted and POSIX-single-quotes only the path tail.
+
 ## Streaming loads with generation tags
 
 Directory loads run via `load_dir_task` (in `fs_ops`), which spawns a
@@ -124,7 +165,9 @@ cheap `is_file` / `is_dir` stats; results are cached on `Pane` as
 convenience). The App layer calls `refresh_claude_marker(&mut pane)`
 from `App::new`, `App::navigate`, and `App::reload_both_panes`, so the
 cache is rebuilt on the same lifecycle as `git_info` — external file
-additions while a pane is showing won't update it.
+additions while a pane is showing won't update it. The probe is skipped
+for **remote** panes (stat'ing the local filesystem at the remote path
+would be meaningless, and the round-trip cost isn't worth the marker).
 
 ## Docker integration
 

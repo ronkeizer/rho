@@ -10,18 +10,28 @@ use std::time::Duration;
 use iced::{Subscription, Task};
 
 use crate::domain::{
-    detect_archive_format, parse_docker_ps, parse_git_branches, parse_ps_output, parse_ssh_config,
-    Application, ArchiveFormat, DockerContainer, Entry, GitBranch, GitInfo, Process, Side,
-    SshServer,
+    detect_archive_format, parse_docker_ps, parse_git_branches, parse_ls_la, parse_ps_output,
+    parse_ssh_config, Application, ArchiveFormat, BackendId, DockerContainer, Entry, GitBranch,
+    GitInfo, Location, Process, Side, SshServer,
 };
 use crate::Message;
 
 /// Both side-loads (directory entries + git info) for a single pane.
-pub fn loading_tasks(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
-    Task::batch([
-        load_dir_task(side, path.clone(), generation),
-        git_info_task(side, path, generation),
-    ])
+///
+/// Dispatches on `location`:
+/// - `Local(path)` → local read_dir stream + git probe.
+/// - `Remote { backend, path }` → `ssh <backend> ls -la --time-style=full-iso`.
+///   No git info (Phase 2 MVP — remote git probing is a later add).
+pub fn loading_tasks(side: Side, location: Location, generation: u64) -> Task<Message> {
+    match location {
+        Location::Local(path) => Task::batch([
+            load_dir_task(side, path.clone(), generation),
+            git_info_task(side, path, generation),
+        ]),
+        Location::Remote { backend, path } => {
+            load_remote_dir_task(side, backend, path, generation)
+        }
+    }
 }
 
 /// Read `path` in a blocking thread and stream batches of `Entry` back to the
@@ -79,6 +89,109 @@ pub fn load_dir_task(side: Side, path: PathBuf, generation: u64) -> Task<Message
     let done = stream::once(async move { Message::EntriesDone(side, generation) });
 
     Task::stream(chunks.chain(done))
+}
+
+/// Remote sibling of [`load_dir_task`]: spawn
+/// `ssh <backend> ls -la --time-style=full-iso -- <quoted-path>` in a
+/// blocking thread, parse the stdout with [`parse_ls_la`], and emit a
+/// single `EntriesChunk` (all entries at once) followed by `EntriesDone`.
+///
+/// Errors (ssh exit non-zero, ssh missing, parse yields zero entries)
+/// surface as an empty chunk + done so the receiver still completes
+/// and the pane just shows "no entries" — same fail-soft posture as
+/// the local task when `read_dir` errors.
+///
+/// Phase 2 MVP: target hosts need GNU `ls` (i.e. Linux). BSD/macOS hosts
+/// won't recognise `--time-style=full-iso` and the parse will return
+/// empty; the error appears on stderr for debugging.
+pub fn load_remote_dir_task(
+    side: Side,
+    backend: BackendId,
+    path: PathBuf,
+    generation: u64,
+) -> Task<Message> {
+    use iced::futures::stream::{self, StreamExt};
+
+    let entries_msg = async move {
+        let entries = tokio::task::spawn_blocking(move || run_remote_ls(&backend, &path))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("remote ls task panicked: {}", e);
+                Vec::new()
+            });
+        Message::EntriesChunk(side, generation, entries)
+    };
+    let chunk = stream::once(entries_msg);
+    let done = stream::once(async move { Message::EntriesDone(side, generation) });
+    Task::stream(chunk.chain(done))
+}
+
+fn run_remote_ls(backend: &BackendId, path: &Path) -> Vec<Entry> {
+    let quoted = quote_remote_path(path);
+    // Build the remote command as a single argv; ssh will join + the
+    // remote shell will re-tokenise, which is why `quoted` is shell-safe
+    // (single-quoted, with a `~`-passthrough so home expansion still
+    // works).
+    let remote_cmd = format!("ls -la --time-style=full-iso -- {}", quoted);
+    let output = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            backend.as_str(),
+            "--",
+            remote_cmd.as_str(),
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => parse_ls_la(&String::from_utf8_lossy(&out.stdout)),
+        Ok(out) => {
+            eprintln!(
+                "ssh {} ls failed ({}): {}",
+                backend.as_str(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!("failed to spawn ssh for {}: {}", backend.as_str(), e);
+            Vec::new()
+        }
+    }
+}
+
+/// POSIX single-quote a string for safe interpolation into a remote
+/// shell command. Embeds the input verbatim except for `'`, which is
+/// turned into the canonical `'\''` close-reopen sequence.
+fn posix_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Quote a remote path for inclusion in an ssh-dispatched command, but
+/// leave a leading `~` / `~user` segment unquoted so the remote shell
+/// still expands it. Everything from the first `/` onward is single-
+/// quoted by [`posix_quote`].
+fn quote_remote_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let s_ref: &str = &s;
+    if let Some(after_tilde) = s_ref.strip_prefix('~') {
+        match after_tilde.split_once('/') {
+            None => s.into_owned(),
+            Some((tilde_tail, rest)) => format!("~{}/{}", tilde_tail, posix_quote(rest)),
+        }
+    } else {
+        posix_quote(s_ref)
+    }
 }
 
 /// Subscription that watches `folders` (non-recursively) for newly-created or
@@ -1379,5 +1492,62 @@ mod tests {
         // Shell-level: cd 'it'\''s'  — at AppleScript layer the backslash is
         // doubled because shell_quote escapes \ for AppleScript embedding.
         assert!(script.contains("'/Users/me/it'\\\\''s/here'"));
+    }
+
+    #[test]
+    fn posix_quote_wraps_simple_string() {
+        assert_eq!(posix_quote("foo"), "'foo'");
+        assert_eq!(posix_quote("/var/log"), "'/var/log'");
+    }
+
+    #[test]
+    fn posix_quote_escapes_embedded_single_quote() {
+        // `it's` → 'it'\''s'  (close, escaped quote, reopen)
+        assert_eq!(posix_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn posix_quote_handles_special_chars_passively() {
+        // Single-quoting neutralises $ \ " ` etc. — they pass through
+        // untouched.
+        assert_eq!(posix_quote(r#"a $b \c "d" `e`"#), r#"'a $b \c "d" `e`'"#);
+    }
+
+    #[test]
+    fn quote_remote_path_quotes_absolute_path() {
+        assert_eq!(
+            quote_remote_path(Path::new("/var/log")),
+            "'/var/log'".to_string(),
+        );
+    }
+
+    #[test]
+    fn quote_remote_path_quotes_path_with_spaces() {
+        assert_eq!(
+            quote_remote_path(Path::new("/var/My Files/x")),
+            "'/var/My Files/x'".to_string(),
+        );
+    }
+
+    #[test]
+    fn quote_remote_path_keeps_leading_tilde_unquoted() {
+        // ~/.config → ~/'.config'  so the remote shell expands ~ but
+        // the rest is shell-safe even if it contains spaces.
+        assert_eq!(
+            quote_remote_path(Path::new("~/.config")),
+            "~/'.config'".to_string(),
+        );
+        assert_eq!(
+            quote_remote_path(Path::new("~ron/My Files")),
+            "~ron/'My Files'".to_string(),
+        );
+    }
+
+    #[test]
+    fn quote_remote_path_bare_tilde_passes_through() {
+        // `~` with no `/` after — no path to quote, leave it raw so the
+        // remote shell expands to $HOME.
+        assert_eq!(quote_remote_path(Path::new("~")), "~".to_string());
+        assert_eq!(quote_remote_path(Path::new("~user")), "~user".to_string());
     }
 }

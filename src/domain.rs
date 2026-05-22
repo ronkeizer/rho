@@ -15,10 +15,9 @@ use std::time::SystemTime;
 /// account. Used in [`Location::Remote`] to dispatch operations to the
 /// right backend at runtime.
 ///
-/// Phase 1 (this PR) only ever materializes `Location::Local` — the
-/// Remote variant exists so the type system, parser, and persisted
-/// state format are ready for Phase 2's SSH backend without further
-/// churn at call sites.
+/// Today's only backend is SSH (the identifier is a `Host` alias from
+/// `~/.ssh/config`); the type stays open so other transports — Docker
+/// volumes, cloud storage — can plug in without churning call sites.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BackendId(String);
 
@@ -54,10 +53,10 @@ pub enum Location {
 }
 
 impl Location {
-    // `local` / `remote` / `is_local` are part of the Phase 1 surface so
-    // Phase 2 can adopt them without revisiting the type; `is_local` in
-    // particular will be the gate for "this op only works on local
-    // panes" once the SSH backend exists.
+    // `local` / `remote` are ergonomic constructors; call sites
+    // currently use the variant tuple form directly, but these stay so
+    // future code (and tests) can avoid the `BackendId::new("…")`
+    // boilerplate at the call site.
     #[allow(dead_code)]
     pub fn local(path: impl Into<PathBuf>) -> Self {
         Self::Local(path.into())
@@ -71,7 +70,9 @@ impl Location {
         }
     }
 
-    #[allow(dead_code)]
+    /// Gate for "this op only works on local panes" — used to short-
+    /// circuit file operations (copy/move/delete/edit/…) when the
+    /// active or other pane is remote.
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local(_))
     }
@@ -83,6 +84,29 @@ impl Location {
         match self {
             Location::Local(p) => p,
             Location::Remote { path, .. } => path,
+        }
+    }
+
+    /// Parent location, preserving the backend. Returns `None` at the
+    /// filesystem root (`/` locally, `<backend>:/` remotely).
+    pub fn parent(&self) -> Option<Location> {
+        match self {
+            Location::Local(p) => p.parent().map(|p| Location::Local(p.to_path_buf())),
+            Location::Remote { backend, path } => path.parent().map(|p| Location::Remote {
+                backend: backend.clone(),
+                path: p.to_path_buf(),
+            }),
+        }
+    }
+
+    /// Join an entry name onto the location, preserving the backend.
+    pub fn join(&self, name: impl AsRef<Path>) -> Location {
+        match self {
+            Location::Local(p) => Location::Local(p.join(name)),
+            Location::Remote { backend, path } => Location::Remote {
+                backend: backend.clone(),
+                path: path.join(name),
+            },
         }
     }
 }
@@ -961,6 +985,104 @@ pub fn filtered_servers<'a>(servers: &'a [SshServer], input: &str) -> Vec<&'a Ss
         .collect()
 }
 
+/// Parse the output of `ls -la --time-style=full-iso` into `Entry`s.
+///
+/// Each non-header line looks like:
+/// ```text
+/// -rw-r--r-- 1 user group  158 2026-05-22 14:32:01.000000000 +0000 README.md
+/// ```
+/// Permission char `d` → directory, `l` → symlink (treated as not-dir,
+/// name truncated at the ` -> target` suffix). Sizes are only set for
+/// regular files, matching the local listing's behaviour.
+///
+/// Lines that don't fit the expected shape (blank, the leading
+/// `total N`, garbled stderr leaking into stdout) are dropped via
+/// `filter_map` rather than failing the whole parse.
+pub fn parse_ls_la(stdout: &str) -> Vec<Entry> {
+    stdout.lines().filter_map(parse_ls_la_line).collect()
+}
+
+fn parse_ls_la_line(line: &str) -> Option<Entry> {
+    if line.is_empty() || line.starts_with("total ") {
+        return None;
+    }
+
+    // Find the byte offset of the 9th whitespace-separated field — that's
+    // where the filename starts. Walking once gets us both the splitting
+    // boundary and lets the name keep any embedded whitespace.
+    let mut in_field = false;
+    let mut field_idx = 0usize;
+    let mut name_start = None;
+    for (i, c) in line.char_indices() {
+        let is_ws = c.is_whitespace();
+        if !in_field && !is_ws {
+            in_field = true;
+            field_idx += 1;
+            if field_idx == 9 {
+                name_start = Some(i);
+                break;
+            }
+        } else if in_field && is_ws {
+            in_field = false;
+        }
+    }
+    let name_start = name_start?;
+    let mut cols = line[..name_start].split_whitespace();
+    let perms = cols.next()?;
+    let _nlink = cols.next()?;
+    let _owner = cols.next()?;
+    let _group = cols.next()?;
+    let size_str = cols.next()?;
+    let date = cols.next()?;
+    let time = cols.next()?;
+    let tz = cols.next()?;
+
+    let kind = perms.chars().next()?;
+    let is_dir = kind == 'd';
+    let is_symlink = kind == 'l';
+
+    let rest = &line[name_start..];
+    let name = if is_symlink {
+        // `link_name -> target` — keep only the link name. If a link
+        // name itself contains ` -> ` we'd truncate early; that's a
+        // known MVP limitation.
+        rest.split(" -> ").next().unwrap_or(rest).to_string()
+    } else {
+        rest.to_string()
+    };
+    if name == "." || name == ".." {
+        return None;
+    }
+
+    let size = if is_dir || is_symlink {
+        None
+    } else {
+        size_str.parse::<u64>().ok()
+    };
+
+    // `--time-style=full-iso` emits `YYYY-MM-DD HH:MM:SS.fffffffff ±HHMM`.
+    let combined = format!("{} {} {}", date, time, tz);
+    let modified = chrono::DateTime::parse_from_str(&combined, "%Y-%m-%d %H:%M:%S%.f %z")
+        .ok()
+        .and_then(|dt| {
+            let secs = dt.timestamp();
+            if secs < 0 {
+                return None;
+            }
+            Some(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::new(secs as u64, dt.timestamp_subsec_nanos()),
+            )
+        });
+
+    Some(Entry {
+        name,
+        is_dir,
+        size,
+        modified,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct GitInfo {
     pub branch: String,
@@ -976,8 +1098,6 @@ pub struct GitInfo {
 #[derive(Debug)]
 pub struct Pane {
     /// Where this pane's listing lives — local path or remote backend.
-    /// Phase 1 always constructs `Location::Local`; the Remote arm is
-    /// reserved for Phase 2 (SSH backend) and beyond.
     pub location: Location,
     pub entries: Vec<Entry>,
     /// Indices into `entries` that pass the current filter, in display order.
@@ -1442,6 +1562,138 @@ mod tests {
             let parsed: Location = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(&parsed, original);
         }
+    }
+
+    #[test]
+    fn location_parent_preserves_backend() {
+        let remote = Location::Remote {
+            backend: BackendId::new("alice.dev"),
+            path: PathBuf::from("/var/log"),
+        };
+        assert_eq!(
+            remote.parent(),
+            Some(Location::Remote {
+                backend: BackendId::new("alice.dev"),
+                path: PathBuf::from("/var"),
+            })
+        );
+        assert_eq!(
+            Location::Local(PathBuf::from("/etc/ssh")).parent(),
+            Some(Location::Local(PathBuf::from("/etc"))),
+        );
+    }
+
+    #[test]
+    fn location_parent_at_root_returns_none() {
+        assert_eq!(Location::Local(PathBuf::from("/")).parent(), None);
+        assert_eq!(
+            Location::Remote {
+                backend: BackendId::new("host"),
+                path: PathBuf::from("/"),
+            }
+            .parent(),
+            None,
+        );
+    }
+
+    #[test]
+    fn location_join_preserves_backend() {
+        let remote = Location::Remote {
+            backend: BackendId::new("host"),
+            path: PathBuf::from("/var"),
+        };
+        assert_eq!(
+            remote.join("log"),
+            Location::Remote {
+                backend: BackendId::new("host"),
+                path: PathBuf::from("/var/log"),
+            }
+        );
+        assert_eq!(
+            Location::Local(PathBuf::from("/etc")).join("ssh"),
+            Location::Local(PathBuf::from("/etc/ssh")),
+        );
+    }
+
+    #[test]
+    fn parse_ls_la_skips_total_and_dot_entries() {
+        let stdout = "\
+total 12
+drwxr-xr-x 3 user group 4096 2026-05-22 14:32:01.000000000 +0000 .
+drwxr-xr-x 10 user group 4096 2026-05-22 14:30:15.000000000 +0000 ..
+-rw-r--r-- 1 user group 158 2026-05-22 14:32:01.000000000 +0000 README.md
+";
+        let out = parse_ls_la(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "README.md");
+        assert_eq!(out[0].is_dir, false);
+        assert_eq!(out[0].size, Some(158));
+        assert!(out[0].modified.is_some());
+    }
+
+    #[test]
+    fn parse_ls_la_marks_directories() {
+        let stdout = "\
+drwxr-xr-x 2 user group 4096 2026-05-22 14:31:00.000000000 +0000 src
+-rw-r--r-- 1 user group 42 2026-05-22 14:31:00.000000000 +0000 main.rs
+";
+        let out = parse_ls_la(stdout);
+        assert_eq!(out.len(), 2);
+        let src = out.iter().find(|e| e.name == "src").unwrap();
+        assert!(src.is_dir);
+        // Dirs report no size, matching local listings.
+        assert_eq!(src.size, None);
+        let main = out.iter().find(|e| e.name == "main.rs").unwrap();
+        assert!(!main.is_dir);
+        assert_eq!(main.size, Some(42));
+    }
+
+    #[test]
+    fn parse_ls_la_strips_symlink_target() {
+        let stdout = "\
+lrwxrwxrwx 1 user group 9 2026-05-22 14:31:30.000000000 +0000 link -> README.md
+";
+        let out = parse_ls_la(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "link");
+        // We don't follow remote symlinks → treat as not-dir, no size.
+        assert!(!out[0].is_dir);
+        assert_eq!(out[0].size, None);
+    }
+
+    #[test]
+    fn parse_ls_la_preserves_spaces_in_names() {
+        let stdout = "\
+-rw-r--r-- 1 user group 7 2026-05-22 14:31:00.000000000 +0000 a file with spaces.txt
+";
+        let out = parse_ls_la(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "a file with spaces.txt");
+    }
+
+    #[test]
+    fn parse_ls_la_handles_full_iso_with_nanos_and_offset() {
+        let stdout = "\
+-rw-r--r-- 1 user group 1 2026-05-22 14:32:01.123456789 +0200 a
+";
+        let out = parse_ls_la(stdout);
+        assert_eq!(out.len(), 1);
+        // We don't assert the exact SystemTime, but the parse must succeed —
+        // an unparseable timestamp would leave `modified` as None.
+        assert!(out[0].modified.is_some());
+    }
+
+    #[test]
+    fn parse_ls_la_skips_malformed_lines() {
+        let stdout = "\
+total 0
+this is not an ls line
+-rw-r--r-- 1 user group 1 2026-05-22 14:32:01.000000000 +0000 ok.txt
+";
+        let out = parse_ls_la(stdout);
+        // The malformed line is dropped; the real one survives.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "ok.txt");
     }
 
     fn mk_entry(name: &str, is_dir: bool, size: Option<u64>) -> Entry {

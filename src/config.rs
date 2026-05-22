@@ -102,16 +102,18 @@ pub fn settings_path() -> PathBuf {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SavedState {
     /// Where the left pane was pointing. Serialized as a string —
-    /// pure paths round-trip unchanged (`left: /Users/ron`); remote
-    /// locations get the `<backend>:<path>` form once Phase 2 lands.
+    /// local paths round-trip unchanged (`left: /Users/ron`); remote
+    /// locations use the `<backend>:<path>` form (e.g.
+    /// `left: alice.dev:/var/log`).
     pub left: Location,
     pub right: Location,
     #[serde(default = "default_active_side")]
     pub active: Side,
-    /// Recently-navigated directories, most-recent first. Used by the
-    /// "Go to folder" modal as filterable suggestions. Maintained via
-    /// [`crate::domain::add_recent`]. Stays `PathBuf`-shaped in Phase 1
-    /// — broadening to `Location` is a Phase 2 concern.
+    /// Recently-navigated **local** directories, most-recent first.
+    /// Used by the "Go to folder" modal as filterable suggestions.
+    /// Maintained via [`crate::domain::add_recent`]. Remote panes
+    /// don't feed this list — the SSH-server picker is the entry point
+    /// for those.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
 }
