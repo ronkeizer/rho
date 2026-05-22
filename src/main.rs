@@ -1588,9 +1588,6 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         let key_press = keyboard::on_key_press(|key, mods: Modifiers| {
-            if let Key::Named(Named::Shift) = key {
-                return Some(Message::ShiftChanged(true));
-            }
             match key {
                 Key::Character(ref c)
                     if mods.command() && mods.shift() && c.eq_ignore_ascii_case("p") =>
@@ -1637,10 +1634,19 @@ impl App {
             }
         });
 
-        let key_release = keyboard::on_key_release(|key, _mods| match key {
-            Key::Named(Named::Shift) => Some(Message::ShiftChanged(false)),
-            _ => None,
-        });
+        // Shift state — tracked via the raw `ModifiersChanged` event so it
+        // fires regardless of widget capture. The earlier `on_key_press` /
+        // `on_key_release` based approach only fired on `Status::Ignored`,
+        // which meant a released-after-click shift could be swallowed by
+        // the focused button and leave `shift_held` stuck `true` — causing
+        // the next plain click to extend the selection.
+        let mods_listener =
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) => {
+                    Some(Message::ShiftChanged(mods.shift()))
+                }
+                _ => None,
+            });
 
         // Esc — captured at the raw-event level (status is intentionally
         // ignored) so it fires even when a `text_input` has focus and
@@ -1660,7 +1666,7 @@ impl App {
 
         let settings_poll = time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
 
-        let mut subs = vec![key_press, key_release, esc_listener, resizes, settings_poll];
+        let mut subs = vec![key_press, mods_listener, esc_listener, resizes, settings_poll];
 
         // Watch folders are read once at startup (same lifecycle as window
         // size). Filter out paths that don't exist so notify::watch() doesn't
