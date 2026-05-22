@@ -4,12 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Rho is a cross-platform dual-pane file manager (fman/Total Commander style) written in Rust on top of `iced 0.13`. A single binary crate split into four modules:
+Rho is a cross-platform dual-pane file manager (fman/Total Commander style) written in Rust on top of `iced 0.13`. A single binary crate split into six modules:
 
 - `src/config.rs` — `~/.rho.yaml` settings (with hot reload), `~/.rho-state.yaml` session restore, color parsing, editor/Quick Look launchers, `home_dir`/`expand_tilde`.
-- `src/domain.rs` — pure types with no iced widget code: `Side`, `SortBy`/`SortDir`, `Entry`, `Pane` (selection/filter/sort), `Prompt` + focus enums, `PaletteAction`, `GitInfo`, `sort_entries`. Unit-tested in isolation.
-- `src/fs_ops.rs` — directory streaming (`load_dir_task`), copy/delete (`copy_task`, `delete_task`, `copy_recursive`, `delete_path`), git probe (`git_info_task`, `gather_git_info`), file-watch subscription. Everything that returns `Task<Message>` / `Subscription<Message>` lives here.
-- `src/main.rs` — `App` state, the central `Message` enum, the `update`/`view`/`subscription` glue, and the view helpers (`view_pane`, `view_modal`, `build_row`, `compute_row_style`, layout math, formatters). Sections inside still use `// -----` headers.
+- `src/domain.rs` — pure types with no iced widget code: `Side`, `SortBy`/`SortDir`, `Entry`, `Pane` (selection/filter/sort), `Prompt` + focus enums, `PaletteAction`, `GitInfo`, plus every parser/sort/filter helper (`parse_docker_ps`, `parse_ps_output`, `parse_ssh_config`, `parse_git_branches`, `sort_entries`/`_apps`/`_containers`/`_processes`/`_servers`, the `filtered_*` family, `default_zip_filename`, `keyboard_shortcuts`). Unit-tested in isolation — no iced runtime needed.
+- `src/fs_ops.rs` — async tasks + subprocess wrappers: directory streaming (`load_dir_task`), copy/move/delete (`copy_task`, `move_task`, `delete_task` plus their `copy_recursive` / `move_path` / `delete_path` primitives), compress/uncompress (`compress_task`, `uncompress_task`), git probe + checkout, docker ps/kill/shell, ps + kill, app scan + launch, ssh config scan + connect, the file-watch subscription, and the shared `spawn_terminal_with_command` macOS-AppleScript dispatcher. Everything that returns `Task<Message>` / `Subscription<Message>` lives here.
+- `src/view_pane.rs` — `view_pane()` for one of the two side-by-side pane views, plus row helpers (`build_row`, `compute_row_style`, `row_visual`, `folder_name_color`, `header_cell`), under-list bars (`git_info_bar`, `filter_bar`, `claude_info_bar`), and the layout/formatter helpers (`name_max_chars`, `viewport_height_estimate`, `scroll_id`, `format_size`, `format_modified`, `truncate_with_ellipsis`). The latter four are called from `App` for scroll math too but ship with the view code. Tests for the helpers live here.
+- `src/view_modal.rs` — `view_modal()` (one giant match on `Prompt`) + the per-prompt rendering branches + `modal_style` / `backdrop_style` and the sortable-column-header helpers (`docker_header`, `process_header`).
+- `src/main.rs` — `App` state, the central `Message` enum, the `update` / `view` / `subscription` glue (i.e. the entire message router), and the small `refresh_claude_marker` helper. View functions are imported from `view_pane` / `view_modal`.
 
 ## Commands
 
