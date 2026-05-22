@@ -2311,7 +2311,7 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                     .into()
             } else {
                 let actions_col = filtered.iter().enumerate().fold(
-                    column![].spacing(4),
+                    column![].spacing(2),
                     |col, (i, action)| {
                         // Same idea as the Open modal: highlight only the
                         // active row; the rest inherit the modal background.
@@ -2321,9 +2321,9 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                             button::text
                         };
                         col.push(
-                            button(text(action.label()))
+                            button(text(action.label()).size(12))
                                 .on_press(Message::PaletteSelect(*action))
-                                .padding(Padding::from([8, 20]))
+                                .padding(Padding::from([2, 12]))
                                 .width(Length::Fill)
                                 .style(style),
                         )
