@@ -1539,7 +1539,12 @@ impl App {
                 Key::Character(ref c) if mods.command() && c.as_str() == "," => {
                     Some(Message::OpenSettingsFile)
                 }
-                Key::Named(Named::Escape) => Some(Message::PromptCancel),
+                // Esc is handled by the dedicated `esc_listener`
+                // subscription below — text_input captures Esc to clear its
+                // own focus, so routing it through `on_key_press` (which
+                // only fires on Ignored events) makes the user hit Esc
+                // twice. `event::listen_with` sees the press regardless
+                // of widget capture.
                 Key::Named(Named::ArrowUp) => Some(Message::MoveSelection(-1, mods.shift())),
                 Key::Named(Named::ArrowDown) => Some(Message::MoveSelection(1, mods.shift())),
                 Key::Named(Named::PageUp) => Some(Message::PageMove(-1, mods.shift())),
@@ -1573,11 +1578,25 @@ impl App {
             _ => None,
         });
 
+        // Esc — captured at the raw-event level (status is intentionally
+        // ignored) so it fires even when a `text_input` has focus and
+        // would otherwise swallow the first press to clear its own focus.
+        // `PromptCancel` is idempotent: closes the current modal if any,
+        // else clears the active pane's filter, else no-op.
+        let esc_listener =
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: Key::Named(Named::Escape),
+                    ..
+                }) => Some(Message::PromptCancel),
+                _ => None,
+            });
+
         let resizes = window::resize_events().map(|(_, size)| Message::Resized(size));
 
         let settings_poll = time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
 
-        let mut subs = vec![key_press, key_release, resizes, settings_poll];
+        let mut subs = vec![key_press, key_release, esc_listener, resizes, settings_poll];
 
         // Watch folders are read once at startup (same lifecycle as window
         // size). Filter out paths that don't exist so notify::watch() doesn't
