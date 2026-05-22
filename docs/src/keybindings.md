@@ -16,7 +16,7 @@ key the OS treats as the "logo" / Super key. The app reads it through iced's
 | `PageUp` / `PageDown` | Move by one page (computed from current viewport) |
 | `Shift +` arrow / page key | Extend the selection from the anchor |
 | `Tab` | Switch the active pane (left ↔ right) |
-| `Enter` | If cursor is on `..`, go up. On a directory, descend. On a file, open via the OS default app. |
+| `Enter` | If cursor is on `..`, go up. On a directory, descend. On a `.zip`, extract to `/tmp` and browse (large archives prompt first — see below). On any other file, open via the OS default app. |
 | `Backspace` | Go to the parent directory (or, if a filter is active, delete one character from it) |
 
 ## Marking & range selection
@@ -87,6 +87,7 @@ Inside a modal, the navigation keys behave differently:
 | Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
+| Large-archive extract confirm | Shown when `Enter` is pressed on a `.zip` over 100 MiB. `Tab` / `←` / `→` toggle Cancel ↔ Extract focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel. |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
 | Processes | Type to filter (substring against name). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
@@ -114,6 +115,27 @@ Both actions require their respective CLIs (`zip`, `unzip`, `tar`) to be
 on `PATH`. macOS ships all three; most Linux distros do too. On Windows
 `tar` is built-in but `zip` / `unzip` need to be installed separately
 (or the actions will error out with "not found in PATH").
+
+### Enter on a `.zip`
+
+Pressing `Enter` on a `.zip` row extracts it into a fresh
+`/tmp/rho-<sanitized-stem>-<epoch-ms>/` directory (on Windows, the OS
+temp dir is used instead of `/tmp`) and then navigates the active pane
+into that directory so you can browse the unpacked contents as if it
+were any other folder. The active pane's [recent locations](./session-state.md)
+get updated the same as any other navigate.
+
+If the archive is larger than **100 MiB**, a confirmation modal appears
+first with Cancel and Extract buttons — default focus is Cancel so a
+stray `Enter` won't kick off a long unpack. Tab / ←/→ flip focus,
+`Enter` activates the focused button, `Esc` cancels.
+
+Only `.zip` triggers this — other archive types (`.tar.gz`, `.tar.bz2`,
+…) still open via the OS default. To unpack those, mark the archives and
+use the **Uncompress** action from the command palette.
+
+The extracted folder is left behind in `/tmp` and not cleaned up by Rho;
+the OS handles temp-directory garbage collection.
 
 ### Docker containers modal
 

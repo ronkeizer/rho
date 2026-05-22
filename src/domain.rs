@@ -95,6 +95,14 @@ pub enum Prompt {
         paths: Vec<PathBuf>,
         focus: DeleteFocus,
     },
+    /// User pressed Enter on a `.zip` larger than the threshold — ask
+    /// before unpacking it into `/tmp` and browsing. Reuses [`DeleteFocus`]
+    /// for the Cancel/Confirm button state.
+    ConfirmLargeExtract {
+        archive_path: PathBuf,
+        size_bytes: u64,
+        focus: DeleteFocus,
+    },
     /// Filesystem watcher noticed new files in a watched folder; ask the user
     /// whether to open the folder in one of the panes.
     NewFiles {

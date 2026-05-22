@@ -439,6 +439,64 @@ fn run_extract(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Extract `archive` into a freshly-made directory under the OS temp dir
+/// and emit `Message::ExtractedToTemp(dest, result)` so the App can
+/// navigate the active pane into the new dir on success. Used when the
+/// user hits Enter on a `.zip` row.
+pub fn extract_to_temp_task(archive: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            let dest = tmp_extract_dest(&archive);
+            let dest_for_task = dest.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&dest_for_task).map_err(|e| {
+                    format!("failed to create {}: {}", dest_for_task.display(), e)
+                })?;
+                run_extract(&archive, &dest_for_task)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("extract task panicked: {}", e)));
+            (dest, res)
+        },
+        |(dest, res)| Message::ExtractedToTemp(dest, res),
+    )
+}
+
+/// Where the next extraction goes. `/tmp/rho-<sanitized-stem>-<epoch-ms>`
+/// on Unix; the OS temp dir on Windows. Sanitization keeps `[A-Za-z0-9_-]`
+/// and replaces everything else with `_`, so weird archive names don't
+/// produce unusable folder names. The epoch-ms suffix avoids clobbering a
+/// previous extraction of the same archive.
+pub fn tmp_extract_dest(archive: &Path) -> PathBuf {
+    let stem = archive
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive");
+    let safe: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let folder_name = format!("rho-{}-{}", safe, ms);
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp").join(folder_name)
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join(folder_name)
+    }
+}
+
 /// Probe the directory for git status. Returns None when `path` isn't inside
 /// a git repository (or when `git` is missing from PATH).
 pub fn git_info_task(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
@@ -1205,6 +1263,41 @@ mod tests {
         let missing = dir.path().join("nope");
         let dst = dir.path().join("dst");
         assert!(move_path(&missing, &dst).is_err());
+    }
+
+    #[test]
+    fn tmp_extract_dest_keeps_safe_chars() {
+        let p = tmp_extract_dest(Path::new("/Users/me/my_archive.zip"));
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("rho-my_archive-"), "got: {}", name);
+    }
+
+    #[test]
+    fn tmp_extract_dest_sanitizes_special_chars() {
+        // Spaces / quotes / parens get replaced with `_` so the folder name
+        // is safe to pass to shells / file systems without further quoting.
+        let p = tmp_extract_dest(Path::new("/tmp/My Project (v2).zip"));
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("rho-My_Project__v2_-"), "got: {}", name);
+        // No spaces, quotes, parens in the result.
+        for bad in [' ', '\'', '"', '(', ')'] {
+            assert!(!name.contains(bad), "char {:?} leaked into {}", bad, name);
+        }
+    }
+
+    #[test]
+    fn tmp_extract_dest_falls_back_for_no_stem() {
+        // No extension and weird input — should still produce a usable path.
+        let p = tmp_extract_dest(Path::new(""));
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("rho-archive-"), "got: {}", name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_extract_dest_uses_tmp_on_unix() {
+        let p = tmp_extract_dest(Path::new("/foo/x.zip"));
+        assert!(p.starts_with("/tmp"));
     }
 
     #[cfg(target_os = "macos")]

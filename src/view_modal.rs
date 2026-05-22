@@ -16,6 +16,7 @@ use crate::domain::{
     DockerState, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
     Prompt, Side, SortDir, SshServersState,
 };
+use crate::view_pane::format_size;
 use crate::{Message, PROMPT_ID};
 
 pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
@@ -227,6 +228,53 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
             .spacing(10);
             column![
                 text("Confirm delete").size(15),
+                text(question),
+                actions,
+                text("Tab or ←/→ switch  ·  Enter activate  ·  Esc cancel").size(11),
+            ]
+            .spacing(10)
+        }
+        Prompt::ConfirmLargeExtract {
+            archive_path,
+            size_bytes,
+            focus,
+        } => {
+            let name = archive_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string());
+            let question = format!(
+                "\"{}\" is {}. Extract it to /tmp and browse?",
+                name,
+                format_size(*size_bytes),
+            );
+
+            let cancel_style: fn(&Theme, button::Status) -> button::Style =
+                if *focus == DeleteFocus::Cancel {
+                    button::primary
+                } else {
+                    button::secondary
+                };
+            let confirm_style: fn(&Theme, button::Status) -> button::Style =
+                if *focus == DeleteFocus::Confirm {
+                    button::primary
+                } else {
+                    button::secondary
+                };
+
+            let actions = row![
+                button(text("Cancel"))
+                    .on_press(Message::PromptCancel)
+                    .padding(Padding::from([6, 16]))
+                    .style(cancel_style),
+                button(text("Extract"))
+                    .on_press(Message::PromptSubmit)
+                    .padding(Padding::from([6, 16]))
+                    .style(confirm_style),
+            ]
+            .spacing(10);
+            column![
+                text("Extract large archive").size(15),
                 text(question),
                 actions,
                 text("Tab or ←/→ switch  ·  Enter activate  ·  Esc cancel").size(11),

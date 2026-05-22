@@ -25,15 +25,18 @@ use domain::{
 };
 use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
-    docker_shell, file_watch_subscription, git_branches_task, git_checkout_task,
-    kill_process_task, launch_app, loading_tasks, move_task, open_claude_code, ps_task,
-    ssh_connect, ssh_servers_task, uncompress_task,
+    docker_shell, extract_to_temp_task, file_watch_subscription, git_branches_task,
+    git_checkout_task, kill_process_task, launch_app, loading_tasks, move_task, open_claude_code,
+    ps_task, ssh_connect, ssh_servers_task, uncompress_task,
 };
 use view_modal::view_modal;
 use view_pane::{name_max_chars, scroll_id, view_pane, viewport_height_estimate};
 
 pub(crate) const PROMPT_ID: &str = "prompt";
 const RECENT_CAP: usize = 50;
+/// Enter on a `.zip` over this size pops a confirmation modal before we
+/// shell out to `unzip`. 100 MiB.
+const LARGE_ARCHIVE_THRESHOLD: u64 = 100 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -89,6 +92,9 @@ pub(crate) enum Message {
     CompressFinished(Result<PathBuf, String>),
     /// Per-archive extraction results.
     UncompressFinished(Vec<(PathBuf, Result<(), String>)>),
+    /// Enter-on-zip extraction completed. On success, navigate the active
+    /// pane into `dest` so the user can browse the unpacked contents.
+    ExtractedToTemp(PathBuf, Result<(), String>),
     Resized(Size),
     /// The watcher subscription noticed new files in `folder`.
     NewFilesDetected(PathBuf, Vec<String>),
@@ -163,6 +169,8 @@ struct App {
     compress_in_progress: Option<(usize, PathBuf)>,
     /// (count, dest_dir) while an uncompress task is in flight.
     uncompress_in_progress: Option<(usize, PathBuf)>,
+    /// Source archive path while an Enter-on-zip extraction is running.
+    extract_in_progress: Option<PathBuf>,
     /// New-file detections that arrived while another modal was open. Drained
     /// FIFO when the current modal closes.
     pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
@@ -212,6 +220,7 @@ impl App {
             delete_in_progress: None,
             compress_in_progress: None,
             uncompress_in_progress: None,
+            extract_in_progress: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
         };
@@ -352,6 +361,19 @@ impl App {
                     other => other,
                 }
             }
+            // Same Cancel/Confirm keyboard wiring as Delete — Enter routes to
+            // the focused button, Tab/←/→ flip focus.
+            (Some(Prompt::ConfirmLargeExtract { focus, .. }), m) => {
+                let focus = *focus;
+                match m {
+                    Message::ActivateSelection => match focus {
+                        DeleteFocus::Confirm => Message::PromptSubmit,
+                        DeleteFocus::Cancel => Message::PromptCancel,
+                    },
+                    Message::SwitchSide => Message::SwitchPromptFocus,
+                    other => other,
+                }
+            }
             (Some(Prompt::NewFiles { focus, .. }), m) => {
                 let focus = *focus;
                 match m {
@@ -480,6 +502,22 @@ impl App {
                     if entry.is_dir {
                         return self.navigate(side, path);
                     }
+                    // Enter on a .zip extracts to /tmp and browses the result.
+                    // Large archives (>100 MiB) pop a confirmation first so
+                    // the user doesn't accidentally kick off a long unpack.
+                    if is_zip(&path) {
+                        let size = entry.size.unwrap_or(0);
+                        if size > LARGE_ARCHIVE_THRESHOLD {
+                            self.prompt = Some(Prompt::ConfirmLargeExtract {
+                                archive_path: path,
+                                size_bytes: size,
+                                focus: DeleteFocus::Cancel,
+                            });
+                            return Task::none();
+                        }
+                        self.extract_in_progress = Some(path.clone());
+                        return extract_to_temp_task(path);
+                    }
                     if let Err(e) = open::that_detached(&path) {
                         eprintln!("failed to open {}: {}", path.display(), e);
                     }
@@ -526,7 +564,8 @@ impl App {
                 }
             }
             Message::SwitchPromptFocus => match self.prompt.as_mut() {
-                Some(Prompt::Delete { focus, .. }) => *focus = focus.toggle(),
+                Some(Prompt::Delete { focus, .. })
+                | Some(Prompt::ConfirmLargeExtract { focus, .. }) => *focus = focus.toggle(),
                 Some(Prompt::NewFiles { focus, .. }) => *focus = focus.next(),
                 _ => {}
             },
@@ -613,6 +652,7 @@ impl App {
                             }
                         }
                         Prompt::Delete { .. }
+                        | Prompt::ConfirmLargeExtract { .. }
                         | Prompt::NewFiles { .. }
                         | Prompt::KeyboardShortcuts => {}
                     }
@@ -702,6 +742,10 @@ impl App {
                             } else {
                                 None
                             }
+                        }
+                        Prompt::ConfirmLargeExtract { archive_path, .. } => {
+                            self.extract_in_progress = Some(archive_path.clone());
+                            Some(extract_to_temp_task(archive_path))
                         }
                         // NewFiles uses NewFilesPickSide / PromptCancel, never
                         // PromptSubmit. If we somehow get here, just drop it.
@@ -972,6 +1016,22 @@ impl App {
                     }
                 }
                 return self.reload_both_panes();
+            }
+            Message::ExtractedToTemp(dest, result) => {
+                let archive = self.extract_in_progress.take();
+                match result {
+                    Ok(()) => {
+                        let side = self.active;
+                        return self.navigate(side, dest);
+                    }
+                    Err(e) => {
+                        let name = archive
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| dest.display().to_string());
+                        eprintln!("extract {} failed: {}", name, e);
+                    }
+                }
             }
             Message::DeleteFinished(results) => {
                 self.delete_in_progress = None;
@@ -1450,6 +1510,13 @@ impl App {
                 dest.display()
             ));
         }
+        if let Some(archive) = &self.extract_in_progress {
+            let name = archive
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive.display().to_string());
+            return Some(format!("Extracting {} to /tmp…", name));
+        }
         if let Some(count) = self.delete_in_progress {
             let noun = if count == 1 { "file" } else { "files" };
             return Some(format!("Deleting {} {}…", count, noun));
@@ -1619,4 +1686,39 @@ impl App {
 fn refresh_claude_marker(pane: &mut Pane) {
     pane.has_claude_md = pane.path.join("CLAUDE.md").is_file();
     pane.has_claude_dir = pane.path.join(".claude").is_dir();
+}
+
+/// True if the path's extension is `zip` (case-insensitive). Used to gate
+/// Enter-on-archive extraction.
+fn is_zip(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_zip;
+    use std::path::Path;
+
+    #[test]
+    fn is_zip_matches_lowercase() {
+        assert!(is_zip(Path::new("archive.zip")));
+    }
+
+    #[test]
+    fn is_zip_matches_uppercase() {
+        assert!(is_zip(Path::new("ARCHIVE.ZIP")));
+    }
+
+    #[test]
+    fn is_zip_rejects_tar_gz() {
+        assert!(!is_zip(Path::new("archive.tar.gz")));
+    }
+
+    #[test]
+    fn is_zip_rejects_no_extension() {
+        assert!(!is_zip(Path::new("README")));
+    }
 }
