@@ -136,6 +136,14 @@ pub enum Prompt {
     /// Static informational modal — lists keyboard shortcuts sourced from
     /// [`keyboard_shortcuts`]. No interactive state; Esc dismisses.
     KeyboardShortcuts,
+    /// "Connect to SSH server" action. Lists `Host` entries from
+    /// `~/.ssh/config` (skipping pure-wildcard blocks). Per-row action is
+    /// `Connect` — opens a new terminal window running `ssh <alias>`.
+    SshServers {
+        state: SshServersState,
+        input: String,
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +191,8 @@ pub enum PaletteAction {
     /// Runtime-gated: only offered when the active pane is inside a git
     /// repository (see [`available_palette_actions`]).
     GitBranch,
+    SshConnect,
+    OpenClaudeCode,
     KeyboardShortcuts,
     Exit,
 }
@@ -196,6 +206,8 @@ impl PaletteAction {
         PaletteAction::Processes,
         PaletteAction::LaunchApplication,
         PaletteAction::GitBranch,
+        PaletteAction::SshConnect,
+        PaletteAction::OpenClaudeCode,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -207,6 +219,8 @@ impl PaletteAction {
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
         PaletteAction::GitBranch,
+        PaletteAction::SshConnect,
+        PaletteAction::OpenClaudeCode,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -219,6 +233,8 @@ impl PaletteAction {
             PaletteAction::Processes => "Processes",
             PaletteAction::LaunchApplication => "Launch Application",
             PaletteAction::GitBranch => "Git: branch",
+            PaletteAction::SshConnect => "Connect to SSH server",
+            PaletteAction::OpenClaudeCode => "Open Claude Code in this folder",
             PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
         }
@@ -409,6 +425,25 @@ pub struct GitBranch {
 pub enum GitBranchesState {
     Loading,
     Loaded(Vec<GitBranch>),
+    Error(String),
+}
+
+/// A single `Host` entry parsed out of `~/.ssh/config`. Only the four fields
+/// the modal cares about are kept; everything else (ProxyJump, Port, etc.) is
+/// preserved by `ssh` itself when we shell out — we don't need it here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshServer {
+    pub alias: String,
+    pub hostname: Option<String>,
+    pub user: Option<String>,
+    pub identity_file: Option<String>,
+}
+
+/// Lifecycle of the Connect to SSH server modal. Same shape as the others.
+#[derive(Debug, Clone)]
+pub enum SshServersState {
+    Loading,
+    Loaded(Vec<SshServer>),
     Error(String),
 }
 
@@ -610,6 +645,90 @@ pub fn filtered_branches<'a>(branches: &'a [GitBranch], input: &str) -> Vec<&'a 
         .collect()
 }
 
+/// Parse a (very small) subset of `~/.ssh/config`:
+///
+/// - Each `Host` line opens a block. Multiple patterns on one `Host` line
+///   are split on whitespace; the first non-wildcard pattern becomes the
+///   entry's alias. Pure-wildcard blocks (e.g. `Host *`) are skipped — they
+///   apply to every host and don't represent a specific server.
+/// - Inside a block, `HostName`, `User`, `IdentityFile` are tracked.
+/// - SSH config keys are case-insensitive.
+/// - `Include` directives are ignored in v1.
+///
+/// Comments (`#` at start of trimmed line) and blank lines are skipped.
+pub fn parse_ssh_config(content: &str) -> Vec<SshServer> {
+    let mut servers = Vec::new();
+    let mut current: Option<SshServer> = None;
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = match line.split_once(char::is_whitespace) {
+            Some((k, v)) => (k, v.trim()),
+            None => continue,
+        };
+        let key_lower = key.to_ascii_lowercase();
+
+        if key_lower == "host" {
+            if let Some(srv) = current.take() {
+                servers.push(srv);
+            }
+            // Pick the first non-wildcard pattern; if none, this whole block
+            // is a defaults block and we just don't open a `current`.
+            let alias = value
+                .split_whitespace()
+                .find(|p| !p.contains('*') && !p.contains('?'));
+            if let Some(alias) = alias {
+                current = Some(SshServer {
+                    alias: alias.to_string(),
+                    hostname: None,
+                    user: None,
+                    identity_file: None,
+                });
+            }
+        } else if let Some(srv) = current.as_mut() {
+            match key_lower.as_str() {
+                "hostname" => srv.hostname = Some(value.to_string()),
+                "user" => srv.user = Some(value.to_string()),
+                "identityfile" => srv.identity_file = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+    if let Some(srv) = current.take() {
+        servers.push(srv);
+    }
+    servers
+}
+
+/// Sort SSH servers by alias ascending (case-insensitive). The order in
+/// `~/.ssh/config` is grouping-driven, not alphabetic, so we re-sort for
+/// the modal to make scanning easier.
+pub fn sort_servers(servers: &mut [SshServer]) {
+    servers.sort_by_cached_key(|s| s.alias.to_lowercase());
+}
+
+/// Case-insensitive substring filter — matches alias OR hostname so a user
+/// who only remembers the hostname can still find the entry.
+pub fn filtered_servers<'a>(servers: &'a [SshServer], input: &str) -> Vec<&'a SshServer> {
+    if input.is_empty() {
+        return servers.iter().collect();
+    }
+    let needle = input.to_lowercase();
+    servers
+        .iter()
+        .filter(|s| {
+            s.alias.to_lowercase().contains(&needle)
+                || s.hostname
+                    .as_ref()
+                    .map(|h| h.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct GitInfo {
     pub branch: String,
@@ -646,6 +765,10 @@ pub struct Pane {
     pub load_generation: u64,
     /// Result of the async git probe, if this directory is inside a git repo.
     pub git_info: Option<GitInfo>,
+    /// Whether a `CLAUDE.md` file exists in this directory.
+    pub has_claude_md: bool,
+    /// Whether a `.claude/` directory exists in this directory.
+    pub has_claude_dir: bool,
     /// Name of an entry the cursor should land on as soon as it appears in
     /// the streaming load. Used to focus on a newly-detected file after the
     /// "new files" modal opens its folder. Cleared on `navigate()`, or when
@@ -669,8 +792,31 @@ impl Pane {
             loading: true,
             load_generation: 0,
             git_info: None,
+            has_claude_md: false,
+            has_claude_dir: false,
             pending_focus: None,
         }
+    }
+
+    /// True iff this pane's directory has a `CLAUDE.md` file *or* a
+    /// `.claude/` subdirectory — the marker the in-app info bar lights up
+    /// for.
+    pub fn has_claude_marker(&self) -> bool {
+        self.has_claude_md || self.has_claude_dir
+    }
+
+    /// Formatted label for the Claude info bar (e.g. "claude: CLAUDE.md,
+    /// .claude/"). Caller is responsible for checking [`Self::has_claude_marker`]
+    /// first — an empty marker returns the bare "claude: " prefix.
+    pub fn claude_marker_label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.has_claude_md {
+            parts.push("CLAUDE.md");
+        }
+        if self.has_claude_dir {
+            parts.push(".claude/");
+        }
+        format!("claude: {}", parts.join(", "))
     }
 
     /// Reset the pane to "about to load `path`". Returns the new generation
@@ -685,6 +831,11 @@ impl Pane {
         self.loading = true;
         self.load_generation += 1;
         self.git_info = None;
+        // Claude markers are reset here so the old pane's bar doesn't briefly
+        // bleed into the new directory; the App layer re-stats and sets them
+        // right after this returns.
+        self.has_claude_md = false;
+        self.has_claude_dir = false;
         // A fresh navigation overrides any in-flight focus request. The caller
         // re-sets pending_focus *after* navigate() if it wants one.
         self.pending_focus = None;
@@ -1051,6 +1202,43 @@ mod tests {
         assert!(p.loading);
         assert_eq!(p.load_generation, 0);
         assert!(p.git_info.is_none());
+        assert!(!p.has_claude_md);
+        assert!(!p.has_claude_dir);
+        assert!(!p.has_claude_marker());
+    }
+
+    #[test]
+    fn pane_has_claude_marker_combinations() {
+        let mut p = Pane::empty(PathBuf::from("/tmp"));
+        assert!(!p.has_claude_marker());
+        p.has_claude_md = true;
+        assert!(p.has_claude_marker());
+        p.has_claude_md = false;
+        p.has_claude_dir = true;
+        assert!(p.has_claude_marker());
+        p.has_claude_md = true;
+        assert!(p.has_claude_marker());
+    }
+
+    #[test]
+    fn pane_claude_marker_label_lists_what_is_present() {
+        let mut p = Pane::empty(PathBuf::from("/tmp"));
+        p.has_claude_md = true;
+        assert_eq!(p.claude_marker_label(), "claude: CLAUDE.md");
+        p.has_claude_dir = true;
+        assert_eq!(p.claude_marker_label(), "claude: CLAUDE.md, .claude/");
+        p.has_claude_md = false;
+        assert_eq!(p.claude_marker_label(), "claude: .claude/");
+    }
+
+    #[test]
+    fn pane_navigate_clears_claude_markers() {
+        let mut p = Pane::empty(PathBuf::from("/old"));
+        p.has_claude_md = true;
+        p.has_claude_dir = true;
+        p.navigate(PathBuf::from("/new"));
+        assert!(!p.has_claude_md);
+        assert!(!p.has_claude_dir);
     }
 
     #[test]
@@ -2090,5 +2278,139 @@ mod tests {
         for needle in ["⌘P", "⌘⇧P", "F4", "F5", "F10", "Tab", "Esc"] {
             assert!(joined.contains(needle), "missing binding: {}", needle);
         }
+    }
+
+    #[test]
+    fn palette_action_ssh_connect_label() {
+        assert_eq!(
+            PaletteAction::SshConnect.label(),
+            "Connect to SSH server"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_config_basic() {
+        let cfg = "
+Host alpha
+    HostName alpha.example.com
+    User alice
+    IdentityFile ~/.ssh/id_rsa
+
+Host beta
+    HostName beta.example.com
+    User bob
+";
+        let out = parse_ssh_config(cfg);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alias, "alpha");
+        assert_eq!(out[0].hostname.as_deref(), Some("alpha.example.com"));
+        assert_eq!(out[0].user.as_deref(), Some("alice"));
+        assert_eq!(out[0].identity_file.as_deref(), Some("~/.ssh/id_rsa"));
+        assert_eq!(out[1].alias, "beta");
+        assert_eq!(out[1].hostname.as_deref(), Some("beta.example.com"));
+        assert_eq!(out[1].identity_file, None);
+    }
+
+    #[test]
+    fn parse_ssh_config_skips_pure_wildcard_blocks() {
+        let cfg = "
+Host *
+    ServerAliveInterval 30
+    IdentityFile ~/.ssh/id_ed25519
+
+Host real
+    HostName real.example.com
+";
+        let out = parse_ssh_config(cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alias, "real");
+        // The defaults block's IdentityFile must NOT leak into `real`.
+        assert!(out[0].identity_file.is_none());
+    }
+
+    #[test]
+    fn parse_ssh_config_picks_first_non_wildcard_pattern() {
+        // "Host foo *.bar" → first non-wildcard is "foo".
+        let cfg = "Host foo *.bar\n    HostName foo.example.com\n";
+        let out = parse_ssh_config(cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alias, "foo");
+    }
+
+    #[test]
+    fn parse_ssh_config_handles_comments_and_case() {
+        let cfg = "
+# my work boxes
+Host work
+    hostname work.example.com
+    USER carol
+";
+        let out = parse_ssh_config(cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hostname.as_deref(), Some("work.example.com"));
+        assert_eq!(out[0].user.as_deref(), Some("carol"));
+    }
+
+    #[test]
+    fn parse_ssh_config_empty_returns_empty() {
+        assert!(parse_ssh_config("").is_empty());
+        assert!(parse_ssh_config("\n# only comments\n").is_empty());
+    }
+
+    fn mk_server(alias: &str, host: Option<&str>) -> SshServer {
+        SshServer {
+            alias: alias.to_string(),
+            hostname: host.map(|s| s.to_string()),
+            user: None,
+            identity_file: None,
+        }
+    }
+
+    #[test]
+    fn sort_servers_case_insensitive_by_alias() {
+        let mut v = vec![
+            mk_server("Zeta", None),
+            mk_server("alpha", None),
+            mk_server("Beta", None),
+        ];
+        sort_servers(&mut v);
+        assert_eq!(v[0].alias, "alpha");
+        assert_eq!(v[1].alias, "Beta");
+        assert_eq!(v[2].alias, "Zeta");
+    }
+
+    #[test]
+    fn filtered_servers_matches_alias_or_hostname() {
+        let v = vec![
+            mk_server("work", Some("work.example.com")),
+            mk_server("home", Some("home.lan")),
+        ];
+        // Alias match.
+        let out = filtered_servers(&v, "work");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alias, "work");
+        // Hostname match.
+        let out = filtered_servers(&v, "lan");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alias, "home");
+        // Empty filter returns all.
+        assert_eq!(filtered_servers(&v, "").len(), 2);
+        // No match.
+        assert!(filtered_servers(&v, "zzz").is_empty());
+    }
+
+    #[test]
+    fn filtered_servers_is_case_insensitive() {
+        let v = vec![mk_server("Work", Some("EXAMPLE.com"))];
+        assert_eq!(filtered_servers(&v, "WORK").len(), 1);
+        assert_eq!(filtered_servers(&v, "example").len(), 1);
+    }
+
+    #[test]
+    fn palette_action_open_claude_code_label() {
+        assert_eq!(
+            PaletteAction::OpenClaudeCode.label(),
+            "Open Claude Code in this folder"
+        );
     }
 }

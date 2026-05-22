@@ -22,16 +22,16 @@ use config::{
 };
 use domain::{
     add_recent, available_palette_actions, filtered_actions, filtered_apps, filtered_branches,
-    filtered_containers, filtered_processes, filtered_recents, keyboard_shortcuts, sort_apps,
-    sort_containers, sort_entries, sort_processes, Application, AppsState, DeleteFocus,
-    DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
-    NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy, ProcessesState, Prompt, RowVisual,
-    Side, SortBy, SortDir,
+    filtered_containers, filtered_processes, filtered_recents, filtered_servers,
+    keyboard_shortcuts, sort_apps, sort_containers, sort_entries, sort_processes, Application,
+    AppsState, DeleteFocus, DockerContainer, DockerSortBy, DockerState, Entry, GitBranch,
+    GitBranchesState, GitInfo, NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy,
+    ProcessesState, Prompt, RowVisual, Side, SortBy, SortDir, SshServer, SshServersState,
 };
 use fs_ops::{
     apps_task, copy_task, delete_task, docker_kill_task, docker_ps_task, docker_shell,
     file_watch_subscription, git_branches_task, git_checkout_task, kill_process_task, launch_app,
-    loading_tasks, ps_task,
+    loading_tasks, open_claude_code, ps_task, ssh_connect, ssh_servers_task,
 };
 
 const PROMPT_ID: &str = "prompt";
@@ -127,6 +127,10 @@ enum Message {
     GitCheckout(String),
     /// `git checkout <branch>` completed.
     GitCheckoutFinished(String, Result<(), String>),
+    /// `read_ssh_config` completed (or failed) for the SshServers modal.
+    SshServersLoaded(Result<Vec<SshServer>, String>),
+    /// User clicked Connect on an SSH server row — spawn a terminal.
+    SshConnect(String),
     /// Global "quit the app" — currently bound to F10.
     ExitApp,
     NoOp,
@@ -198,6 +202,11 @@ impl App {
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
         };
+        // Stat the initial pane paths for the CLAUDE.md / .claude marker so
+        // the info bar shows on startup, not just after the first navigate.
+        let mut app = app;
+        refresh_claude_marker(&mut app.left);
+        refresh_claude_marker(&mut app.right);
         // Pane::empty starts at load_generation 0; the initial loads tag
         // their chunks the same way so they're accepted.
         let init = Task::batch([
@@ -239,6 +248,7 @@ impl App {
 
     fn navigate(&mut self, side: Side, path: PathBuf) -> Task<Message> {
         let generation = self.pane_mut(side).navigate(path.clone());
+        refresh_claude_marker(self.pane_mut(side));
         add_recent(&mut self.recent_locations, path.clone(), RECENT_CAP);
         self.save_state();
         Task::batch([
@@ -304,6 +314,8 @@ impl App {
         let right_path = self.right.path.clone();
         let left_gen = self.left.navigate(left_path.clone());
         let right_gen = self.right.navigate(right_path.clone());
+        refresh_claude_marker(&mut self.left);
+        refresh_claude_marker(&mut self.right);
         Task::batch([
             loading_tasks(Side::Left, left_path, left_gen),
             loading_tasks(Side::Right, right_path, right_gen),
@@ -349,7 +361,8 @@ impl App {
                 Some(Prompt::Open { .. })
                 | Some(Prompt::CommandPalette { .. })
                 | Some(Prompt::Apps { .. })
-                | Some(Prompt::GitBranches { .. }),
+                | Some(Prompt::GitBranches { .. })
+                | Some(Prompt::SshServers { .. }),
                 m,
             ) => match m {
                 Message::MoveSelection(delta, _) => Message::PromptMove(delta),
@@ -403,14 +416,21 @@ impl App {
                 let side = self.active;
                 // If a filter is active, Backspace edits the filter instead
                 // of leaving the current directory.
-                {
+                let filter_shrank = {
                     let pane = self.pane_mut(side);
                     if !pane.filter.is_empty() {
                         let prior = pane.cursor_name();
                         pane.filter.pop();
                         pane.recompute_visible(prior.as_deref());
-                        return Task::none();
+                        true
+                    } else {
+                        false
                     }
+                };
+                if filter_shrank {
+                    // visible row count changed — re-anchor scroll so the
+                    // newly-matching rows are visible. See FilterAppend.
+                    return self.ensure_active_visible();
                 }
                 if let Some(parent) = self.pane(side).path.parent().map(|p| p.to_path_buf()) {
                     return self.navigate(side, parent);
@@ -555,6 +575,17 @@ impl App {
                             *input = value;
                             if let GitBranchesState::Loaded(list) = state {
                                 let n = filtered_branches(list, input).len();
+                                *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                            }
+                        }
+                        Prompt::SshServers {
+                            input,
+                            state,
+                            selected,
+                        } => {
+                            *input = value;
+                            if let SshServersState::Loaded(list) = state {
+                                let n = filtered_servers(list, input).len();
                                 *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                             }
                         }
@@ -715,6 +746,35 @@ impl App {
                             self.prompt = Some(Prompt::KeyboardShortcuts);
                             None
                         }
+                        // SshServers: Enter connects to the highlighted row.
+                        // Empty/loading/error keeps the modal open.
+                        Prompt::SshServers {
+                            state,
+                            input,
+                            selected,
+                        } => {
+                            let alias = if let SshServersState::Loaded(list) = &state {
+                                let filtered = filtered_servers(list, &input);
+                                filtered.get(selected).map(|&s| s.alias.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(alias) = alias {
+                                if let Err(e) =
+                                    ssh_connect(&alias, self.config.terminal_app.as_deref())
+                                {
+                                    eprintln!("ssh connect {} failed: {}", alias, e);
+                                }
+                                None
+                            } else {
+                                self.prompt = Some(Prompt::SshServers {
+                                    state,
+                                    input,
+                                    selected,
+                                });
+                                None
+                            }
+                        }
                     }
                 } else {
                     None
@@ -731,11 +791,23 @@ impl App {
                 } else {
                     // No modal — Esc clears the active pane's filter.
                     let side = self.active;
-                    let pane = self.pane_mut(side);
-                    if !pane.filter.is_empty() {
-                        let prior = pane.cursor_name();
-                        pane.filter.clear();
-                        pane.recompute_visible(prior.as_deref());
+                    let filter_was_active = {
+                        let pane = self.pane_mut(side);
+                        if !pane.filter.is_empty() {
+                            let prior = pane.cursor_name();
+                            pane.filter.clear();
+                            pane.recompute_visible(prior.as_deref());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if filter_was_active {
+                        // Visible row count changed (filter dropped → all
+                        // entries shown again). Re-anchor scroll to the
+                        // cursor — without this, the unfiltered list may
+                        // still appear scrolled to the wrong position.
+                        return self.ensure_active_visible();
                     }
                 }
             }
@@ -745,6 +817,11 @@ impl App {
                 let prior = pane.cursor_name();
                 pane.filter.push_str(&s);
                 pane.recompute_visible(prior.as_deref());
+                // After the visible-row count changes, the existing scroll
+                // position may be past the end of the new (filtered) list.
+                // ensure_active_visible re-anchors scroll_y around the
+                // (possibly-reset) cursor so the matching rows are on-screen.
+                return self.ensure_active_visible();
             }
             Message::EntriesChunk(side, generation, chunk) => {
                 // Read pending-focus state *before* the append, so we can
@@ -905,6 +982,18 @@ impl App {
                         }
                     }
                 }
+                Some(Prompt::SshServers {
+                    state,
+                    input,
+                    selected,
+                }) => {
+                    if let SshServersState::Loaded(list) = state {
+                        let n = filtered_servers(list, input).len() as i32;
+                        if n > 0 {
+                            *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                        }
+                    }
+                }
                 _ => {}
             },
             Message::OpenRecent(path) => {
@@ -951,7 +1040,7 @@ impl App {
                 }
             }
             Message::DockerShell(id) => {
-                if let Err(e) = docker_shell(&id) {
+                if let Err(e) = docker_shell(&id, self.config.terminal_app.as_deref()) {
                     eprintln!("docker shell {} failed: {}", id, e);
                 }
             }
@@ -1034,6 +1123,24 @@ impl App {
                 if let Some(Prompt::GitBranches { repo_path, .. }) = &self.prompt {
                     let path = repo_path.clone();
                     return git_checkout_task(path, branch);
+                }
+            }
+            Message::SshServersLoaded(result) => {
+                if let Some(Prompt::SshServers { state, .. }) = self.prompt.as_mut() {
+                    *state = match result {
+                        Ok(list) => SshServersState::Loaded(list),
+                        Err(msg) => SshServersState::Error(msg),
+                    };
+                }
+            }
+            Message::SshConnect(alias) => {
+                // Close the modal first — the terminal launches in a separate
+                // window, so once it's spawned the user is interacting with
+                // ssh, not with us.
+                self.prompt = None;
+                self.show_next_pending();
+                if let Err(e) = ssh_connect(&alias, self.config.terminal_app.as_deref()) {
+                    eprintln!("ssh connect {} failed: {}", alias, e);
                 }
             }
             Message::GitCheckoutFinished(branch, result) => {
@@ -1153,6 +1260,27 @@ impl App {
             }
             PaletteAction::KeyboardShortcuts => {
                 self.prompt = Some(Prompt::KeyboardShortcuts);
+                Task::none()
+            }
+            PaletteAction::SshConnect => {
+                self.prompt = Some(Prompt::SshServers {
+                    state: SshServersState::Loading,
+                    input: String::new(),
+                    selected: 0,
+                });
+                Task::batch([
+                    ssh_servers_task(),
+                    text_input::focus(text_input::Id::new(PROMPT_ID)),
+                ])
+            }
+            PaletteAction::OpenClaudeCode => {
+                // Fire-and-forget: spawn a terminal with `claude` running in
+                // the active pane's directory. No modal — the action just
+                // launches and closes the palette.
+                let path = self.pane(self.active).path.clone();
+                if let Err(e) = open_claude_code(&path, self.config.terminal_app.as_deref()) {
+                    eprintln!("open Claude Code in {} failed: {}", path.display(), e);
+                }
                 Task::none()
             }
             PaletteAction::Exit => window::get_oldest().and_then(window::close),
@@ -1527,6 +1655,9 @@ fn view_pane<'a>(
     if let Some(info) = &pane.git_info {
         inner_col = inner_col.push(git_info_bar(info, config, active));
     }
+    if pane.has_claude_marker() {
+        inner_col = inner_col.push(claude_info_bar(pane, config, active));
+    }
     let inner = container(inner_col).padding(6);
 
     // No border around the pane any more. The "which pane is active" cue is
@@ -1539,6 +1670,38 @@ fn view_pane<'a>(
     mouse_area(pane_container)
         .on_press(Message::Activate(side))
         .into()
+}
+
+/// Stat `pane.path` for the Claude context markers (`CLAUDE.md` /
+/// `.claude/`) and update the pane's cached booleans. Called on every
+/// navigate / reload — same lifecycle as `git_info`.
+fn refresh_claude_marker(pane: &mut Pane) {
+    pane.has_claude_md = pane.path.join("CLAUDE.md").is_file();
+    pane.has_claude_dir = pane.path.join(".claude").is_dir();
+}
+
+/// Orange info bar shown when the active directory has a `CLAUDE.md` and/or
+/// `.claude/`. Mirrors `git_info_bar`'s shape, just with hardcoded amber
+/// colors since iced's theme doesn't ship an "orange" palette.
+fn claude_info_bar<'a>(pane: &Pane, config: &Config, active: bool) -> Element<'a, Message> {
+    container(
+        text(pane.claude_marker_label())
+            .font(Font::MONOSPACE)
+            .size(config.header_font_size),
+    )
+    .padding(Padding::from([2, 8]))
+    .width(Length::Fill)
+    .style(move |_theme: &Theme| {
+        let bg = Color::from_rgb8(0x4a, 0x30, 0x18);
+        let fg_full = Color::from_rgb8(0xff, 0xa0, 0x40);
+        let fg = if active { fg_full } else { dim(fg_full) };
+        container::Style {
+            background: Some(bg.into()),
+            text_color: Some(fg),
+            ..Default::default()
+        }
+    })
+    .into()
 }
 
 fn git_info_bar<'a>(info: &GitInfo, config: &Config, active: bool) -> Element<'a, Message> {
@@ -1855,7 +2018,8 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
         Prompt::Docker { .. }
         | Prompt::Processes { .. }
         | Prompt::Apps { .. }
-        | Prompt::GitBranches { .. } => 720.0,
+        | Prompt::GitBranches { .. }
+        | Prompt::SshServers { .. } => 720.0,
         Prompt::KeyboardShortcuts => 600.0,
         _ => 440.0,
     };
@@ -2607,6 +2771,128 @@ fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 filter_widget,
                 body,
                 text("Type to filter  ·  ↑/↓ select  ·  Enter or click Checkout  ·  Esc dismisses")
+                    .size(11),
+            ]
+            .spacing(6)
+        }
+        Prompt::SshServers {
+            state,
+            input,
+            selected,
+        } => {
+            let filter_widget = text_input("filter by alias or hostname…", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8);
+
+            let body: Element<'_, Message> = match state {
+                SshServersState::Loading => container(text("Loading…").size(12))
+                    .padding(Padding::from([8, 8]))
+                    .into(),
+                SshServersState::Error(msg) => container(
+                    text(msg.clone())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .style(|theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.extended_palette().danger.base.color),
+                        }),
+                )
+                .padding(Padding::from([8, 8]))
+                .into(),
+                SshServersState::Loaded(servers) => {
+                    let filtered = filtered_servers(servers, input);
+                    if filtered.is_empty() {
+                        container(text("No servers match.").size(12))
+                            .padding(Padding::from([8, 8]))
+                            .into()
+                    } else {
+                        let list_col = filtered.iter().enumerate().fold(
+                            column![].spacing(3),
+                            |col, (i, server)| {
+                                let alias = server.alias.clone();
+                                let highlighted = i == *selected;
+                                let user_host = match (&server.user, &server.hostname) {
+                                    (Some(u), Some(h)) => format!("{}@{}", u, h),
+                                    (None, Some(h)) => h.clone(),
+                                    (Some(u), None) => format!("{}@?", u),
+                                    (None, None) => String::new(),
+                                };
+                                let identity = server
+                                    .identity_file
+                                    .clone()
+                                    .unwrap_or_default();
+                                let alias_cell = text(server.alias.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(11)
+                                    .width(Length::FillPortion(3))
+                                    .wrapping(iced::widget::text::Wrapping::None);
+                                let host_cell = text(user_host)
+                                    .font(Font::MONOSPACE)
+                                    .size(11)
+                                    .width(Length::FillPortion(4))
+                                    .wrapping(iced::widget::text::Wrapping::None);
+                                let identity_cell = text(identity)
+                                    .font(Font::MONOSPACE)
+                                    .size(11)
+                                    .width(Length::FillPortion(3))
+                                    .wrapping(iced::widget::text::Wrapping::None)
+                                    .style(|theme: &Theme| iced::widget::text::Style {
+                                        color: Some(dim(theme.extended_palette().background.base.text)),
+                                    });
+                                let row_widget = row![
+                                    alias_cell,
+                                    host_cell,
+                                    identity_cell,
+                                    button(
+                                        text("Connect")
+                                            .size(10)
+                                            .align_x(Horizontal::Center)
+                                            .width(Length::Fill),
+                                    )
+                                    .on_press(Message::SshConnect(alias))
+                                    .padding(Padding::from([2, 0]))
+                                    .width(Length::Fixed(80.0))
+                                    .style(button::primary),
+                                ]
+                                .spacing(8)
+                                .align_y(iced::Alignment::Center);
+                                col.push(
+                                    container(row_widget)
+                                        .padding(Padding::from([3, 8]))
+                                        .style(move |theme: &Theme| container::Style {
+                                            background: if highlighted {
+                                                Some(
+                                                    theme
+                                                        .extended_palette()
+                                                        .primary
+                                                        .weak
+                                                        .color
+                                                        .into(),
+                                                )
+                                            } else {
+                                                None
+                                            },
+                                            border: Border {
+                                                color: Color::TRANSPARENT,
+                                                width: 1.0,
+                                                radius: 4.0.into(),
+                                            },
+                                            ..Default::default()
+                                        }),
+                                )
+                            },
+                        );
+                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                    }
+                }
+            };
+
+            column![
+                text("Connect to SSH server").size(15),
+                filter_widget,
+                body,
+                text("Type to filter  ·  ↑/↓ select  ·  Enter or click Connect  ·  Esc dismisses")
                     .size(11),
             ]
             .spacing(6)

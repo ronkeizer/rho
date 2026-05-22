@@ -30,12 +30,28 @@ to see it.
 | `mark_color` | string `#rrggbb` | _(theme-derived)_ | Background for marked rows (range selection). Omit to use the theme's primary-weak color. |
 | `folder_color` | string `#rrggbb` | `#6db4ff` | Name color for directory entries. |
 | `watch_folders` | list of strings | `["~/Downloads"]` | Folders to watch for new files. Read once at startup; restart to apply changes. |
+| `terminal_app` | string | _(auto)_ | macOS only. Which terminal app to launch for the SSH `Connect` and Docker `Shell` actions. Common values: `"iTerm"`, `"Terminal"`. Omit (or leave `None`) to auto-pick: `iTerm` when `/Applications/iTerm.app` exists, otherwise `Terminal`. Ignored on Linux / Windows. |
 
 ## Colors
 
 Color fields are `#rrggbb` (hash optional). Invalid values are silently
 ignored and the theme-derived default is used instead. Parsing is
 case-insensitive and whitespace-tolerant.
+
+## Terminal app (macOS)
+
+When you set `terminal_app` (or rely on the auto-pick), the SSH and
+Docker-shell actions emit AppleScript tailored to that app:
+
+- **iTerm / iTerm2** → `create window with default profile command "..."`.
+  The command becomes the session's main process — no shell wrapper, no
+  prompt visible before the command runs.
+- **Terminal** (or any other name) → `do script "exec ..."`. `do script`
+  always wraps in a shell, so you'll briefly see the shell prompt, but
+  `exec` immediately replaces it with your command.
+
+That's also why the auto-pick prefers iTerm if it's installed — the
+iTerm path has a noticeably smoother launch.
 
 ## Watch folders
 

@@ -74,7 +74,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -91,6 +91,7 @@ Inside a modal, the navigation keys behave differently:
 | Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
 | Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
 | Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
+| Connect to SSH server | Type to filter (substring against alias or hostname). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Connect` opens a new terminal running `ssh <alias>`. `Esc` dismisses. |
 
 ### Docker containers modal
 
@@ -180,3 +181,55 @@ which is the same probe that drives the per-pane git bar.
 
 The branch list is captured at modal open time and isn't refreshed
 during the session. Dismiss and reopen to refresh.
+
+### Connect to SSH server modal
+
+Picking **Connect to SSH server** from the command palette reads
+`~/.ssh/config` and lists every `Host` entry — alias, `user@hostname`
+(or just hostname when no User is set), and IdentityFile. Sorted by
+alias ascending. Filter input narrows by substring of either the
+alias or the hostname (case-insensitive).
+
+Wildcard-only blocks (`Host *`) are skipped — they're defaults that
+apply to every host, not specific servers. `Include` directives are
+not followed in v1: only the top-level `~/.ssh/config` is parsed.
+When a `Host` line lists multiple patterns (e.g. `Host alpha *.foo`),
+the first non-wildcard pattern becomes the entry's alias.
+
+- **Connect** — opens a new terminal window with `ssh <alias>` as its
+  main process. Per OS:
+  - macOS: `osascript` + Terminal.app, with the command prefixed by
+    `exec` so the shell that `do script` spawns immediately replaces
+    itself with `ssh`. You'll briefly see the shell prompt — that
+    flicker is unavoidable with `do script` — but no shell process
+    lingers behind the ssh session.
+  - Linux: `x-terminal-emulator -e ssh <alias>` — terminal exec's
+    directly into ssh, no shell wrapper.
+  - Windows: `cmd /K ssh <alias>`.
+
+  All real configuration (HostName, User, Port, ProxyJump, etc.) is
+  resolved by `ssh` itself from `~/.ssh/config`, so options the modal
+  doesn't display still take effect.
+
+If `~/.ssh/config` is missing or contains no specific Host entries,
+the modal shows an explanatory message instead of an empty list.
+
+### Open Claude Code in this folder
+
+Picking **Open Claude Code in this folder** spawns a new terminal in
+the active pane's directory and runs `claude`. There's no modal — the
+action fires and the palette closes. Per OS:
+
+- **macOS** — `osascript` honors the `terminal_app` setting (defaults
+  to iTerm if installed, else Terminal). Terminal.app types
+  `cd '<path>' && exec claude` into the shell; iTerm wraps that in
+  `sh -c "..."` so `&&` is interpreted, since iTerm runs the
+  `command` value as the session's argv rather than through a shell.
+- **Linux** — `x-terminal-emulator -e claude`, spawned with `cwd`
+  set to the pane's path, so the terminal (and `claude` inside it)
+  inherits the working directory. No shell wrapper.
+- **Windows** — `cmd /K claude`, spawned with `cwd` set similarly.
+
+Requires the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview)
+to be installed and on `PATH`. If `claude` isn't found you'll see the
+usual "command not found" inside the new terminal window.

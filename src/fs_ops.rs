@@ -10,8 +10,8 @@ use std::time::Duration;
 use iced::{Subscription, Task};
 
 use crate::domain::{
-    parse_docker_ps, parse_git_branches, parse_ps_output, Application, DockerContainer, Entry,
-    GitBranch, GitInfo, Process, Side,
+    parse_docker_ps, parse_git_branches, parse_ps_output, parse_ssh_config, Application,
+    DockerContainer, Entry, GitBranch, GitInfo, Process, Side, SshServer,
 };
 use crate::Message;
 
@@ -444,57 +444,131 @@ fn run_docker_kill(id: &str) -> Result<(), String> {
 
 /// Open a new terminal window running `docker exec -it <id> /bin/sh`.
 /// `/bin/sh` is used because it's universally available (Alpine images
-/// typically lack bash). Returns once the terminal is *spawned* — we don't
-/// follow its lifetime.
-pub fn docker_shell(id: &str) -> Result<(), String> {
+/// typically lack bash).
+pub fn docker_shell(id: &str, terminal_app: Option<&str>) -> Result<(), String> {
+    spawn_terminal_with_command(
+        "docker",
+        &["exec", "-it", id, "/bin/sh"],
+        terminal_app,
+    )
+}
+
+/// Spawn a new terminal window that runs `prog <args>`. Shared by
+/// `docker_shell` and `ssh_connect`. Returns once the terminal is *spawned*
+/// — we don't follow its lifetime.
+///
+/// Per OS:
+/// - macOS: `osascript`; the AppleScript dialect depends on the resolved
+///   terminal app (see [`resolve_macos_terminal_app`]). iTerm gets the
+///   modern `create window with default profile command "..."` form so
+///   the command becomes the session's main process. Terminal.app falls
+///   back to `do script "exec ..."`. Both arg-quote through
+///   [`shell_quote`].
+/// - Linux: `x-terminal-emulator -e prog arg1 arg2 …`. The terminal_app
+///   setting is ignored for v1 (Linux terminals' flags aren't uniform).
+/// - Windows: `cmd /C start cmd /K "prog arg1 arg2 …"`. Setting ignored.
+fn spawn_terminal_with_command(
+    prog: &str,
+    args: &[&str],
+    terminal_app: Option<&str>,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        // AppleScript injects the command into a freshly-opened Terminal.app
-        // window. The `do script` form leaves the terminal sitting in the
-        // shell so the user can run extra commands after the exec ends.
-        let script = format!(
-            "tell application \"Terminal\" to do script \"docker exec -it {} /bin/sh\"",
-            shell_quote(id)
-        );
+        let mut cmd = shell_quote(prog);
+        for a in args {
+            cmd.push(' ');
+            cmd.push_str(&shell_quote(a));
+        }
+        let app = resolve_macos_terminal_app(terminal_app);
+        let script = macos_terminal_apple_script(&app, &cmd);
         std::process::Command::new("osascript")
             .args(["-e", &script])
             .spawn()
             .map(|_| ())
-            .map_err(|e| format!("failed to launch Terminal.app: {}", e))
+            .map_err(|e| format!("failed to launch {}: {}", app, e))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     {
-        // Debian-ish standard alternative; on Wayland/GNOME it usually points
-        // at gnome-terminal. Other distros may need to install the
-        // x-terminal-emulator alternative or symlink something themselves.
-        std::process::Command::new("x-terminal-emulator")
-            .args(["-e", "docker", "exec", "-it", id, "/bin/sh"])
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to launch x-terminal-emulator: {}", e))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "cmd", "/K"])
-            .arg(format!("docker exec -it {} /bin/sh", id))
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to launch cmd: {}", e))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = id;
-        Err("opening a shell isn't supported on this platform".to_string())
+        let _ = terminal_app;
+        #[cfg(target_os = "linux")]
+        {
+            let mut full: Vec<&str> = vec!["-e", prog];
+            full.extend_from_slice(args);
+            std::process::Command::new("x-terminal-emulator")
+                .args(&full)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("failed to launch x-terminal-emulator: {}", e))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let mut joined = prog.to_string();
+            for a in args {
+                joined.push(' ');
+                joined.push_str(a);
+            }
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "cmd", "/K"])
+                .arg(joined)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("failed to launch cmd: {}", e))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = (prog, args);
+            Err("opening a terminal isn't supported on this platform".to_string())
+        }
     }
 }
 
 /// Minimal escaping for embedding into AppleScript `do script "..."`.
-/// Container IDs / names are `[A-Za-z0-9_.-]+` per Docker, but defense in
-/// depth doesn't cost us anything.
+/// Container IDs / SSH aliases are usually safe `[A-Za-z0-9_.-]+`, but
+/// defense in depth doesn't cost us anything.
 #[cfg(target_os = "macos")]
 fn shell_quote(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Resolve which macOS terminal app to use. User-supplied setting wins;
+/// otherwise prefer iTerm if installed, falling back to Terminal.app.
+#[cfg(target_os = "macos")]
+fn resolve_macos_terminal_app(setting: Option<&str>) -> String {
+    if let Some(s) = setting {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if std::path::Path::new("/Applications/iTerm.app").exists() {
+        "iTerm".to_string()
+    } else {
+        "Terminal".to_string()
+    }
+}
+
+/// Build the AppleScript that launches `cmd` in the named terminal app.
+/// `cmd` is the already-shell-quoted command string (e.g. `"ssh foo"`).
+///
+/// - **iTerm / iTerm2**: uses `create window with default profile command
+///   "..."` (iTerm 3.x+). The command becomes the session's main process
+///   — no shell wrapper, no shell prompt visible before it starts.
+/// - **Anything else** (including `Terminal`): falls back to `do script
+///   "exec ..."`. `do script` always wraps in a shell, but `exec`
+///   immediately replaces it with the command so the shell flicker is
+///   minimized.
+fn macos_terminal_apple_script(app: &str, cmd: &str) -> String {
+    let lowered = app.to_ascii_lowercase();
+    if lowered == "iterm" || lowered == "iterm2" {
+        format!(
+            "tell application \"{app}\"\n    \
+                 activate\n    \
+                 create window with default profile command \"{cmd}\"\n\
+             end tell"
+        )
+    } else {
+        format!("tell application \"{app}\" to do script \"exec {cmd}\"")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +807,128 @@ fn run_git_checkout(repo_path: &Path, branch: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// SSH servers
+// ---------------------------------------------------------------------------
+
+/// Read `~/.ssh/config` and parse it via [`parse_ssh_config`]. Returns the
+/// list sorted by alias. Errors (missing file, unreadable) surface as
+/// `Err(message)` so the modal shows a friendly explanation instead of an
+/// empty list.
+pub fn ssh_servers_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(read_ssh_config)
+                .await
+                .unwrap_or_else(|e| Err(format!("ssh servers task panicked: {}", e)))
+        },
+        Message::SshServersLoaded,
+    )
+}
+
+fn read_ssh_config() -> Result<Vec<SshServer>, String> {
+    let path = crate::config::home_dir().join(".ssh").join("config");
+    let contents = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("No {} found.", path.display()),
+        _ => format!("Failed to read {}: {}", path.display(), e),
+    })?;
+    let mut servers = parse_ssh_config(&contents);
+    if servers.is_empty() {
+        return Err(format!(
+            "{} has no Host entries (or only wildcard defaults).",
+            path.display()
+        ));
+    }
+    crate::domain::sort_servers(&mut servers);
+    Ok(servers)
+}
+
+/// Open a new terminal window running `ssh <alias>`. The alias is the
+/// `Host` line from `~/.ssh/config`, so ssh itself resolves the actual
+/// HostName / User / Port / etc. `terminal_app` is honored on macOS — see
+/// [`spawn_terminal_with_command`] / [`macos_terminal_apple_script`].
+pub fn ssh_connect(alias: &str, terminal_app: Option<&str>) -> Result<(), String> {
+    spawn_terminal_with_command("ssh", &[alias], terminal_app)
+}
+
+// ---------------------------------------------------------------------------
+// Open Claude Code
+// ---------------------------------------------------------------------------
+
+/// Open a new terminal window with `claude` running in `path`. Doesn't go
+/// through [`spawn_terminal_with_command`] because that helper has no cwd
+/// support and assumes whitespace-free args — both of which are awkward
+/// when you need `cd '<path with spaces>' && exec claude`.
+pub fn open_claude_code(path: &Path, terminal_app: Option<&str>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = resolve_macos_terminal_app(terminal_app);
+        let script = macos_claude_apple_script(&app, &path.display().to_string());
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch {}: {}", app, e))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Spawning x-terminal-emulator with current_dir set means the
+        // terminal — and the `claude` it exec's into — inherits that cwd.
+        // No shell wrapper needed.
+        let _ = terminal_app;
+        std::process::Command::new("x-terminal-emulator")
+            .current_dir(path)
+            .args(["-e", "claude"])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch x-terminal-emulator: {}", e))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = terminal_app;
+        std::process::Command::new("cmd")
+            .current_dir(path)
+            .args(["/C", "start", "cmd", "/K", "claude"])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch cmd: {}", e))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (path, terminal_app);
+        Err("opening a terminal isn't supported on this platform".to_string())
+    }
+}
+
+/// Build the AppleScript that opens `app` with a session that has cd'd into
+/// `path` and then exec'd `claude`. Same dispatch as
+/// [`macos_terminal_apple_script`] (iTerm gets `create window … command`;
+/// everything else falls back to Terminal-style `do script`).
+///
+/// `path` is single-quoted for the inner shell command so spaces / `$` / etc.
+/// are safe. Single quotes in the path itself are escaped via the standard
+/// `'\''` close-escape-reopen idiom. The whole shell command is then
+/// AppleScript-escaped for the surrounding `"..."`.
+fn macos_claude_apple_script(app: &str, path: &str) -> String {
+    let single_quoted_path = path.replace('\'', "'\\''");
+    let shell_cmd = format!("cd '{}' && exec claude", single_quoted_path);
+    let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+    let lowered = app.to_ascii_lowercase();
+    if lowered == "iterm" || lowered == "iterm2" {
+        // iTerm runs `command` as the session's argv (no shell wrapper), so
+        // && / ' / etc. aren't interpreted. Wrap with `sh -c "<inner>"`.
+        format!(
+            "tell application \"{app}\"\n    \
+                 activate\n    \
+                 create window with default profile command \"sh -c \\\"{escaped}\\\"\"\n\
+             end tell"
+        )
+    } else {
+        // Terminal `do script` types into the user's shell, so && works as-is.
+        format!("tell application \"{app}\" to do script \"{escaped}\"")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,5 +1014,75 @@ mod tests {
         // AppleScript string stays well-formed.
         assert_eq!(shell_quote(r#"a"b"#), r#"a\"b"#);
         assert_eq!(shell_quote(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn macos_terminal_script_iterm_uses_create_window_with_command() {
+        let script = macos_terminal_apple_script("iTerm", "ssh alpha");
+        // iTerm path: command becomes the session's main process (no shell wrapper).
+        assert!(script.contains("tell application \"iTerm\""));
+        assert!(script.contains("create window with default profile command \"ssh alpha\""));
+        assert!(!script.contains("do script"));
+    }
+
+    #[test]
+    fn macos_terminal_script_iterm2_alias_works_too() {
+        // "iTerm2" should map to the iTerm dialect — same dispatch.
+        let script = macos_terminal_apple_script("iTerm2", "ssh alpha");
+        assert!(script.contains("create window with default profile command"));
+    }
+
+    #[test]
+    fn macos_terminal_script_terminal_uses_do_script_with_exec() {
+        let script = macos_terminal_apple_script("Terminal", "ssh alpha");
+        // Terminal path: do script wraps in shell, exec replaces it ASAP.
+        assert_eq!(
+            script,
+            "tell application \"Terminal\" to do script \"exec ssh alpha\""
+        );
+    }
+
+    #[test]
+    fn macos_terminal_script_unknown_app_falls_back_to_do_script() {
+        // Best-effort for unknown app names: same do-script form, just with
+        // their tell-application target.
+        let script = macos_terminal_apple_script("Kitty", "ssh alpha");
+        assert!(script.contains("tell application \"Kitty\""));
+        assert!(script.contains("do script \"exec ssh alpha\""));
+    }
+
+    #[test]
+    fn macos_claude_script_terminal_uses_do_script_with_cd_and_exec() {
+        let script = macos_claude_apple_script("Terminal", "/Users/me/project");
+        assert_eq!(
+            script,
+            "tell application \"Terminal\" to do script \"cd '/Users/me/project' && exec claude\""
+        );
+    }
+
+    #[test]
+    fn macos_claude_script_iterm_wraps_in_sh_dash_c() {
+        let script = macos_claude_apple_script("iTerm", "/Users/me/project");
+        // iTerm's `command` doesn't run through a shell, so && + single
+        // quotes need a `sh -c "..."` wrapper for correct interpretation.
+        assert!(script.contains("create window with default profile command"));
+        assert!(script.contains("sh -c \\\"cd '/Users/me/project' && exec claude\\\""));
+    }
+
+    #[test]
+    fn macos_claude_script_quotes_path_with_spaces() {
+        let script = macos_claude_apple_script("Terminal", "/Users/me/My Projects/rho");
+        // The path is single-quoted in the shell command so spaces stay
+        // inside a single shell-argument.
+        assert!(script.contains("cd '/Users/me/My Projects/rho' && exec claude"));
+    }
+
+    #[test]
+    fn macos_claude_script_escapes_single_quote_in_path() {
+        // Path containing a literal ' uses the close-escape-reopen idiom.
+        let script = macos_claude_apple_script("Terminal", "/Users/me/it's/here");
+        // Shell-level: cd 'it'\''s'  — at AppleScript layer the backslash is
+        // doubled because shell_quote escapes \ for AppleScript embedding.
+        assert!(script.contains("'/Users/me/it'\\\\''s/here'"));
     }
 }

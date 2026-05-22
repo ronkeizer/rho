@@ -31,6 +31,12 @@ pub struct Config {
     /// Folders to watch for new files. Each accepts a `~/` prefix. Non-recursive.
     /// Read once at startup — editing this requires restarting the app.
     pub watch_folders: Vec<String>,
+    /// Which terminal app to use for "Connect to SSH server" and the Docker
+    /// `Shell` action. Currently honored on macOS; the value is the literal
+    /// `tell application "<name>"` target. `None` resolves at launch time
+    /// to `"iTerm"` when `/Applications/iTerm.app` exists, otherwise
+    /// `"Terminal"`. On Linux / Windows this field is currently ignored.
+    pub terminal_app: Option<String>,
 }
 
 impl Default for Config {
@@ -49,6 +55,7 @@ impl Default for Config {
             mark_color: None,
             folder_color: Some("#6db4ff".to_string()),
             watch_folders: vec!["~/Downloads".to_string()],
+            terminal_app: None,
         }
     }
 }
@@ -205,7 +212,10 @@ fn default_template_yaml() -> &'static str {
      # Folders to watch for new files. App pops up a prompt offering to switch\n\
      # a pane to that folder. Non-recursive. Restart to apply changes.\n\
      watch_folders:\n\
-     \x20\x20- \"~/Downloads\"\n"
+     \x20\x20- \"~/Downloads\"\n\
+     # macOS only. Which terminal app the SSH / Docker shell actions use.\n\
+     # Defaults to \"iTerm\" if /Applications/iTerm.app exists, else \"Terminal\".\n\
+     # terminal_app: \"iTerm\"\n"
 }
 
 #[derive(Debug, Clone, Copy)]

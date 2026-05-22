@@ -114,6 +114,18 @@ subprocess calls: `branch --show-current`, `status --porcelain`, and
 fetched on every navigate and refreshed after copy/delete (because
 `reload_both_panes` routes through `navigate()`).
 
+## Claude marker
+
+An orange info bar appears under the file list whenever the pane's
+directory contains a `CLAUDE.md` file or a `.claude/` subdirectory —
+the "you're in a Claude-aware project" signal. The detection is two
+cheap `is_file` / `is_dir` stats; results are cached on `Pane` as
+`has_claude_md` / `has_claude_dir` (plus a `has_claude_marker()`
+convenience). The App layer calls `refresh_claude_marker(&mut pane)`
+from `App::new`, `App::navigate`, and `App::reload_both_panes`, so the
+cache is rebuilt on the same lifecycle as `git_info` — external file
+additions while a pane is showing won't update it.
+
 ## Docker integration
 
 The "Docker containers" palette action opens a modal driven by a
