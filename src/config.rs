@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use iced::{Color, Size};
 use serde::Deserialize;
 
-use crate::domain::Side;
+use crate::domain::{Location, Side};
 
 pub const SETTINGS_FILENAME: &str = ".rho.yaml";
 pub const STATE_FILENAME: &str = ".rho-state.yaml";
@@ -101,13 +101,17 @@ pub fn settings_path() -> PathBuf {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SavedState {
-    pub left: PathBuf,
-    pub right: PathBuf,
+    /// Where the left pane was pointing. Serialized as a string —
+    /// pure paths round-trip unchanged (`left: /Users/ron`); remote
+    /// locations get the `<backend>:<path>` form once Phase 2 lands.
+    pub left: Location,
+    pub right: Location,
     #[serde(default = "default_active_side")]
     pub active: Side,
     /// Recently-navigated directories, most-recent first. Used by the
     /// "Go to folder" modal as filterable suggestions. Maintained via
-    /// [`crate::domain::add_recent`].
+    /// [`crate::domain::add_recent`]. Stays `PathBuf`-shaped in Phase 1
+    /// — broadening to `Location` is a Phase 2 concern.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
 }
@@ -499,8 +503,8 @@ mod tests {
     #[test]
     fn saved_state_roundtrips_through_yaml() {
         let state = SavedState {
-            left: PathBuf::from("/tmp/left"),
-            right: PathBuf::from("/tmp/right"),
+            left: Location::Local(PathBuf::from("/tmp/left")),
+            right: Location::Local(PathBuf::from("/tmp/right")),
             active: Side::Right,
             recent: vec![PathBuf::from("/etc"), PathBuf::from("/usr/local")],
         };
@@ -519,8 +523,8 @@ mod tests {
         // empty list rather than failing.
         let yaml = "left: /a\nright: /b\n";
         let parsed: SavedState = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(parsed.left, PathBuf::from("/a"));
-        assert_eq!(parsed.right, PathBuf::from("/b"));
+        assert_eq!(parsed.left, Location::Local(PathBuf::from("/a")));
+        assert_eq!(parsed.right, Location::Local(PathBuf::from("/b")));
         assert_eq!(parsed.active, Side::Left);
         assert!(parsed.recent.is_empty());
     }
@@ -528,13 +532,42 @@ mod tests {
     #[test]
     fn saved_state_yaml_uses_lowercase_side() {
         let state = SavedState {
-            left: PathBuf::from("/x"),
-            right: PathBuf::from("/y"),
+            left: Location::Local(PathBuf::from("/x")),
+            right: Location::Local(PathBuf::from("/y")),
             active: Side::Right,
             recent: Vec::new(),
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         // serde(rename_all = "lowercase") should produce "right" not "Right".
         assert!(yaml.contains("active: right"));
+    }
+
+    #[test]
+    fn saved_state_reads_pre_phase1_yaml_unchanged() {
+        // State files written by older versions of rho stored `left`/`right`
+        // as plain path strings. Those round-trip through `Location::Local`
+        // identically (the serialization format is the same for local
+        // paths), so existing state files keep loading after the type
+        // change without migration.
+        let yaml = "left: /Users/ron\nright: /tmp\nactive: left\nrecent: []\n";
+        let parsed: SavedState = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.left, Location::Local(PathBuf::from("/Users/ron")));
+        assert_eq!(parsed.right, Location::Local(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn saved_state_round_trips_remote_location() {
+        let state = SavedState {
+            left: Location::Local(PathBuf::from("/tmp")),
+            right: Location::Remote {
+                backend: crate::domain::BackendId::new("alice.dev"),
+                path: PathBuf::from("/var/log"),
+            },
+            active: Side::Left,
+            recent: Vec::new(),
+        };
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        let parsed: SavedState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.right, state.right);
     }
 }

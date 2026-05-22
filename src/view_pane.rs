@@ -28,7 +28,7 @@ pub fn view_pane<'a>(
     colors: RowColors,
     window_height: f32,
 ) -> Element<'a, Message> {
-    let path_header = text(pane.path.display().to_string())
+    let path_header = text(pane.location.to_string())
         .font(Font::MONOSPACE)
         .size(config.row_font_size)
         .style(move |theme: &Theme| iced::widget::text::Style {

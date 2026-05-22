@@ -4,8 +4,151 @@
 //! so the logic can be unit-tested without an iced runtime.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::convert::Infallible;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::SystemTime;
+
+/// Stable identifier for a registered backend instance — e.g.
+/// `"alice.dev"` for an SSH host alias, or `"work"` for a Dropbox
+/// account. Used in [`Location::Remote`] to dispatch operations to the
+/// right backend at runtime.
+///
+/// Phase 1 (this PR) only ever materializes `Location::Local` — the
+/// Remote variant exists so the type system, parser, and persisted
+/// state format are ready for Phase 2's SSH backend without further
+/// churn at call sites.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BackendId(String);
+
+impl BackendId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BackendId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Where a pane's listing lives. `Local` is a path on the local
+/// filesystem; `Remote` is a path on a registered backend (SSH host,
+/// Dropbox account, …) identified by its [`BackendId`].
+///
+/// Serialized to / from a single string in `~/.rho-state.yaml`:
+/// - `Local(PathBuf)` ↔ the path as-is (`"/Users/ron"`, `"C:\\foo"`).
+/// - `Remote { backend, path }` ↔ `"<backend>:<path>"` where `<path>`
+///   starts with `/` or `~` so it can't be confused with a local
+///   filename containing a colon (`file:notes.txt` stays Local).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    Local(PathBuf),
+    Remote { backend: BackendId, path: PathBuf },
+}
+
+impl Location {
+    // `local` / `remote` / `is_local` are part of the Phase 1 surface so
+    // Phase 2 can adopt them without revisiting the type; `is_local` in
+    // particular will be the gate for "this op only works on local
+    // panes" once the SSH backend exists.
+    #[allow(dead_code)]
+    pub fn local(path: impl Into<PathBuf>) -> Self {
+        Self::Local(path.into())
+    }
+
+    #[allow(dead_code)]
+    pub fn remote(backend: BackendId, path: impl Into<PathBuf>) -> Self {
+        Self::Remote {
+            backend,
+            path: path.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
+    /// Inner path, regardless of variant. Safe to use for display,
+    /// `join`, `parent`, and other purely-syntactic path operations.
+    /// I/O *must* dispatch on the variant — see `is_local()`.
+    pub fn path(&self) -> &Path {
+        match self {
+            Location::Local(p) => p,
+            Location::Remote { path, .. } => path,
+        }
+    }
+}
+
+impl FromStr for Location {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // No colon → unambiguous local path.
+        let colon = match s.find(':') {
+            Some(i) => i,
+            None => return Ok(Location::Local(PathBuf::from(s))),
+        };
+        let prefix = &s[..colon];
+        let rest = &s[colon + 1..];
+
+        // Windows drive letter (`C:\foo` or `C:/foo`) — single ASCII
+        // alpha followed by `:` and a path separator.
+        if prefix.len() == 1
+            && prefix.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && rest.starts_with(['\\', '/'])
+        {
+            return Ok(Location::Local(PathBuf::from(s)));
+        }
+
+        // <backend-id>:<remote-path>. The remote path must start with
+        // `/` or `~` — without that anchor we treat the colon as part
+        // of a local filename (e.g. `file:notes.txt`).
+        let is_backend_id = !prefix.is_empty()
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if is_backend_id && (rest.starts_with('/') || rest.starts_with('~')) {
+            return Ok(Location::Remote {
+                backend: BackendId::new(prefix),
+                path: PathBuf::from(rest),
+            });
+        }
+
+        Ok(Location::Local(PathBuf::from(s)))
+    }
+}
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Location::Local(p) => write!(f, "{}", p.display()),
+            Location::Remote { backend, path } => {
+                write!(f, "{}:{}", backend.as_str(), path.display())
+            }
+        }
+    }
+}
+
+impl serde::Serialize for Location {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Location {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(Location::from_str(&s).expect("Location::from_str is infallible"))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -832,7 +975,10 @@ pub struct GitInfo {
 
 #[derive(Debug)]
 pub struct Pane {
-    pub path: PathBuf,
+    /// Where this pane's listing lives — local path or remote backend.
+    /// Phase 1 always constructs `Location::Local`; the Remote arm is
+    /// reserved for Phase 2 (SSH backend) and beyond.
+    pub location: Location,
     pub entries: Vec<Entry>,
     /// Indices into `entries` that pass the current filter, in display order.
     /// Row 0 is the ".." entry; rows 1..=visible_indices.len() map to
@@ -866,9 +1012,9 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn empty(path: PathBuf) -> Self {
+    pub fn empty(location: Location) -> Self {
         Self {
-            path,
+            location,
             entries: Vec::new(),
             visible_indices: Vec::new(),
             filter: String::new(),
@@ -885,6 +1031,15 @@ impl Pane {
             has_claude_dir: false,
             pending_focus: None,
         }
+    }
+
+    /// Inner path of this pane's location. Safe for purely-syntactic
+    /// path operations (display, `join`, `parent`); I/O code must
+    /// dispatch on [`Location`] via `self.location.is_local()` /
+    /// `matches!(self.location, …)` because the path alone doesn't
+    /// carry the backend.
+    pub fn path(&self) -> &Path {
+        self.location.path()
     }
 
     /// True iff this pane's directory has a `CLAUDE.md` file *or* a
@@ -908,10 +1063,10 @@ impl Pane {
         format!("claude: {}", parts.join(", "))
     }
 
-    /// Reset the pane to "about to load `path`". Returns the new generation
-    /// that the matching load_dir_task should tag chunks with.
-    pub fn navigate(&mut self, path: PathBuf) -> u64 {
-        self.path = path;
+    /// Reset the pane to "about to load `location`". Returns the new
+    /// generation that the matching load_dir_task should tag chunks with.
+    pub fn navigate(&mut self, location: Location) -> u64 {
+        self.location = location;
         self.entries.clear();
         self.visible_indices.clear();
         self.filter.clear();
@@ -1047,7 +1202,7 @@ impl Pane {
         let (lo, hi) = self.mark_range();
         (lo..=hi)
             .filter_map(|i| self.entry_at(i))
-            .map(|e| self.path.join(&e.name))
+            .map(|e| self.path().join(&e.name))
             .collect()
     }
 
@@ -1154,6 +1309,139 @@ mod tests {
     fn delete_focus_toggle() {
         assert_eq!(DeleteFocus::Cancel.toggle(), DeleteFocus::Confirm);
         assert_eq!(DeleteFocus::Confirm.toggle(), DeleteFocus::Cancel);
+    }
+
+    #[test]
+    fn location_parses_plain_absolute_path_as_local() {
+        let loc: Location = "/Users/ron/code".parse().unwrap();
+        assert_eq!(loc, Location::Local(PathBuf::from("/Users/ron/code")));
+    }
+
+    #[test]
+    fn location_parses_relative_path_as_local() {
+        let loc: Location = "src/main.rs".parse().unwrap();
+        assert_eq!(loc, Location::Local(PathBuf::from("src/main.rs")));
+    }
+
+    #[test]
+    fn location_parses_tilde_path_as_local() {
+        let loc: Location = "~/Downloads".parse().unwrap();
+        assert_eq!(loc, Location::Local(PathBuf::from("~/Downloads")));
+    }
+
+    #[test]
+    fn location_parses_windows_drive_path_as_local() {
+        // Without this branch, "C:" would look like a backend ID.
+        let loc: Location = r"C:\Users\ron".parse().unwrap();
+        assert_eq!(loc, Location::Local(PathBuf::from(r"C:\Users\ron")));
+        let loc: Location = "D:/projects".parse().unwrap();
+        assert_eq!(loc, Location::Local(PathBuf::from("D:/projects")));
+    }
+
+    #[test]
+    fn location_parses_local_filename_with_colon_as_local() {
+        // The rest of the string doesn't start with `/` or `~`, so the
+        // colon is part of a local filename, not a backend separator.
+        let loc: Location = "file:notes.txt".parse().unwrap();
+        assert_eq!(loc, Location::Local(PathBuf::from("file:notes.txt")));
+    }
+
+    #[test]
+    fn location_parses_ssh_alias_form_as_remote() {
+        let loc: Location = "alice.dev:/var/log".parse().unwrap();
+        assert_eq!(
+            loc,
+            Location::Remote {
+                backend: BackendId::new("alice.dev"),
+                path: PathBuf::from("/var/log"),
+            }
+        );
+    }
+
+    #[test]
+    fn location_parses_remote_with_tilde_path() {
+        let loc: Location = "host:~/dotfiles".parse().unwrap();
+        assert_eq!(
+            loc,
+            Location::Remote {
+                backend: BackendId::new("host"),
+                path: PathBuf::from("~/dotfiles"),
+            }
+        );
+    }
+
+    #[test]
+    fn location_parses_backend_id_with_punctuation() {
+        let loc: Location = "my-host_1.example:/x".parse().unwrap();
+        assert_eq!(
+            loc,
+            Location::Remote {
+                backend: BackendId::new("my-host_1.example"),
+                path: PathBuf::from("/x"),
+            }
+        );
+    }
+
+    #[test]
+    fn location_display_round_trips_local() {
+        let original = Location::Local(PathBuf::from("/etc/hosts"));
+        let s = original.to_string();
+        let parsed: Location = s.parse().unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn location_display_round_trips_remote() {
+        let original = Location::Remote {
+            backend: BackendId::new("work"),
+            path: PathBuf::from("/Apps/notes"),
+        };
+        let s = original.to_string();
+        assert_eq!(s, "work:/Apps/notes");
+        let parsed: Location = s.parse().unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn location_is_local() {
+        assert!(Location::Local(PathBuf::from("/tmp")).is_local());
+        assert!(!Location::Remote {
+            backend: BackendId::new("x"),
+            path: PathBuf::from("/tmp"),
+        }
+        .is_local());
+    }
+
+    #[test]
+    fn location_path_returns_inner_path_for_both_variants() {
+        assert_eq!(
+            Location::Local(PathBuf::from("/tmp")).path(),
+            Path::new("/tmp"),
+        );
+        assert_eq!(
+            Location::Remote {
+                backend: BackendId::new("x"),
+                path: PathBuf::from("/var/log"),
+            }
+            .path(),
+            Path::new("/var/log"),
+        );
+    }
+
+    #[test]
+    fn location_serde_round_trips_via_yaml() {
+        let pairs = [
+            Location::Local(PathBuf::from("/Users/ron")),
+            Location::Remote {
+                backend: BackendId::new("alice.dev"),
+                path: PathBuf::from("/var/log"),
+            },
+        ];
+        for original in &pairs {
+            let yaml = serde_yaml::to_string(original).unwrap();
+            let parsed: Location = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(&parsed, original);
+        }
     }
 
     fn mk_entry(name: &str, is_dir: bool, size: Option<u64>) -> Entry {
@@ -1265,7 +1553,7 @@ mod tests {
     /// Helper to construct a Pane preloaded with entries, bypassing the
     /// streaming load path so tests don't depend on the filesystem.
     fn pane_with_entries(path: &str, entries: Vec<Entry>) -> Pane {
-        let mut pane = Pane::empty(PathBuf::from(path));
+        let mut pane = Pane::empty(Location::Local(PathBuf::from(path)));
         pane.append_chunk(entries);
         // Simulate EntriesDone: sort once, then rebuild visible indices.
         // append_chunk itself no longer sorts (deferred to EntriesDone so
@@ -1279,8 +1567,9 @@ mod tests {
 
     #[test]
     fn pane_empty_starts_loading_with_no_entries() {
-        let p = Pane::empty(PathBuf::from("/tmp"));
-        assert_eq!(p.path, PathBuf::from("/tmp"));
+        let p = Pane::empty(Location::Local(PathBuf::from("/tmp")));
+        assert_eq!(p.path(), Path::new("/tmp"));
+        assert!(p.location.is_local());
         assert!(p.entries.is_empty());
         assert!(p.visible_indices.is_empty());
         assert!(p.filter.is_empty());
@@ -1298,7 +1587,7 @@ mod tests {
 
     #[test]
     fn pane_has_claude_marker_combinations() {
-        let mut p = Pane::empty(PathBuf::from("/tmp"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/tmp")));
         assert!(!p.has_claude_marker());
         p.has_claude_md = true;
         assert!(p.has_claude_marker());
@@ -1311,7 +1600,7 @@ mod tests {
 
     #[test]
     fn pane_claude_marker_label_lists_what_is_present() {
-        let mut p = Pane::empty(PathBuf::from("/tmp"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/tmp")));
         p.has_claude_md = true;
         assert_eq!(p.claude_marker_label(), "claude: CLAUDE.md");
         p.has_claude_dir = true;
@@ -1322,10 +1611,10 @@ mod tests {
 
     #[test]
     fn pane_navigate_clears_claude_markers() {
-        let mut p = Pane::empty(PathBuf::from("/old"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/old")));
         p.has_claude_md = true;
         p.has_claude_dir = true;
-        p.navigate(PathBuf::from("/new"));
+        p.navigate(Location::Local(PathBuf::from("/new")));
         assert!(!p.has_claude_md);
         assert!(!p.has_claude_dir);
     }
@@ -1348,11 +1637,11 @@ mod tests {
         });
         let gen_before = p.load_generation;
 
-        let gen_after = p.navigate(PathBuf::from("/new"));
+        let gen_after = p.navigate(Location::Local(PathBuf::from("/new")));
 
         assert_eq!(gen_after, gen_before + 1);
         assert_eq!(p.load_generation, gen_after);
-        assert_eq!(p.path, PathBuf::from("/new"));
+        assert_eq!(p.path(), Path::new("/new"));
         assert!(p.entries.is_empty());
         assert!(p.visible_indices.is_empty());
         assert!(p.filter.is_empty());
@@ -1364,11 +1653,11 @@ mod tests {
 
     #[test]
     fn navigate_generation_strictly_increases() {
-        let mut p = Pane::empty(PathBuf::from("/"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/")));
         let g0 = p.load_generation;
-        let g1 = p.navigate(PathBuf::from("/a"));
-        let g2 = p.navigate(PathBuf::from("/b"));
-        let g3 = p.navigate(PathBuf::from("/c"));
+        let g1 = p.navigate(Location::Local(PathBuf::from("/a")));
+        let g2 = p.navigate(Location::Local(PathBuf::from("/b")));
+        let g3 = p.navigate(Location::Local(PathBuf::from("/c")));
         assert!(g1 > g0);
         assert!(g2 > g1);
         assert!(g3 > g2);
@@ -1626,7 +1915,7 @@ mod tests {
 
     #[test]
     fn append_chunk_accumulates_across_calls() {
-        let mut p = Pane::empty(PathBuf::from("/p"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/p")));
         p.append_chunk(vec![mk_entry("b", false, Some(1))]);
         p.append_chunk(vec![mk_entry("a", false, Some(2))]);
         assert_eq!(p.entries.len(), 2);
@@ -1639,7 +1928,7 @@ mod tests {
 
     #[test]
     fn append_chunk_rebuilds_visible_indices() {
-        let mut p = Pane::empty(PathBuf::from("/p"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/p")));
         p.append_chunk(vec![
             mk_entry("a", false, Some(1)),
             mk_entry("b", false, Some(2)),
@@ -1649,7 +1938,7 @@ mod tests {
 
     #[test]
     fn append_chunk_respects_existing_filter() {
-        let mut p = Pane::empty(PathBuf::from("/p"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/p")));
         p.filter = "alp".to_string();
         p.recompute_visible(None);
         p.append_chunk(vec![
@@ -1663,7 +1952,7 @@ mod tests {
 
     #[test]
     fn append_empty_chunk_is_noop() {
-        let mut p = Pane::empty(PathBuf::from("/p"));
+        let mut p = Pane::empty(Location::Local(PathBuf::from("/p")));
         p.append_chunk(vec![mk_entry("a", false, None)]);
         let before_len = p.entries.len();
         p.append_chunk(Vec::new());
