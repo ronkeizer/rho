@@ -75,7 +75,7 @@ Directories always cluster before files regardless of sort column.
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
 | `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Delete / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
-| `⌘,` | Open `~/.fm.yaml` in the OS default editor (creates the file if missing) |
+| `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
 Inside a modal, the navigation keys behave differently:
@@ -108,7 +108,7 @@ Default sort is Name ascending.
   status if the kill failed).
 - **Shell** — opens a new terminal window running `docker exec -it <id>
   /bin/sh`. `/bin/sh` is used rather than `bash` because Alpine-based
-  images often don't ship bash. The terminal lives independently of `fm`
+  images often don't ship bash. The terminal lives independently of Rho
   — closing it doesn't affect the container.
 
 Platform notes for the **Shell** button:

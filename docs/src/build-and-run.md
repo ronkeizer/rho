@@ -1,6 +1,6 @@
 # Build & run
 
-`fm` is a single binary crate. No system services or daemons.
+Rho is a single binary crate. No system services or daemons.
 
 ## Requirements
 
@@ -21,8 +21,8 @@
 ```sh
 cargo run              # launch the app
 cargo check            # fast type-check during edits
-cargo build --release  # optimized binary at target/release/fm
-cargo test             # run the unit tests (94 of them)
+cargo build --release  # optimized binary at target/release/rho
+cargo test             # run the unit tests
 ```
 
 `cargo check` is the right command while iterating — `cargo build` from a
@@ -30,7 +30,7 @@ cold cache takes ~15s because iced pulls in a wide tree of crates.
 
 ## First launch
 
-On first run `fm` creates `~/.fm.yaml` with a starter template (see
+On first run Rho creates `~/.rho.yaml` with a starter template (see
 [Configuration](./configuration.md)) and opens with both panes pointed at
 `$HOME`. Subsequent launches restore the last-used folders from
-`~/.fm-state.yaml` (see [Session state](./session-state.md)).
+`~/.rho-state.yaml` (see [Session state](./session-state.md)).

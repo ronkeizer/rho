@@ -1,10 +1,10 @@
 # Session state
 
-`~/.fm-state.yaml` holds the last-used pane folders so the app reopens
+`~/.rho-state.yaml` holds the last-used pane folders so the app reopens
 where you left it. It is written eagerly on any path change or active-pane
 switch.
 
-This file is separate from [`~/.fm.yaml`](./configuration.md) on purpose:
+This file is separate from [`~/.rho.yaml`](./configuration.md) on purpose:
 settings are user-edited and may be hand-tuned, but session state is
 machine-managed and you generally shouldn't touch it.
 

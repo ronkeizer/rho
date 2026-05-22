@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`fm` is a cross-platform dual-pane file manager (fman/Total Commander style) written in Rust on top of `iced 0.13`. A single binary crate split into four modules:
+Rho is a cross-platform dual-pane file manager (fman/Total Commander style) written in Rust on top of `iced 0.13`. A single binary crate split into four modules:
 
-- `src/config.rs` — `~/.fm.yaml` settings (with hot reload), `~/.fm-state.yaml` session restore, color parsing, editor/Quick Look launchers, `home_dir`/`expand_tilde`.
+- `src/config.rs` — `~/.rho.yaml` settings (with hot reload), `~/.rho-state.yaml` session restore, color parsing, editor/Quick Look launchers, `home_dir`/`expand_tilde`.
 - `src/domain.rs` — pure types with no iced widget code: `Side`, `SortBy`/`SortDir`, `Entry`, `Pane` (selection/filter/sort), `Prompt` + focus enums, `PaletteAction`, `GitInfo`, `sort_entries`. Unit-tested in isolation.
 - `src/fs_ops.rs` — directory streaming (`load_dir_task`), copy/delete (`copy_task`, `delete_task`, `copy_recursive`, `delete_path`), git probe (`git_info_task`, `gather_git_info`), file-watch subscription. Everything that returns `Task<Message>` / `Subscription<Message>` lives here.
 - `src/main.rs` — `App` state, the central `Message` enum, the `update`/`view`/`subscription` glue, and the view helpers (`view_pane`, `view_modal`, `build_row`, `compute_row_style`, layout math, formatters). Sections inside still use `// -----` headers.
@@ -34,9 +34,9 @@ Every behavior change ships with tests **and** docs. Treat these as part of the 
 
 **Docs.** Update `docs/src/` for anything user-visible:
 - New or changed keybinding → `docs/src/keybindings.md`.
-- New or changed `~/.fm.yaml` field → `docs/src/configuration.md` (and the in-tree starter template in `config.rs::default_template_yaml`).
+- New or changed `~/.rho.yaml` field → `docs/src/configuration.md` (and the in-tree starter template in `config.rs::default_template_yaml`).
 - New modal / subsystem → architecture note in `docs/src/architecture.md`, plus a chapter if it warrants one (add to `SUMMARY.md`).
-- New `~/.fm-state.yaml` field → `docs/src/session-state.md`.
+- New `~/.rho-state.yaml` field → `docs/src/session-state.md`.
 
 The docs CI catches broken refs on every PR. Refactors that don't change behavior don't need new docs, but if the existing docs become inaccurate as a result, update them in the same PR.
 
@@ -79,12 +79,12 @@ When adding a new modal kind: extend the `Prompt` enum, add the open-message han
 
 `on_key_press` only fires for events with `event::Status::Ignored`. When `text_input` (in the Open/Copy modal) has focus and captures Enter/Backspace/characters, the subscription stays silent — that's why Delete-modal-Enter handling needs the explicit redirect.
 
-### Settings (`~/.fm.yaml`) and state (`~/.fm-state.yaml`)
+### Settings (`~/.rho.yaml`) and state (`~/.rho-state.yaml`)
 
 Two separate YAML files in `$HOME`:
 
-- **`.fm.yaml`** (user-editable settings): colors, font sizes, row geometry, initial window dimensions. Created with a starter template on first run via `ensure_settings_file()`. Cmd+, opens it in the system default editor.
-- **`.fm-state.yaml`** (session restore): `left`, `right`, `active`. Written eagerly on every path/active change. Read in `App::new`, with non-existent paths silently falling back to `$HOME`.
+- **`.rho.yaml`** (user-editable settings): colors, font sizes, row geometry, initial window dimensions. Created with a starter template on first run via `ensure_settings_file()`. Cmd+, opens it in the system default editor.
+- **`.rho-state.yaml`** (session restore): `left`, `right`, `active`. Written eagerly on every path/active change. Read in `App::new`, with non-existent paths silently falling back to `$HOME`.
 
 Settings hot-reload: a 1 Hz `iced::time::every` subscription emits `CheckSettings`, which compares the file's mtime to the last-seen value and calls `Config::load()` if it changed. Hot reload doesn't touch window size (iced sets that once at startup) — only render-time settings (font, colors, row height, column widths).
 

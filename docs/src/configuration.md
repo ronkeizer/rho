@@ -1,6 +1,6 @@
 # Configuration
 
-`fm` reads its visual settings from `~/.fm.yaml`. The file is created with
+Rho reads its visual settings from `~/.rho.yaml`. The file is created with
 a starter template the first time you launch the app, and is re-read live
 on save (a 1 Hz mtime check picks up changes without a restart). If the
 file is missing or fails to parse, defaults are used and a warning is
@@ -70,7 +70,7 @@ app shows a modal asking whether to switch one of the panes to that folder.
 ## Example
 
 ```yaml
-# fm configuration file — edits are picked up live (no restart needed).
+# Rho configuration file — edits are picked up live (no restart needed).
 row_height_px: 19.0
 row_font_size: 13
 header_font_size: 11

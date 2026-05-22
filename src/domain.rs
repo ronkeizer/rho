@@ -286,7 +286,7 @@ pub fn keyboard_shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static st
             vec![
                 ("⌘P", "Go to folder (filterable list of recent locations)"),
                 ("⌘⇧P", "Command palette"),
-                ("⌘,", "Open ~/.fm.yaml in the OS default editor"),
+                ("⌘,", "Open ~/.rho.yaml in the OS default editor"),
                 ("Esc", "Cancel current modal / clear the filter"),
             ],
         ),

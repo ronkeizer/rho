@@ -1,5 +1,5 @@
 [book]
-title = "fm — dual-pane file manager"
+title = "Rho — dual-pane file manager"
 authors = ["Ron Keizer"]
 language = "en"
 src = "src"

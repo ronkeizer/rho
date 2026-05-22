@@ -10,7 +10,7 @@ external-facing summary.
 ```
 src/
   main.rs       # App state, Message enum, update/view/subscription, view helpers
-  config.rs     # ~/.fm.yaml + ~/.fm-state.yaml, colors, editor/Quick Look launchers
+  config.rs     # ~/.rho.yaml + ~/.rho-state.yaml, colors, editor/Quick Look launchers
   domain.rs     # Pane, Entry, sort/filter, Prompt enum — no iced widgets
   fs_ops.rs     # Directory streaming, copy/delete, git probe, file watcher
 ```

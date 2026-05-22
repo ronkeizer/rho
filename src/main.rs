@@ -45,7 +45,7 @@ fn main() -> iced::Result {
     ensure_settings_file();
     let config = Config::load();
     let window_size = config.window_size();
-    iced::application("fm", App::update, App::view)
+    iced::application("Rho", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| Theme::Dark)
         .window_size(window_size)
@@ -157,7 +157,7 @@ struct App {
     /// FIFO when the current modal closes.
     pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
     /// Most-recently-visited directories, front-first. Persisted to
-    /// `~/.fm-state.yaml`. Updated on every successful navigate.
+    /// `~/.rho-state.yaml`. Updated on every successful navigate.
     recent_locations: Vec<PathBuf>,
 }
 

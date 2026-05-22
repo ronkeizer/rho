@@ -1,4 +1,4 @@
-//! User settings (`~/.fm.yaml`), session state (`~/.fm-state.yaml`), color
+//! User settings (`~/.rho.yaml`), session state (`~/.rho-state.yaml`), color
 //! parsing, and the small process-launching helpers (`$EDITOR` / Quick Look)
 //! used by the keybindings.
 
@@ -9,8 +9,8 @@ use serde::Deserialize;
 
 use crate::domain::Side;
 
-pub const SETTINGS_FILENAME: &str = ".fm.yaml";
-pub const STATE_FILENAME: &str = ".fm-state.yaml";
+pub const SETTINGS_FILENAME: &str = ".rho.yaml";
+pub const STATE_FILENAME: &str = ".rho-state.yaml";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -195,7 +195,7 @@ pub fn quick_look(path: &Path) -> std::io::Result<()> {
 }
 
 fn default_template_yaml() -> &'static str {
-    "# fm configuration file — edits are picked up live (no restart needed).\n\
+    "# Rho configuration file — edits are picked up live (no restart needed).\n\
      row_height_px: 19.0\n\
      row_font_size: 13\n\
      header_font_size: 11\n\
