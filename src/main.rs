@@ -85,9 +85,9 @@ pub(crate) enum Message {
     GitInfoLoaded(Side, u64, Option<GitInfo>),
     EditFile,
     QuickLook,
-    CopyFinished(Vec<(PathBuf, Result<(), String>)>),
-    MoveFinished(Vec<(PathBuf, Result<(), String>)>),
-    DeleteFinished(Vec<(PathBuf, Result<(), String>)>),
+    CopyFinished(Vec<(Location, Result<(), String>)>),
+    MoveFinished(Vec<(Location, Result<(), String>)>),
+    DeleteFinished(Vec<(Location, Result<(), String>)>),
     /// `zip` task completed — `Ok(path)` is the new archive's path.
     CompressFinished(Result<PathBuf, String>),
     /// Per-archive extraction results.
@@ -163,9 +163,9 @@ struct App {
     window_size: Size,
     settings_mtime: Option<SystemTime>,
     /// (count, dest) while a copy task is in flight.
-    copy_in_progress: Option<(usize, PathBuf)>,
+    copy_in_progress: Option<(usize, Location)>,
     /// (count, dest) while a move task is in flight.
-    move_in_progress: Option<(usize, PathBuf)>,
+    move_in_progress: Option<(usize, Location)>,
     /// File count while a delete task is in flight.
     delete_in_progress: Option<usize>,
     /// (count, output_zip) while a compress task is in flight.
@@ -565,29 +565,19 @@ impl App {
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenCopyPrompt => {
-                // Phase 2 MVP: no remote ↔ local file transfer yet.
-                if !self.pane(self.active).location.is_local() {
-                    return Task::none();
-                }
                 let other = self.active.other();
-                let dest = self.pane(other).path().display().to_string();
+                let dest = self.pane(other).location.to_string();
                 self.prompt = Some(Prompt::Copy { input: dest });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenMovePrompt => {
-                if !self.pane(self.active).location.is_local() {
-                    return Task::none();
-                }
                 let other = self.active.other();
-                let dest = self.pane(other).path().display().to_string();
+                let dest = self.pane(other).location.to_string();
                 self.prompt = Some(Prompt::Move { input: dest });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
             Message::OpenDeletePrompt => {
-                if !self.pane(self.active).location.is_local() {
-                    return Task::none();
-                }
-                let paths = self.pane(self.active).marked_paths();
+                let paths = self.pane(self.active).marked_locations();
                 if !paths.is_empty() {
                     // Default focus on Cancel: a stray Enter shouldn't delete.
                     self.prompt = Some(Prompt::Delete {
@@ -715,9 +705,9 @@ impl App {
                                 .map(|p| self.navigate(self.active, Location::Local(p)))
                         }
                         Prompt::Copy { input } => {
-                            let dest = PathBuf::from(expand_tilde(input.trim()));
-                            if dest.is_dir() {
-                                let srcs = self.pane(self.active).marked_paths();
+                            let dest = parse_dest_location(&input);
+                            if dest_exists(&dest) {
+                                let srcs = self.pane(self.active).marked_locations();
                                 if !srcs.is_empty() {
                                     self.copy_in_progress = Some((srcs.len(), dest.clone()));
                                     Some(copy_task(srcs, dest))
@@ -729,9 +719,9 @@ impl App {
                             }
                         }
                         Prompt::Move { input } => {
-                            let dest = PathBuf::from(expand_tilde(input.trim()));
-                            if dest.is_dir() {
-                                let srcs = self.pane(self.active).marked_paths();
+                            let dest = parse_dest_location(&input);
+                            if dest_exists(&dest) {
+                                let srcs = self.pane(self.active).marked_locations();
                                 if !srcs.is_empty() {
                                     self.move_in_progress = Some((srcs.len(), dest.clone()));
                                     Some(move_task(srcs, dest))
@@ -1026,7 +1016,7 @@ impl App {
                 self.copy_in_progress = None;
                 for (src, res) in &results {
                     if let Err(e) = res {
-                        eprintln!("copy {} failed: {}", src.display(), e);
+                        eprintln!("copy {} failed: {}", src, e);
                     }
                 }
                 return self.reload_both_panes();
@@ -1035,7 +1025,7 @@ impl App {
                 self.move_in_progress = None;
                 for (src, res) in &results {
                     if let Err(e) = res {
-                        eprintln!("move {} failed: {}", src.display(), e);
+                        eprintln!("move {} failed: {}", src, e);
                     }
                 }
                 return self.reload_both_panes();
@@ -1076,7 +1066,7 @@ impl App {
                 self.delete_in_progress = None;
                 for (src, res) in &results {
                     if let Err(e) = res {
-                        eprintln!("delete {} failed: {}", src.display(), e);
+                        eprintln!("delete {} failed: {}", src, e);
                     }
                 }
                 return self.reload_both_panes();
@@ -1398,28 +1388,19 @@ impl App {
         self.prompt = None;
         match action {
             PaletteAction::Copy => {
-                if !self.both_panes_local() {
-                    return Task::none();
-                }
                 let other = self.active.other();
-                let dest = self.pane(other).path().display().to_string();
+                let dest = self.pane(other).location.to_string();
                 self.prompt = Some(Prompt::Copy { input: dest });
                 text_input::focus(text_input::Id::new(PROMPT_ID))
             }
             PaletteAction::Move => {
-                if !self.both_panes_local() {
-                    return Task::none();
-                }
                 let other = self.active.other();
-                let dest = self.pane(other).path().display().to_string();
+                let dest = self.pane(other).location.to_string();
                 self.prompt = Some(Prompt::Move { input: dest });
                 text_input::focus(text_input::Id::new(PROMPT_ID))
             }
             PaletteAction::Delete => {
-                if !self.pane(self.active).location.is_local() {
-                    return Task::none();
-                }
-                let paths = self.pane(self.active).marked_paths();
+                let paths = self.pane(self.active).marked_locations();
                 if !paths.is_empty() {
                     self.prompt = Some(Prompt::Delete {
                         paths,
@@ -1562,11 +1543,11 @@ impl App {
     fn status_text(&self) -> Option<String> {
         if let Some((count, dest)) = &self.copy_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
-            return Some(format!("Copying {} {} to {}…", count, noun, dest.display()));
+            return Some(format!("Copying {} {} to {}…", count, noun, dest));
         }
         if let Some((count, dest)) = &self.move_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
-            return Some(format!("Moving {} {} to {}…", count, noun, dest.display()));
+            return Some(format!("Moving {} {} to {}…", count, noun, dest));
         }
         if let Some((count, output)) = &self.compress_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
@@ -1776,6 +1757,31 @@ fn refresh_claude_marker(pane: &mut Pane) {
     }
     pane.has_claude_md = pane.path().join("CLAUDE.md").is_file();
     pane.has_claude_dir = pane.path().join(".claude").is_dir();
+}
+
+/// Parse the trimmed text of a Copy/Move prompt input into a
+/// [`Location`]. Wraps `Location::from_str` (which is infallible) with
+/// the tilde-expansion the prompts have always done for local paths.
+fn parse_dest_location(input: &str) -> Location {
+    let trimmed = input.trim();
+    let parsed: Location = trimmed.parse().expect("Location::from_str is infallible");
+    match parsed {
+        // Tilde-expand local paths so `~/Downloads` resolves like it
+        // used to before the Location refactor.
+        Location::Local(p) => Location::Local(PathBuf::from(expand_tilde(&p.to_string_lossy()))),
+        other => other,
+    }
+}
+
+/// Validate that a Copy/Move destination is plausible before kicking
+/// off the task. Local paths must exist as a directory (matches the
+/// pre-Phase-3 behaviour); remote paths are trusted — sftp will
+/// surface a clearer error than we can guess up-front.
+fn dest_exists(loc: &Location) -> bool {
+    match loc {
+        Location::Local(p) => p.is_dir(),
+        Location::Remote { .. } => true,
+    }
 }
 
 /// True if the path's extension is `zip` (case-insensitive). Used to gate

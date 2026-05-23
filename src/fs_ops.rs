@@ -320,73 +320,387 @@ fn is_ignored_watch_filename(name: &str) -> bool {
     matches!(ext.as_str(), "crdownload" | "part" | "download" | "tmp")
 }
 
-pub fn copy_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
+/// Copy a batch of sources into `dst`. By construction the caller pulls
+/// `srcs` from the active pane's `marked_locations`, so every source
+/// shares the same backend (all `Local`, or all `Remote` with the same
+/// `BackendId`). The dispatch matches on `(srcs[0].is_local, dst)`:
+///
+/// - `Local → Local` → in-process `copy_recursive`.
+/// - `Local → Remote` → one `sftp put -r` per source.
+/// - `Remote → Local` → one `sftp get -r` per source.
+/// - `Remote → Remote` same host → `ssh <alias> cp -r` per source.
+/// - `Remote → Remote` cross-host → stage through local `/tmp` via
+///   `get` then `put` (slow, but rare).
+///
+/// Per-source results come back as `(source, Result<(), String>)` so
+/// the receiver can log partial failures.
+pub fn copy_task(srcs: Vec<Location>, dst: Location) -> Task<Message> {
     Task::perform(
         async move {
-            tokio::task::spawn_blocking(move || {
-                srcs.into_iter()
-                    .map(|src| {
-                        let name = match src.file_name() {
-                            Some(n) => n.to_owned(),
-                            None => {
-                                return (src.clone(), Err("source has no file name".to_string()))
-                            }
-                        };
-                        let target = dest_dir.join(name);
-                        let res = copy_recursive(&src, &target).map_err(|e| e.to_string());
-                        (src, res)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default()
+            tokio::task::spawn_blocking(move || run_copy(srcs, dst))
+                .await
+                .unwrap_or_default()
         },
         Message::CopyFinished,
     )
 }
 
-pub fn move_task(srcs: Vec<PathBuf>, dest_dir: PathBuf) -> Task<Message> {
+/// Move-with-Location dispatch. Same backend combos as [`copy_task`];
+/// when source and destination share a remote backend the implementation
+/// short-circuits to `ssh <alias> mv` (atomic, preserves inodes).
+/// All other combinations are "copy then delete source on success".
+pub fn move_task(srcs: Vec<Location>, dst: Location) -> Task<Message> {
     Task::perform(
         async move {
-            tokio::task::spawn_blocking(move || {
-                srcs.into_iter()
-                    .map(|src| {
-                        let name = match src.file_name() {
-                            Some(n) => n.to_owned(),
-                            None => {
-                                return (src.clone(), Err("source has no file name".to_string()))
-                            }
-                        };
-                        let target = dest_dir.join(name);
-                        let res = move_path(&src, &target).map_err(|e| e.to_string());
-                        (src, res)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default()
+            tokio::task::spawn_blocking(move || run_move(srcs, dst))
+                .await
+                .unwrap_or_default()
         },
         Message::MoveFinished,
     )
 }
 
-pub fn delete_task(paths: Vec<PathBuf>) -> Task<Message> {
+/// Delete a batch of locations. Local sources go through the existing
+/// `delete_path` helper; remote sources fan out to
+/// `ssh <alias> rm -rf -- <path>` (one call per source so we can return
+/// per-source results).
+pub fn delete_task(srcs: Vec<Location>) -> Task<Message> {
     Task::perform(
         async move {
-            tokio::task::spawn_blocking(move || {
-                paths
-                    .into_iter()
-                    .map(|path| {
-                        let res = delete_path(&path).map_err(|e| e.to_string());
-                        (path, res)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default()
+            tokio::task::spawn_blocking(move || run_delete(srcs))
+                .await
+                .unwrap_or_default()
         },
         Message::DeleteFinished,
     )
+}
+
+fn run_copy(srcs: Vec<Location>, dst: Location) -> Vec<(Location, Result<(), String>)> {
+    let src_is_local = srcs.first().map(|s| s.is_local()).unwrap_or(true);
+    match (src_is_local, &dst) {
+        (true, Location::Local(dst_dir)) => copy_local_to_local(srcs, dst_dir),
+        (true, Location::Remote { backend, path }) => {
+            sftp_put_each(srcs, backend.clone(), path.clone())
+        }
+        (false, Location::Local(dst_dir)) => {
+            let backend = match srcs.first() {
+                Some(Location::Remote { backend, .. }) => backend.clone(),
+                _ => return Vec::new(),
+            };
+            sftp_get_each(srcs, backend, dst_dir.clone())
+        }
+        (false, Location::Remote { backend: dst_be, path: dst_path }) => {
+            let src_be = match srcs.first() {
+                Some(Location::Remote { backend, .. }) => backend.clone(),
+                _ => return Vec::new(),
+            };
+            if src_be == *dst_be {
+                ssh_cp_each(srcs, src_be, dst_path.clone())
+            } else {
+                cross_host_copy_each(srcs, src_be, dst_be.clone(), dst_path.clone())
+            }
+        }
+    }
+}
+
+fn run_move(srcs: Vec<Location>, dst: Location) -> Vec<(Location, Result<(), String>)> {
+    // Same-host R→R uses `ssh mv` so the move is atomic and inodes
+    // survive. Every other combination is copy-then-delete-source.
+    let src_backend = match srcs.first() {
+        Some(Location::Remote { backend, .. }) => Some(backend.clone()),
+        _ => None,
+    };
+    if let (Some(src_be), Location::Remote { backend: dst_be, path: dst_path }) = (&src_backend, &dst) {
+        if src_be == dst_be {
+            return ssh_mv_each(srcs, src_be.clone(), dst_path.clone());
+        }
+    }
+    if src_backend.is_none() {
+        if let Location::Local(dst_dir) = &dst {
+            // Local move keeps the rename-or-copy+delete primitive.
+            return move_local_to_local(srcs, dst_dir);
+        }
+    }
+    // Mixed-backend / local↔remote: copy first, then if the copy
+    // succeeded delete that source.
+    run_copy(srcs, dst)
+        .into_iter()
+        .map(|(src, res)| match res {
+            Ok(()) => {
+                let del = delete_one(&src);
+                (src, del)
+            }
+            Err(e) => (src, Err(e)),
+        })
+        .collect()
+}
+
+fn run_delete(srcs: Vec<Location>) -> Vec<(Location, Result<(), String>)> {
+    srcs.into_iter()
+        .map(|loc| {
+            let res = delete_one(&loc);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn copy_local_to_local(
+    srcs: Vec<Location>,
+    dst_dir: &Path,
+) -> Vec<(Location, Result<(), String>)> {
+    srcs.into_iter()
+        .map(|loc| {
+            let src_path = match &loc {
+                Location::Local(p) => p.clone(),
+                _ => return (loc, Err("expected local source".to_string())),
+            };
+            let name = match src_path.file_name() {
+                Some(n) => n.to_owned(),
+                None => return (loc, Err("source has no file name".to_string())),
+            };
+            let target = dst_dir.join(name);
+            let res = copy_recursive(&src_path, &target).map_err(|e| e.to_string());
+            (loc, res)
+        })
+        .collect()
+}
+
+fn move_local_to_local(
+    srcs: Vec<Location>,
+    dst_dir: &Path,
+) -> Vec<(Location, Result<(), String>)> {
+    srcs.into_iter()
+        .map(|loc| {
+            let src_path = match &loc {
+                Location::Local(p) => p.clone(),
+                _ => return (loc, Err("expected local source".to_string())),
+            };
+            let name = match src_path.file_name() {
+                Some(n) => n.to_owned(),
+                None => return (loc, Err("source has no file name".to_string())),
+            };
+            let target = dst_dir.join(name);
+            let res = move_path(&src_path, &target).map_err(|e| e.to_string());
+            (loc, res)
+        })
+        .collect()
+}
+
+fn delete_one(loc: &Location) -> Result<(), String> {
+    match loc {
+        Location::Local(p) => delete_path(p).map_err(|e| e.to_string()),
+        Location::Remote { backend, path } => ssh_rm_recursive(backend, path),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote copy / move / delete dispatchers (sftp + ssh subprocesses)
+// ---------------------------------------------------------------------------
+
+fn sftp_put_each(
+    srcs: Vec<Location>,
+    backend: BackendId,
+    dst_path: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    let dst_quoted = quote_remote_path(&dst_path);
+    srcs.into_iter()
+        .map(|loc| {
+            let src_path = match &loc {
+                Location::Local(p) => p.clone(),
+                _ => return (loc, Err("expected local source".to_string())),
+            };
+            let local_quoted = posix_quote(&src_path.display().to_string());
+            let script = build_sftp_put_script(&local_quoted, &dst_quoted);
+            let res = run_sftp_batch(&backend, &script);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn sftp_get_each(
+    srcs: Vec<Location>,
+    backend: BackendId,
+    dst_dir: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    let local_dst_quoted = posix_quote(&dst_dir.display().to_string());
+    srcs.into_iter()
+        .map(|loc| {
+            let remote_path = match &loc {
+                Location::Remote { path, .. } => path.clone(),
+                _ => return (loc, Err("expected remote source".to_string())),
+            };
+            let remote_quoted = quote_remote_path(&remote_path);
+            let script = build_sftp_get_script(&remote_quoted, &local_dst_quoted);
+            let res = run_sftp_batch(&backend, &script);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn ssh_cp_each(
+    srcs: Vec<Location>,
+    backend: BackendId,
+    dst_path: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    let dst_quoted = quote_remote_path(&dst_path);
+    srcs.into_iter()
+        .map(|loc| {
+            let remote_src = match &loc {
+                Location::Remote { path, .. } => path.clone(),
+                _ => return (loc, Err("expected remote source".to_string())),
+            };
+            let src_quoted = quote_remote_path(&remote_src);
+            let cmd = format!("cp -r -- {} {}", src_quoted, dst_quoted);
+            let res = run_ssh_command(&backend, &cmd);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn ssh_mv_each(
+    srcs: Vec<Location>,
+    backend: BackendId,
+    dst_path: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    let dst_quoted = quote_remote_path(&dst_path);
+    srcs.into_iter()
+        .map(|loc| {
+            let remote_src = match &loc {
+                Location::Remote { path, .. } => path.clone(),
+                _ => return (loc, Err("expected remote source".to_string())),
+            };
+            let src_quoted = quote_remote_path(&remote_src);
+            let cmd = format!("mv -- {} {}", src_quoted, dst_quoted);
+            let res = run_ssh_command(&backend, &cmd);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn ssh_rm_recursive(backend: &BackendId, path: &Path) -> Result<(), String> {
+    let quoted = quote_remote_path(path);
+    let cmd = format!("rm -rf -- {}", quoted);
+    run_ssh_command(backend, &cmd)
+}
+
+/// Cross-host R→R copy: stage each source through a fresh `/tmp`
+/// directory on the local machine. Slower than same-host `ssh cp` but
+/// avoids depending on `ssh -A` agent forwarding or
+/// `ProxyJump`-style routing.
+fn cross_host_copy_each(
+    srcs: Vec<Location>,
+    src_backend: BackendId,
+    dst_backend: BackendId,
+    dst_path: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    srcs.into_iter()
+        .map(|loc| {
+            let remote_src = match &loc {
+                Location::Remote { path, .. } => path.clone(),
+                _ => return (loc, Err("expected remote source".to_string())),
+            };
+            let res = cross_host_copy_one(&src_backend, &dst_backend, &remote_src, &dst_path);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn cross_host_copy_one(
+    src_backend: &BackendId,
+    dst_backend: &BackendId,
+    remote_src: &Path,
+    dst_path: &Path,
+) -> Result<(), String> {
+    let staging =
+        make_staging_dir().map_err(|e| format!("failed to create staging dir: {}", e))?;
+    let stage_result = (|| -> Result<(), String> {
+        let remote_quoted = quote_remote_path(remote_src);
+        let staging_quoted = posix_quote(&staging.display().to_string());
+        let get = build_sftp_get_script(&remote_quoted, &staging_quoted);
+        run_sftp_batch(src_backend, &get)?;
+        let basename = remote_src
+            .file_name()
+            .ok_or_else(|| "source has no file name".to_string())?;
+        let staged = staging.join(basename);
+        let staged_quoted = posix_quote(&staged.display().to_string());
+        let dst_quoted = quote_remote_path(dst_path);
+        let put = build_sftp_put_script(&staged_quoted, &dst_quoted);
+        run_sftp_batch(dst_backend, &put)
+    })();
+    // Best-effort cleanup; we don't surface a remove failure if the
+    // copy itself succeeded.
+    let _ = std::fs::remove_dir_all(&staging);
+    stage_result
+}
+
+fn make_staging_dir() -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rho-stage-{}-{}", pid, count));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Pure batch-script builders, kept separate so they can be unit-tested
+/// without spawning sftp.
+fn build_sftp_put_script(local_quoted: &str, remote_quoted: &str) -> String {
+    format!("put -r {} {}\n", local_quoted, remote_quoted)
+}
+
+fn build_sftp_get_script(remote_quoted: &str, local_quoted: &str) -> String {
+    format!("get -r {} {}\n", remote_quoted, local_quoted)
+}
+
+fn run_sftp_batch(backend: &BackendId, script: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sftp")
+        .args(["-b", "-", "-o", "BatchMode=yes", backend.as_str()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn sftp: {}", e))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "sftp stdin missing".to_string())?;
+        stdin
+            .write_all(script.as_bytes())
+            .map_err(|e| format!("failed to write sftp script: {}", e))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("sftp wait failed: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("sftp exited with status {}", output.status)
+        } else {
+            stderr
+        })
+    }
+}
+
+fn run_ssh_command(backend: &BackendId, remote_cmd: &str) -> Result<(), String> {
+    let output = std::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", backend.as_str(), "--", remote_cmd])
+        .output()
+        .map_err(|e| format!("failed to spawn ssh: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("ssh exited with status {}", output.status)
+        } else {
+            stderr
+        })
+    }
 }
 
 pub fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -1549,5 +1863,68 @@ mod tests {
         // remote shell expands to $HOME.
         assert_eq!(quote_remote_path(Path::new("~")), "~".to_string());
         assert_eq!(quote_remote_path(Path::new("~user")), "~user".to_string());
+    }
+
+    #[test]
+    fn build_sftp_put_script_emits_recursive_put_with_newline() {
+        assert_eq!(
+            build_sftp_put_script("'/local/foo'", "~/'.config'"),
+            "put -r '/local/foo' ~/'.config'\n",
+        );
+    }
+
+    #[test]
+    fn build_sftp_get_script_emits_recursive_get_with_newline() {
+        assert_eq!(
+            build_sftp_get_script("'/remote/log'", "'/tmp/stage'"),
+            "get -r '/remote/log' '/tmp/stage'\n",
+        );
+    }
+
+    #[test]
+    fn run_copy_local_to_local_uses_copy_recursive() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, b"hi").unwrap();
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+
+        let results = run_copy(
+            vec![Location::Local(src.clone())],
+            Location::Local(dst.clone()),
+        );
+        assert_eq!(results.len(), 1);
+        let (_loc, res) = &results[0];
+        assert!(res.is_ok(), "expected ok, got {:?}", res);
+        assert!(dst.join("a.txt").exists());
+    }
+
+    #[test]
+    fn run_move_local_to_local_renames_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, b"hi").unwrap();
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+
+        let results = run_move(
+            vec![Location::Local(src.clone())],
+            Location::Local(dst.clone()),
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        assert!(!src.exists());
+        assert!(dst.join("a.txt").exists());
+    }
+
+    #[test]
+    fn run_delete_local_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("doomed");
+        std::fs::write(&src, b"bye").unwrap();
+        let results = run_delete(vec![Location::Local(src.clone())]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        assert!(!src.exists());
     }
 }

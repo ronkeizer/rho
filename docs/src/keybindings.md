@@ -94,7 +94,7 @@ Inside a modal, the navigation keys behave differently:
 | Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
 | Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
 | Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
-| Connect to SSH server | Type to filter (substring against alias or hostname). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Connect` opens a new terminal running `ssh <alias>`. `Open` lists the host's home directory in the active pane (listing only — no remote file ops yet). `Esc` dismisses. |
+| Connect to SSH server | Type to filter (substring against alias or hostname). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Connect` opens a new terminal running `ssh <alias>`. `Open` lists the host's home directory in the active pane and lets you Copy / Move / Delete to and from it (via `sftp` and `ssh rm -rf`). `Esc` dismisses. |
 
 ### Compress / Uncompress modals
 
@@ -244,12 +244,19 @@ the first non-wildcard pattern becomes the entry's alias.
   pane. The pane's path header switches to `<alias>:<path>` and
   navigation (`Enter`, `Backspace`, arrow keys) works as normal, with
   each step running a fresh `ssh <alias> ls -la --time-style=full-iso`
-  against the remote. Listing-only in the current release: file
-  operations (copy / move / delete / compress / edit / Quick Look /
-  open Claude Code / git branch) silently no-op while the active pane
-  is remote, since rho can't yet transfer files between local and
-  remote. The remote host needs GNU `ls` (any Linux distro) — BSD-style
-  `ls` doesn't accept `--time-style=full-iso`.
+  against the remote. The remote host needs GNU `ls` (any Linux
+  distro) — BSD-style `ls` doesn't accept `--time-style=full-iso`.
+
+  **What works against remote panes today**: directory listing,
+  `F5`/`F6` (Copy/Move) in either direction between local and remote,
+  cross-pane copy/move on the same remote host (short-circuits to
+  `ssh <alias> cp -r` / `mv`), copy/move *between* two different remote
+  hosts (slow: stages through local `/tmp`), and `Delete` on remote
+  selections (via `ssh <alias> rm -rf`). What doesn't (yet): Compress /
+  Uncompress, `F4` Edit, Space Quick Look, "Open Claude Code in this
+  folder", and the Git branch palette action — all of those still
+  silently no-op when the active pane is remote, because they hand a
+  file or cwd to a local subprocess.
 
 - **Connect** — opens a new terminal window with `ssh <alias>` as its
   main process. Per OS:

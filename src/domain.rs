@@ -259,7 +259,10 @@ pub enum Prompt {
         input: String,
     },
     Delete {
-        paths: Vec<PathBuf>,
+        /// Backend-aware list — local entries hold a `PathBuf`, remote
+        /// entries carry their backend alias so the confirm UI can show
+        /// `host:/path` and the dispatch hits the right transport.
+        paths: Vec<Location>,
         focus: DeleteFocus,
     },
     /// User pressed Enter on a `.zip` larger than the threshold — ask
@@ -1326,6 +1329,18 @@ impl Pane {
             .collect()
     }
 
+    /// Backend-aware sibling of [`marked_paths`]: returns each marked
+    /// entry as a full [`Location`], preserving the pane's backend.
+    /// Use this anywhere the I/O dispatch needs to know whether the
+    /// source is local or on a particular remote host.
+    pub fn marked_locations(&self) -> Vec<Location> {
+        let (lo, hi) = self.mark_range();
+        (lo..=hi)
+            .filter_map(|i| self.entry_at(i))
+            .map(|e| self.location.join(&e.name))
+            .collect()
+    }
+
     pub fn toggle_sort(&mut self, by: SortBy) {
         let prior = self.cursor_name();
         if self.sort_by == by {
@@ -2282,6 +2297,49 @@ this is not an ls line
         p.anchor = 0;
         p.selected = 0;
         assert!(p.marked_paths().is_empty());
+    }
+
+    #[test]
+    fn marked_locations_on_local_pane_matches_marked_paths() {
+        let mut p = alpha_pane();
+        p.anchor = 1;
+        p.selected = 3;
+        let paths = p.marked_paths();
+        let locs = p.marked_locations();
+        assert_eq!(paths.len(), locs.len());
+        for (path, loc) in paths.iter().zip(locs.iter()) {
+            assert_eq!(loc, &Location::Local(path.clone()));
+        }
+    }
+
+    #[test]
+    fn marked_locations_on_remote_pane_keeps_backend() {
+        let mut p = Pane::empty(Location::Remote {
+            backend: BackendId::new("alice.dev"),
+            path: PathBuf::from("/var/log"),
+        });
+        p.append_chunk(vec![
+            mk_entry("syslog", false, Some(10)),
+            mk_entry("auth.log", false, Some(20)),
+        ]);
+        sort_entries(&mut p.entries, p.sort_by, p.sort_dir);
+        p.recompute_visible(None);
+        p.anchor = 1;
+        p.selected = 2;
+        let locs = p.marked_locations();
+        assert_eq!(locs.len(), 2);
+        for loc in &locs {
+            match loc {
+                Location::Remote { backend, .. } => {
+                    assert_eq!(backend.as_str(), "alice.dev");
+                }
+                _ => panic!("expected Remote, got {:?}", loc),
+            }
+        }
+        // The joined paths still sit under the pane's remote dir.
+        let paths: Vec<&Path> = locs.iter().map(|l| l.path()).collect();
+        assert!(paths.contains(&Path::new("/var/log/syslog")));
+        assert!(paths.contains(&Path::new("/var/log/auth.log")));
     }
 
     #[test]

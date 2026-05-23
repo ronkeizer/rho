@@ -71,12 +71,29 @@ The dispatch point is `fs_ops::loading_tasks(side, location, generation)`:
   unit-tested), and emits a single `EntriesChunk` + `EntriesDone`. No
   git info for remote panes — it's not worth the round-trip in the MVP.
 
-**Scope of remote-pane support today**: listing only. Operations that
-touch local files (copy, move, delete, compress/uncompress, edit, Quick
-Look, "open Claude Code", git branch) early-return when the active pane
-(or, for cross-pane ops, either pane) is remote. The Claude-marker
-probe also short-circuits for remote panes. Plumbing for remote file
-transfer (scp/sftp) is a future phase.
+**Scope of remote-pane support today**: listing + copy + move + delete.
+`copy_task` / `move_task` / `delete_task` in `fs_ops` dispatch on the
+source-and-destination `Location` combination:
+
+- `Local → Local` → in-process `copy_recursive` / `move_path` /
+  `delete_path` (unchanged from before remote support).
+- `Local → Remote` → one `sftp -b - <alias>` invocation per source
+  with a `put -r <src> <dst>` script.
+- `Remote → Local` → same shape with `get -r`.
+- `Remote → Remote`, same `BackendId` → `ssh <alias> 'cp -r -- …'` (or
+  `mv` for moves) so the operation never round-trips through the local
+  machine.
+- `Remote → Remote`, different backends → stage each source through a
+  per-call `/tmp/rho-stage-<pid>-<n>/` directory: `get` from source,
+  `put` to destination, then `rm -rf` the staging dir. Slow but
+  zero-config.
+
+Mutating ops still gated to local: `compress` / `uncompress` (they
+shell out to local `zip`), `EditFile` and `QuickLook` (they hand the
+file to a local editor / Preview app), `OpenClaudeCode` and the Git
+palette action (both expect a local cwd). The Claude-marker probe also
+short-circuits for remote panes. Remote-aware versions of those are
+future phases.
 
 **Entry point**: the existing "Connect to SSH server" palette modal
 (`⌘P` → SSH) grew a second per-row button, **Open**, that fires

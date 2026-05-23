@@ -191,9 +191,10 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
         Prompt::Delete { paths, focus } => {
             let question = if paths.len() == 1 {
                 let name = paths[0]
+                    .path()
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| paths[0].display().to_string());
+                    .unwrap_or_else(|| paths[0].to_string());
                 format!("Do you really want to delete \"{}\"?", name)
             } else {
                 format!("Do you really want to delete {} files?", paths.len())
