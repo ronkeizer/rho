@@ -55,6 +55,21 @@ toolchain.
 On first run, Rho creates `~/.rho.yaml` with a starter template and
 opens with both panes pointed at `$HOME`.
 
+### macOS app bundle
+
+`cargo run` shows the generic binary icon in the Dock. To get a proper
+`Rho.app` with its own Dock icon:
+
+```sh
+./scripts/make-macos-app.sh   # builds the release binary + target/macos/Rho.app
+open target/macos/Rho.app
+```
+
+The icon artwork is generated from scratch (no design tool needed) by
+`scripts/gen-icon.py`, which writes `assets/icon.png`; that same PNG is
+embedded as the window icon on every platform. Re-run it after editing the
+script to regenerate the art.
+
 ## Docs
 
 - [Build & run](https://ronkeizer.github.io/rho/build-and-run.html)

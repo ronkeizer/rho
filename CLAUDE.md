@@ -42,9 +42,9 @@ Every behavior change ships with tests **and** docs. Treat these as part of the 
 
 The docs CI catches broken refs on every PR. Refactors that don't change behavior don't need new docs, but if the existing docs become inaccurate as a result, update them in the same PR.
 
-## iced feature flag (load-bearing)
+## iced feature flags (load-bearing)
 
-`Cargo.toml` pins `iced = { version = "0.13", features = ["tokio"] }`. The `tokio` feature switches iced's executor from `smol` to a tokio runtime, which is required because directory streaming uses `tokio::task::spawn_blocking` + `tokio::sync::mpsc`. Removing the feature reintroduces a `there is no reactor running` panic at runtime.
+`Cargo.toml` pins `iced = { version = "0.13", features = ["tokio", "image"] }`. The `tokio` feature switches iced's executor from `smol` to a tokio runtime, which is required because directory streaming uses `tokio::task::spawn_blocking` + `tokio::sync::mpsc`. Removing the feature reintroduces a `there is no reactor running` panic at runtime. The `image` feature pulls in the `image` crate so `window::icon::from_file_data` can decode the embedded `assets/icon.png` (`main.rs::APP_ICON`); without it the window-icon call won't compile.
 
 ## Architecture
 
