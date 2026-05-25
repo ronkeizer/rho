@@ -22,6 +22,11 @@ use std::time::SystemTime;
 pub struct BackendId(String);
 
 impl BackendId {
+    /// Reserved backend id for the single Dropbox account. Locations under
+    /// it serialize as `dropbox:/path`; the remote dispatchers in `fs_ops`
+    /// route this id to the Dropbox HTTP API instead of ssh/sftp.
+    pub const DROPBOX: &'static str = "dropbox";
+
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -29,6 +34,28 @@ impl BackendId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Which transport this backend speaks. Today the only non-SSH backend
+    /// is Dropbox, keyed off the reserved [`BackendId::DROPBOX`] id.
+    pub fn kind(&self) -> BackendKind {
+        if self.0 == Self::DROPBOX {
+            BackendKind::Dropbox
+        } else {
+            BackendKind::Ssh
+        }
+    }
+
+    pub fn is_dropbox(&self) -> bool {
+        self.kind() == BackendKind::Dropbox
+    }
+}
+
+/// Which transport a [`BackendId`] resolves to. Drives the `fs_ops`
+/// dispatch between the ssh/sftp subprocess path and the Dropbox HTTP API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Ssh,
+    Dropbox,
 }
 
 impl fmt::Display for BackendId {
@@ -212,7 +239,7 @@ impl SortDir {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub name: String,
     pub is_dir: bool,
@@ -281,14 +308,21 @@ pub enum Prompt {
         focus: NewFilesFocus,
     },
     /// Action picker with a filter input. `actions` is the slate of
-    /// currently-offerable actions, captured at open time (so runtime gating
+    /// currently-listed actions, captured at open time (so runtime gating
     /// like Git: branch availability is stable across the modal session).
     /// `selected` is an index into the *filtered* list (i.e.
     /// `filtered_actions(&actions, &input)`).
+    ///
+    /// `dropbox_configured` is captured at open time so the renderer can show
+    /// `OpenDropbox` as a disabled (greyed, non-activatable) row when no
+    /// Dropbox credentials are present — see [`palette_action_enabled`]. We
+    /// keep the row visible-but-disabled rather than hiding it so users
+    /// discover the feature exists.
     CommandPalette {
         input: String,
         selected: usize,
         actions: Vec<PaletteAction>,
+        dropbox_configured: bool,
     },
     /// "Docker containers" action. Shows the currently-running containers
     /// from `docker ps`, each with Kill and Shell buttons. The state goes
@@ -389,6 +423,10 @@ pub enum PaletteAction {
     /// repository (see [`available_palette_actions`]).
     GitBranch,
     SshConnect,
+    /// Always listed, but rendered disabled unless Dropbox credentials are
+    /// present in `~/.rho.yaml` (see [`palette_action_enabled`]). Points the
+    /// active pane at the Dropbox account root.
+    OpenDropbox,
     OpenClaudeCode,
     KeyboardShortcuts,
     Exit,
@@ -407,6 +445,7 @@ impl PaletteAction {
         PaletteAction::LaunchApplication,
         PaletteAction::GitBranch,
         PaletteAction::SshConnect,
+        PaletteAction::OpenDropbox,
         PaletteAction::OpenClaudeCode,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
@@ -423,6 +462,7 @@ impl PaletteAction {
         PaletteAction::Processes,
         PaletteAction::GitBranch,
         PaletteAction::SshConnect,
+        PaletteAction::OpenDropbox,
         PaletteAction::OpenClaudeCode,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
@@ -440,6 +480,7 @@ impl PaletteAction {
             PaletteAction::LaunchApplication => "Launch Application",
             PaletteAction::GitBranch => "Git: branch",
             PaletteAction::SshConnect => "Connect to SSH server",
+            PaletteAction::OpenDropbox => "Open Dropbox",
             PaletteAction::OpenClaudeCode => "Open Claude Code in this folder",
             PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
@@ -552,10 +593,13 @@ pub fn keyboard_shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static st
     ]
 }
 
-/// Subset of [`PaletteAction::ALL`] currently offerable. `in_git_repo` is the
-/// only runtime gate today (GitBranch is hidden outside repos). Cfg-gated
-/// variants like LaunchApplication are already absent from `ALL` on non-mac
-/// builds, so no extra logic needed there.
+/// Subset of [`PaletteAction::ALL`] worth *listing* in the palette.
+/// `in_git_repo` is the only thing that hides a row today (GitBranch is
+/// contextual — meaningless outside a repo, so it's dropped entirely).
+/// Capability-style actions like `OpenDropbox` stay listed regardless of
+/// config and are instead greyed out by [`palette_action_enabled`], so users
+/// discover them. Cfg-gated variants like LaunchApplication are already
+/// absent from `ALL` on non-mac builds, so no extra logic needed there.
 pub fn available_palette_actions(in_git_repo: bool) -> Vec<PaletteAction> {
     PaletteAction::ALL
         .iter()
@@ -565,6 +609,18 @@ pub fn available_palette_actions(in_git_repo: bool) -> Vec<PaletteAction> {
             _ => true,
         })
         .collect()
+}
+
+/// Whether a listed palette action can actually be activated right now.
+/// Listing (in [`available_palette_actions`]) and enablement are separate:
+/// `OpenDropbox` is always listed but only activatable once Dropbox
+/// credentials are present in `~/.rho.yaml`. Everything else is always
+/// enabled once listed.
+pub fn palette_action_enabled(action: PaletteAction, dropbox_configured: bool) -> bool {
+    match action {
+        PaletteAction::OpenDropbox => dropbox_configured,
+        _ => true,
+    }
 }
 
 /// Snapshot of a single running container surfaced from `docker ps`.
@@ -1083,6 +1139,139 @@ fn parse_ls_la_line(line: &str) -> Option<Entry> {
         is_dir,
         size,
         modified,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Dropbox API helpers (pure: path mapping + JSON parsing)
+// ---------------------------------------------------------------------------
+
+/// Map a pane [`Location`] path onto the string the Dropbox API expects.
+/// Dropbox uses `""` for the account root and `/Folder/file` for
+/// everything else (always forward slashes, no trailing slash). Our pane
+/// paths are `PathBuf`s anchored at `/`, so the root `"/"` becomes `""`.
+pub fn dropbox_api_path(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+/// One page of a `list_folder` (or `list_folder/continue`) response,
+/// mapped into our [`Entry`] type. `cursor` is `Some` only when the API
+/// reported `has_more` — the caller pages with `list_folder/continue`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropboxListing {
+    pub entries: Vec<Entry>,
+    pub cursor: Option<String>,
+}
+
+/// Parse a Dropbox `list_folder` JSON body into [`DropboxListing`].
+/// Unknown `.tag`s (e.g. `deleted`) are skipped. Errors carry the Dropbox
+/// `error_summary` when the body is an API error rather than a listing.
+pub fn parse_dropbox_list(json: &str) -> Result<DropboxListing, String> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        entries: Vec<RawEntry>,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default)]
+        error_summary: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawEntry {
+        #[serde(rename = ".tag")]
+        tag: String,
+        name: String,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        server_modified: Option<String>,
+    }
+
+    let resp: Resp = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {}", e))?;
+    if let Some(err) = resp.error_summary {
+        return Err(err);
+    }
+    let entries = resp
+        .entries
+        .into_iter()
+        .filter_map(|raw| match raw.tag.as_str() {
+            "folder" => Some(Entry {
+                name: raw.name,
+                is_dir: true,
+                size: None,
+                modified: None,
+            }),
+            "file" => Some(Entry {
+                name: raw.name,
+                is_dir: false,
+                size: raw.size,
+                modified: raw.server_modified.as_deref().and_then(parse_rfc3339),
+            }),
+            _ => None,
+        })
+        .collect();
+    Ok(DropboxListing {
+        entries,
+        cursor: if resp.has_more { resp.cursor } else { None },
+    })
+}
+
+/// Parse a Dropbox `oauth2/token` response into `(access_token,
+/// expires_in_seconds)`. Token-endpoint errors use OAuth's
+/// `error` / `error_description` shape, so we surface those instead.
+pub fn parse_dropbox_token(json: &str) -> Result<(String, u64), String> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        access_token: Option<String>,
+        #[serde(default)]
+        expires_in: Option<u64>,
+        #[serde(default)]
+        error_description: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+    let resp: Resp =
+        serde_json::from_str(json).map_err(|e| format!("invalid token JSON: {}", e))?;
+    match resp.access_token {
+        // Dropbox access tokens currently last 4 hours; fall back to that
+        // if the field is somehow missing.
+        Some(token) => Ok((token, resp.expires_in.unwrap_or(14_400))),
+        None => Err(resp
+            .error_description
+            .or(resp.error)
+            .unwrap_or_else(|| "token exchange failed".to_string())),
+    }
+}
+
+/// Extract Dropbox's `error_summary` from an API error body, if present.
+/// Used to turn a 4xx/5xx response into a human-readable message.
+pub fn dropbox_error_summary(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("error_summary")?
+        .as_str()
+        .map(|s| s.trim_end_matches(|c| c == '.' || c == '/').to_string())
+}
+
+/// Parse an RFC 3339 timestamp (Dropbox `server_modified`, e.g.
+/// `2015-05-12T15:50:38Z`) into a `SystemTime`. Pre-epoch times → `None`.
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().and_then(|dt| {
+        let secs = dt.timestamp();
+        if secs < 0 {
+            return None;
+        }
+        Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, dt.timestamp_subsec_nanos()))
     })
 }
 
@@ -2867,6 +3056,107 @@ this is not an ls line
     fn available_palette_actions_includes_git_branch_in_repo() {
         let out = available_palette_actions(true);
         assert!(out.contains(&PaletteAction::GitBranch));
+    }
+
+    #[test]
+    fn available_palette_actions_always_lists_dropbox() {
+        // Listed regardless of credentials — discoverability. Enablement is a
+        // separate concern (palette_action_enabled).
+        assert!(available_palette_actions(false).contains(&PaletteAction::OpenDropbox));
+        assert!(available_palette_actions(true).contains(&PaletteAction::OpenDropbox));
+    }
+
+    #[test]
+    fn palette_action_enabled_gates_dropbox_on_credentials() {
+        assert!(!palette_action_enabled(PaletteAction::OpenDropbox, false));
+        assert!(palette_action_enabled(PaletteAction::OpenDropbox, true));
+        // Non-Dropbox actions are enabled regardless of the flag.
+        assert!(palette_action_enabled(PaletteAction::Copy, false));
+        assert!(palette_action_enabled(PaletteAction::GitBranch, false));
+    }
+
+    #[test]
+    fn dropbox_api_path_maps_root_to_empty() {
+        assert_eq!(dropbox_api_path(Path::new("/")), "");
+        assert_eq!(dropbox_api_path(Path::new("/Photos")), "/Photos");
+        assert_eq!(dropbox_api_path(Path::new("/Photos/a.jpg")), "/Photos/a.jpg");
+        // Trailing slash is trimmed.
+        assert_eq!(dropbox_api_path(Path::new("/Photos/")), "/Photos");
+    }
+
+    #[test]
+    fn parse_dropbox_list_maps_files_and_folders() {
+        let json = r#"{
+            "entries": [
+                {".tag": "folder", "name": "Photos"},
+                {".tag": "file", "name": "report.pdf", "size": 1024,
+                 "server_modified": "2015-05-12T15:50:38Z"},
+                {".tag": "deleted", "name": "gone.txt"}
+            ],
+            "cursor": "abc",
+            "has_more": false
+        }"#;
+        let listing = parse_dropbox_list(json).unwrap();
+        // The `deleted` entry is dropped.
+        assert_eq!(listing.entries.len(), 2);
+        let folder = &listing.entries[0];
+        assert_eq!(folder.name, "Photos");
+        assert!(folder.is_dir);
+        assert_eq!(folder.size, None);
+        let file = &listing.entries[1];
+        assert_eq!(file.name, "report.pdf");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, Some(1024));
+        assert!(file.modified.is_some());
+        // has_more false → no continuation cursor.
+        assert_eq!(listing.cursor, None);
+    }
+
+    #[test]
+    fn parse_dropbox_list_returns_cursor_when_has_more() {
+        let json = r#"{"entries": [], "cursor": "next-page", "has_more": true}"#;
+        let listing = parse_dropbox_list(json).unwrap();
+        assert_eq!(listing.cursor.as_deref(), Some("next-page"));
+    }
+
+    #[test]
+    fn parse_dropbox_list_surfaces_api_error() {
+        let json = r#"{"error_summary": "path/not_found/", "error": {".tag": "path"}}"#;
+        let err = parse_dropbox_list(json).unwrap_err();
+        assert!(err.contains("not_found"));
+    }
+
+    #[test]
+    fn parse_dropbox_token_extracts_token_and_expiry() {
+        let json = r#"{"access_token": "sl.abc", "token_type": "bearer", "expires_in": 14400}"#;
+        let (token, expires) = parse_dropbox_token(json).unwrap();
+        assert_eq!(token, "sl.abc");
+        assert_eq!(expires, 14400);
+    }
+
+    #[test]
+    fn parse_dropbox_token_surfaces_oauth_error() {
+        let json = r#"{"error": "invalid_grant", "error_description": "refresh token is invalid"}"#;
+        let err = parse_dropbox_token(json).unwrap_err();
+        assert_eq!(err, "refresh token is invalid");
+    }
+
+    #[test]
+    fn dropbox_error_summary_strips_trailing_dot() {
+        let json = r#"{"error_summary": "path/not_found/.", "error": {".tag": "path"}}"#;
+        assert_eq!(
+            dropbox_error_summary(json).as_deref(),
+            Some("path/not_found")
+        );
+        assert_eq!(dropbox_error_summary("not json"), None);
+    }
+
+    #[test]
+    fn backend_id_kind_detects_dropbox() {
+        assert_eq!(BackendId::new("dropbox").kind(), BackendKind::Dropbox);
+        assert!(BackendId::new("dropbox").is_dropbox());
+        assert_eq!(BackendId::new("alice.dev").kind(), BackendKind::Ssh);
+        assert!(!BackendId::new("alice.dev").is_dropbox());
     }
 
     #[test]

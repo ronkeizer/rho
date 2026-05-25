@@ -12,7 +12,8 @@ use iced::{Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector}
 use crate::config::dim;
 use crate::domain::{
     filtered_actions, filtered_apps, filtered_branches, filtered_containers, filtered_processes,
-    filtered_recents, filtered_servers, keyboard_shortcuts, AppsState, DeleteFocus, DockerSortBy,
+    filtered_recents, filtered_servers, keyboard_shortcuts, palette_action_enabled, AppsState,
+    DeleteFocus, DockerSortBy,
     DockerState, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
     Prompt, Side, SortDir, SshServersState,
 };
@@ -144,6 +145,7 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
             input,
             selected,
             actions,
+            dropbox_configured,
         } => {
             let filtered = filtered_actions(actions, input);
             let input_widget = text_input("filter actions…", input)
@@ -160,20 +162,40 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 let actions_col = filtered.iter().enumerate().fold(
                     column![].spacing(2),
                     |col, (i, action)| {
+                        let enabled = palette_action_enabled(*action, *dropbox_configured);
                         // Same idea as the Open modal: highlight only the
                         // active row; the rest inherit the modal background.
+                        // Disabled rows (e.g. Open Dropbox with no creds) stay
+                        // listed but greyed and non-clickable so the feature is
+                        // discoverable.
                         let style: fn(&Theme, button::Status) -> button::Style = if i == *selected {
                             button::primary
-                        } else {
+                        } else if enabled {
                             button::text
+                        } else {
+                            palette_disabled_style
                         };
-                        col.push(
-                            button(text(action.label()).size(12))
-                                .on_press(Message::PaletteSelect(*action))
-                                .padding(Padding::from([2, 12]))
-                                .width(Length::Fill)
-                                .style(style),
-                        )
+                        // Disabled rows carry a trailing hint pointing at the
+                        // config; enabled rows are just the label.
+                        let label: Element<'_, Message> = if enabled {
+                            text(action.label()).size(12).into()
+                        } else {
+                            row![
+                                text(action.label()).size(12),
+                                Space::with_width(Length::Fill),
+                                text("set credentials in ~/.rho.yaml").size(10),
+                            ]
+                            .align_y(iced::alignment::Vertical::Center)
+                            .into()
+                        };
+                        let mut btn = button(label)
+                            .padding(Padding::from([2, 12]))
+                            .width(Length::Fill)
+                            .style(style);
+                        if enabled {
+                            btn = btn.on_press(Message::PaletteSelect(*action));
+                        }
+                        col.push(btn)
                     },
                 );
                 actions_col.into()
@@ -1114,6 +1136,16 @@ fn process_header<'a>(
     .style(button::text)
     .on_press(Message::ProcessToggleSort(column))
     .into()
+}
+
+/// Style for a non-selected, disabled command-palette row: same flat
+/// background as `button::text`, but with dimmed text so it reads as
+/// unavailable. Selected rows use `button::primary` regardless of enablement.
+fn palette_disabled_style(theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        text_color: dim(theme.extended_palette().background.base.text),
+        ..button::text(theme, status)
+    }
 }
 
 fn modal_style(theme: &Theme) -> container::Style {

@@ -37,6 +37,22 @@ pub struct Config {
     /// to `"iTerm"` when `/Applications/iTerm.app` exists, otherwise
     /// `"Terminal"`. On Linux / Windows this field is currently ignored.
     pub terminal_app: Option<String>,
+    /// Dropbox app key (client id) from the Dropbox App Console. Combined
+    /// with `dropbox_refresh_token` to mint short-lived access tokens for
+    /// the `dropbox:` remote backend. `None` (the default) hides the
+    /// "Open Dropbox" palette action.
+    #[serde(default)]
+    pub dropbox_app_key: Option<String>,
+    /// Dropbox app secret. Required for "full" (non-PKCE) apps; PKCE apps
+    /// can leave this unset. Only ever sent to Dropbox's `oauth2/token`
+    /// endpoint when exchanging the refresh token.
+    #[serde(default)]
+    pub dropbox_app_secret: Option<String>,
+    /// Long-lived OAuth2 refresh token (obtained once via the Dropbox
+    /// authorize flow with `token_access_type=offline`). Exchanged for a
+    /// short-lived access token on demand — see `fs_ops::dropbox_access_token`.
+    #[serde(default)]
+    pub dropbox_refresh_token: Option<String>,
 }
 
 impl Default for Config {
@@ -56,7 +72,41 @@ impl Default for Config {
             folder_color: Some("#6db4ff".to_string()),
             watch_folders: vec!["~/Downloads".to_string()],
             terminal_app: None,
+            dropbox_app_key: None,
+            dropbox_app_secret: None,
+            dropbox_refresh_token: None,
         }
+    }
+}
+
+/// Credentials for the `dropbox:` remote backend, pulled from
+/// [`Config`]. Present only when both an app key and a refresh token are
+/// configured; `app_secret` stays optional (PKCE apps omit it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropboxAuth {
+    pub app_key: String,
+    pub app_secret: Option<String>,
+    pub refresh_token: String,
+}
+
+impl Config {
+    /// The Dropbox credentials, if both the app key and refresh token are
+    /// set. Used to gate the "Open Dropbox" palette action and to mint
+    /// access tokens in `fs_ops`.
+    pub fn dropbox_auth(&self) -> Option<DropboxAuth> {
+        let app_key = self.dropbox_app_key.clone()?;
+        let refresh_token = self.dropbox_refresh_token.clone()?;
+        if app_key.trim().is_empty() || refresh_token.trim().is_empty() {
+            return None;
+        }
+        Some(DropboxAuth {
+            app_key,
+            app_secret: self
+                .dropbox_app_secret
+                .clone()
+                .filter(|s| !s.trim().is_empty()),
+            refresh_token,
+        })
     }
 }
 
@@ -221,7 +271,18 @@ fn default_template_yaml() -> &'static str {
      \x20\x20- \"~/Downloads\"\n\
      # macOS only. Which terminal app the SSH / Docker shell actions use.\n\
      # Defaults to \"iTerm\" if /Applications/iTerm.app exists, else \"Terminal\".\n\
-     # terminal_app: \"iTerm\"\n"
+     # terminal_app: \"iTerm\"\n\
+     # Dropbox backend. Lets panes browse / copy / move / delete under dropbox:/\n\
+     # and enables the \"Open Dropbox\" command. Full setup (create app, grant\n\
+     # files.* scopes, mint a refresh token via the authorize flow) is in the\n\
+     # docs: https://ronkeizer.github.io/rho/configuration.html#dropbox\n\
+     # Gotchas: the refresh_token is NOT the App Console's \"Generate access\n\
+     # token\" button (that's a short-lived sl.* access token); after changing\n\
+     # scopes you must re-authorize; after editing these, restart rho.\n\
+     # app_secret is only needed for non-PKCE apps.\n\
+     # dropbox_app_key: \"xxxxxxxxxxxxxxx\"\n\
+     # dropbox_app_secret: \"xxxxxxxxxxxxxxx\"\n\
+     # dropbox_refresh_token: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -20,8 +20,8 @@ use domain::{
     filtered_branches, filtered_recents, filtered_servers, sort_apps,
     sort_containers, sort_entries, sort_processes, Application, AppsState, BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
-    Location, NewFilesFocus, PaletteAction, Pane, Process, ProcessSortBy, ProcessesState, Prompt,
-    Side, SortBy, SortDir, SshServer, SshServersState,
+    Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
+    ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState,
 };
 use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
@@ -174,6 +174,10 @@ struct App {
     uncompress_in_progress: Option<(usize, PathBuf)>,
     /// Source archive path while an Enter-on-zip extraction is running.
     extract_in_progress: Option<PathBuf>,
+    /// Error from the most recently finished copy/move/delete/compress/
+    /// extract task, shown in red in the status bar until the next such
+    /// action starts. `None` once an operation completes cleanly.
+    last_error: Option<String>,
     /// New-file detections that arrived while another modal was open. Drained
     /// FIFO when the current modal closes.
     pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
@@ -228,6 +232,7 @@ impl App {
             compress_in_progress: None,
             uncompress_in_progress: None,
             extract_in_progress: None,
+            last_error: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
         };
@@ -538,6 +543,7 @@ impl App {
                             });
                             return Task::none();
                         }
+                        self.last_error = None;
                         self.extract_in_progress = Some(path.clone());
                         return extract_to_temp_task(path);
                     }
@@ -632,6 +638,7 @@ impl App {
                             input,
                             selected,
                             actions,
+                            ..
                         } => {
                             *input = value;
                             let n = filtered_actions(actions, input).len();
@@ -682,6 +689,9 @@ impl App {
                 }
             }
             Message::PromptSubmit => {
+                // A fresh submit (copy/move/delete/compress/extract) clears
+                // any error left over from the previous one.
+                self.last_error = None;
                 let task = if let Some(prompt) = self.prompt.take() {
                     match prompt {
                         Prompt::Open {
@@ -777,12 +787,30 @@ impl App {
                             input,
                             selected,
                             actions,
+                            dropbox_configured,
                         } => {
                             let filtered = filtered_actions(&actions, &input);
-                            if let Some(action) = filtered.get(selected).copied() {
-                                return self.execute_palette_action(action);
+                            match filtered.get(selected).copied() {
+                                Some(action)
+                                    if palette_action_enabled(action, dropbox_configured) =>
+                                {
+                                    return self.execute_palette_action(action);
+                                }
+                                // Highlighted row is disabled (e.g. Open
+                                // Dropbox without credentials): keep the modal
+                                // open so Enter feels inert rather than
+                                // dismissing it.
+                                Some(_) => {
+                                    self.prompt = Some(Prompt::CommandPalette {
+                                        input,
+                                        selected,
+                                        actions,
+                                        dropbox_configured,
+                                    });
+                                    None
+                                }
+                                None => None,
                             }
-                            None
                         }
                         // Docker / Processes have a filter input but actions
                         // are mouse-only — Enter is a no-op. Re-instate the
@@ -1019,6 +1047,7 @@ impl App {
                         eprintln!("copy {} failed: {}", src, e);
                     }
                 }
+                self.record_batch_errors("Copy", &results);
                 return self.reload_both_panes();
             }
             Message::MoveFinished(results) => {
@@ -1028,6 +1057,7 @@ impl App {
                         eprintln!("move {} failed: {}", src, e);
                     }
                 }
+                self.record_batch_errors("Move", &results);
                 return self.reload_both_panes();
             }
             Message::CompressFinished(result) => {
@@ -1035,6 +1065,7 @@ impl App {
                 if let Err(e) = &result {
                     eprintln!("compress failed: {}", e);
                 }
+                self.last_error = result.as_ref().err().map(|e| format!("Compress failed: {}", e));
                 return self.reload_both_panes();
             }
             Message::UncompressFinished(results) => {
@@ -1044,6 +1075,7 @@ impl App {
                         eprintln!("uncompress {} failed: {}", archive.display(), e);
                     }
                 }
+                self.record_batch_errors("Extract", &results);
                 return self.reload_both_panes();
             }
             Message::ExtractedToTemp(dest, result) => {
@@ -1059,6 +1091,7 @@ impl App {
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| dest.display().to_string());
                         eprintln!("extract {} failed: {}", name, e);
+                        self.last_error = Some(format!("Extract failed: {}", e));
                     }
                 }
             }
@@ -1069,6 +1102,7 @@ impl App {
                         eprintln!("delete {} failed: {}", src, e);
                     }
                 }
+                self.record_batch_errors("Delete", &results);
                 return self.reload_both_panes();
             }
             Message::Resized(size) => {
@@ -1110,6 +1144,7 @@ impl App {
                     input: String::new(),
                     selected: 0,
                     actions,
+                    dropbox_configured: self.config.dropbox_auth().is_some(),
                 });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
@@ -1128,6 +1163,7 @@ impl App {
                     input,
                     selected,
                     actions,
+                    ..
                 }) => {
                     let n = filtered_actions(actions, input).len() as i32;
                     if n > 0 {
@@ -1504,6 +1540,20 @@ impl App {
                     text_input::focus(text_input::Id::new(PROMPT_ID)),
                 ])
             }
+            PaletteAction::OpenDropbox => {
+                // Point the active pane at the Dropbox account root. The
+                // first `list_folder` mints an access token from the
+                // configured refresh token; if that's missing the action
+                // wouldn't have been offered.
+                let side = self.active;
+                return self.navigate(
+                    side,
+                    Location::Remote {
+                        backend: BackendId::new(BackendId::DROPBOX),
+                        path: PathBuf::from("/"),
+                    },
+                );
+            }
             PaletteAction::OpenClaudeCode => {
                 // Fire-and-forget: spawn a terminal with `claude` running in
                 // the active pane's directory. No modal — the action just
@@ -1534,6 +1584,14 @@ impl App {
                 focus: NewFilesFocus::No,
             });
         }
+    }
+
+    /// Record (or clear) `last_error` from a batch of per-source results.
+    /// `verb` is the capitalised action ("Copy", "Move", "Delete",
+    /// "Extract"). Delegates to the pure [`batch_error_message`].
+    fn record_batch_errors<T>(&mut self, verb: &str, results: &[(T, Result<(), String>)]) {
+        let errors = results.iter().filter_map(|(_, r)| r.as_ref().err());
+        self.last_error = batch_error_message(verb, errors);
     }
 
     /// Returns a transient status string when something async is happening.
@@ -1619,13 +1677,23 @@ impl App {
         // Black background + dim text — the quietest band we can give a row
         // that still needs to be readable. Same look for "Ready" and for any
         // in-progress task message.
-        let status_msg = self.status_text().unwrap_or_else(|| "Ready".to_string());
+        // An error from the last finished op takes precedence over the
+        // in-progress / "Ready" status and is shown in red until the next
+        // copy/move/delete/compress/extract starts.
+        let (status_msg, is_error) = match &self.last_error {
+            Some(err) => (err.clone(), true),
+            None => (self.status_text().unwrap_or_else(|| "Ready".to_string()), false),
+        };
         let status_bar: Element<'_, Message> = container(text(status_msg).size(11))
             .padding(Padding::from([4, 8]))
             .width(Length::Fill)
-            .style(|theme: &Theme| container::Style {
+            .style(move |theme: &Theme| container::Style {
                 background: Some(Color::BLACK.into()),
-                text_color: Some(dim(theme.extended_palette().background.base.text)),
+                text_color: Some(if is_error {
+                    Color::from_rgb(1.0, 0.45, 0.45)
+                } else {
+                    dim(theme.extended_palette().background.base.text)
+                }),
                 ..Default::default()
             })
             .into();
@@ -1793,10 +1861,49 @@ fn is_zip(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Build a status-bar error string for a finished batch operation, or
+/// `None` when nothing failed. `verb` is the capitalised action
+/// ("Copy", "Move", …). Surfaces the first failure verbatim, with a
+/// `(N errors)` count when more than one source failed.
+fn batch_error_message<'a>(
+    verb: &str,
+    errors: impl IntoIterator<Item = &'a String>,
+) -> Option<String> {
+    let errors: Vec<&String> = errors.into_iter().collect();
+    match errors.as_slice() {
+        [] => None,
+        [one] => Some(format!("{} failed: {}", verb, one)),
+        many => Some(format!("{} failed ({} errors): {}", verb, many.len(), many[0])),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_zip;
+    use super::{batch_error_message, is_zip};
     use std::path::Path;
+
+    #[test]
+    fn batch_error_message_none_when_all_ok() {
+        assert_eq!(batch_error_message("Copy", std::iter::empty()), None);
+    }
+
+    #[test]
+    fn batch_error_message_single_failure_is_verbatim() {
+        let errs = vec!["no such file".to_string()];
+        assert_eq!(
+            batch_error_message("Copy", errs.iter()),
+            Some("Copy failed: no such file".to_string()),
+        );
+    }
+
+    #[test]
+    fn batch_error_message_multiple_failures_shows_count_and_first() {
+        let errs = vec!["denied".to_string(), "timeout".to_string()];
+        assert_eq!(
+            batch_error_message("Delete", errs.iter()),
+            Some("Delete failed (2 errors): denied".to_string()),
+        );
+    }
 
     #[test]
     fn is_zip_matches_lowercase() {

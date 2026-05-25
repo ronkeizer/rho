@@ -31,6 +31,9 @@ to see it.
 | `folder_color` | string `#rrggbb` | `#6db4ff` | Name color for directory entries. |
 | `watch_folders` | list of strings | `["~/Downloads"]` | Folders to watch for new files. Read once at startup; restart to apply changes. |
 | `terminal_app` | string | _(auto)_ | macOS only. Which terminal app to launch for the SSH `Connect` and Docker `Shell` actions. Common values: `"iTerm"`, `"Terminal"`. Omit (or leave `None`) to auto-pick: `iTerm` when `/Applications/iTerm.app` exists, otherwise `Terminal`. Ignored on Linux / Windows. |
+| `dropbox_app_key` | string | _(unset)_ | Dropbox app key (client ID) from the [App Console](https://www.dropbox.com/developers/apps). Required to enable the Dropbox backend. |
+| `dropbox_app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
+| `dropbox_refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox_app_key` to unlock the **Open Dropbox** command. |
 
 ## Colors
 
@@ -52,6 +55,90 @@ Docker-shell actions emit AppleScript tailored to that app:
 
 That's also why the auto-pick prefers iTerm if it's installed — the
 iTerm path has a noticeably smoother launch.
+
+## Dropbox
+
+The Dropbox backend lets a pane browse, copy, move, and delete under
+`dropbox:/`. The **Open Dropbox** command palette entry is always listed,
+but stays greyed out and non-activatable until credentials are present —
+with none set, picking it does nothing.
+
+Rho never sees your Dropbox password. Instead you create a Dropbox "app",
+grant it a few scopes, and hand rho a long-lived **refresh token** that it
+exchanges on demand for short-lived access tokens (cached in-process, so
+you authorize once and it survives restarts). Access tokens never touch
+disk. All API calls shell out to `curl`, which must be on `PATH` (it ships
+with macOS and most Linux distros).
+
+### One-time setup
+
+**1. Create the app.** Go to <https://www.dropbox.com/developers/apps> →
+**Create app** → "Scoped access" → "Full Dropbox" (or "App folder" to
+sandbox it). Note the **App key** and, unless you made a PKCE app, the
+**App secret** from the Settings tab.
+
+**2. Grant scopes.** On the app's **Permissions** tab, enable:
+
+- `files.metadata.read`
+- `files.content.read`
+- `files.content.write`
+
+…and click **Submit**. Do this *before* the next step — see the gotcha
+below.
+
+**3. Authorize (get an auth code).** Open this in a browser, substituting
+your app key:
+
+```
+https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&token_access_type=offline&response_type=code
+```
+
+`token_access_type=offline` is what makes Dropbox hand back a *refresh*
+token rather than only a short-lived access token. Approve, then copy the
+one-time `code` it shows (it expires fast — do step 4 right away).
+
+**4. Exchange the code for a refresh token.**
+
+```sh
+curl -s https://api.dropbox.com/oauth2/token \
+    -d code=PASTE_CODE_HERE \
+    -d grant_type=authorization_code \
+    -d client_id=YOUR_APP_KEY \
+    -d client_secret=YOUR_APP_SECRET
+```
+
+(PKCE apps have no secret — drop `client_secret` and add
+`-d code_verifier=…` from the pair you generated for step 3.)
+
+**5. Verify the scopes, then save.** In the JSON response, the `scope`
+field **must** list the files scopes, not just `account_info.read`:
+
+```json
+"scope": "account_info.read files.content.read files.content.write files.metadata.read"
+```
+
+If it only says `account_info.read`, you authorized before submitting the
+Permissions tab — redo steps 2–4. Otherwise copy the `refresh_token` value
+into `~/.rho.yaml` alongside the key and secret, and restart rho.
+
+### Gotchas
+
+- **A refresh token is not an access token.** The App Console's "Generate
+  access token" button gives a short-lived `sl.…` access token, *not* a
+  refresh token. Pasting that yields `invalid_grant: refresh token is
+  malformed`. Refresh tokens come only from the step-3/4 flow and have no
+  `sl.` prefix.
+- **Changing scopes requires re-authorizing.** A refresh token is frozen
+  with whatever scopes existed when it was minted. Enabling more scopes on
+  the Permissions tab does **not** upgrade an existing token — you'll keep
+  getting `missing_scope` until you redo steps 3–4 and paste the new
+  token.
+- **Editing `~/.rho.yaml` doesn't drop the cached access token.** Rho
+  caches the minted access token in-process for its ~4h lifetime. After
+  swapping the refresh token, **restart rho** so it mints a fresh one.
+
+> **Note**: single-shot upload is used for files, so files over Dropbox's
+> 150 MB single-request limit aren't supported yet.
 
 ## Watch folders
 
@@ -87,4 +174,8 @@ folder_color: "#6db4ff"
 # Folders to watch for new files.
 watch_folders:
   - "~/Downloads"
+# Dropbox backend (optional). See the Dropbox section above.
+# dropbox_app_key: "xxxxxxxxxxxxxxx"
+# dropbox_app_secret: "xxxxxxxxxxxxxxx"
+# dropbox_refresh_token: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```

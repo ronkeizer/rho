@@ -52,8 +52,12 @@ previously on, looked up by name.
 
 - `Location::Local(PathBuf)` — a path on the local filesystem.
 - `Location::Remote { backend: BackendId, path: PathBuf }` — a path on a
-  registered backend. Today's only backend is **SSH** (the backend ID is
-  an alias from `~/.ssh/config`).
+  registered backend. Two backends exist today, distinguished by
+  `BackendId::kind()`:
+  - **SSH** — any backend ID; it's an alias from `~/.ssh/config`.
+  - **Dropbox** — the reserved ID `BackendId::DROPBOX` (`"dropbox"`), so a
+    Dropbox pane serializes as `dropbox:/Photos/x.jpg`. A single account
+    is supported, keyed off the credentials in `~/.rho.yaml`.
 
 The two variants share helpers (`location.path()`, `location.parent()`,
 `location.join(name)`) for purely-syntactic operations; the helpers
@@ -65,28 +69,43 @@ The dispatch point is `fs_ops::loading_tasks(side, location, generation)`:
 
 - `Local(path)` → `load_dir_task` (the streaming reader) plus a
   `git_info_task`.
-- `Remote { backend, path }` → `load_remote_dir_task`, which spawns
+- `Remote { backend, path }`, SSH → `load_remote_dir_task`, which spawns
   `ssh <backend> ls -la --time-style=full-iso -- <quoted-path>` in a
   blocking thread, parses the stdout with `parse_ls_la` (in `domain.rs`,
   unit-tested), and emits a single `EntriesChunk` + `EntriesDone`. No
   git info for remote panes — it's not worth the round-trip in the MVP.
+- `Remote { backend, path }`, Dropbox → `load_dropbox_dir_task`, which
+  pages `files/list_folder` (+ `list_folder/continue`) via `curl`, parses
+  each page with `parse_dropbox_list` (in `domain.rs`, unit-tested), and
+  emits one `EntriesChunk` + `EntriesDone`. Same fail-soft posture.
 
 **Scope of remote-pane support today**: listing + copy + move + delete.
 `copy_task` / `move_task` / `delete_task` in `fs_ops` dispatch on the
 source-and-destination `Location` combination:
 
+`fs_ops::transport(&Location)` classifies each side into `Local`,
+`Ssh(BackendId)`, or `Dropbox`, and `run_copy` / `run_move` match on the
+`(source, destination)` pair:
+
 - `Local → Local` → in-process `copy_recursive` / `move_path` /
   `delete_path` (unchanged from before remote support).
-- `Local → Remote` → one `sftp -b - <alias>` invocation per source
-  with a `put -r <src> <dst>` script.
-- `Remote → Local` → same shape with `get -r`.
-- `Remote → Remote`, same `BackendId` → `ssh <alias> 'cp -r -- …'` (or
+- `Local → Ssh` → one `sftp -b - <alias>` invocation per source
+  with a `put -r <src> <dst>` script. `Ssh → Local` uses `get -r`.
+- `Ssh → Ssh`, same `BackendId` → `ssh <alias> 'cp -r -- …'` (or
   `mv` for moves) so the operation never round-trips through the local
-  machine.
-- `Remote → Remote`, different backends → stage each source through a
-  per-call `/tmp/rho-stage-<pid>-<n>/` directory: `get` from source,
-  `put` to destination, then `rm -rf` the staging dir. Slow but
-  zero-config.
+  machine. Different SSH backends stage through `/tmp` (see below).
+- `Local ↔ Dropbox` → `files/upload` (recursive: `create_folder_v2`
+  per directory, single-shot `upload` per file) and `files/download`
+  (recursive: `get_metadata` to detect folders, then list + recurse).
+- `Dropbox → Dropbox` → server-side `files/copy_v2` / `files/move_v2`,
+  no local round-trip.
+- **Mixed remote backends** (Dropbox ↔ SSH), and different SSH hosts →
+  `stage_copy_each`: per source, fetch down to a per-call
+  `/tmp/rho-stage-<pid>-<n>/` with its own transport, push up with the
+  destination's, then remove the staging dir. Slow but zero-config.
+
+Deletes route the same way: `delete_one` dispatches local → `delete_path`,
+Dropbox → `files/delete_v2`, SSH → `ssh <alias> rm -rf`.
 
 Mutating ops still gated to local: `compress` / `uncompress` (they
 shell out to local `zip`), `EditFile` and `QuickLook` (they hand the
@@ -95,14 +114,52 @@ palette action (both expect a local cwd). The Claude-marker probe also
 short-circuits for remote panes. Remote-aware versions of those are
 future phases.
 
-**Entry point**: the existing "Connect to SSH server" palette modal
-(`⌘P` → SSH) grew a second per-row button, **Open**, that fires
-`Message::SshOpenInPane(alias)` and navigates the active pane to
-`Location::Remote { backend: alias, path: "~" }`. The remote shell
-expands `~` on the first `ls`, so there's no separate `pwd` round-trip
-to resolve home up-front. Tilde expansion is preserved by
-`fs_ops::quote_remote_path`, which leaves a leading `~` segment
-unquoted and POSIX-single-quotes only the path tail.
+When a copy / move / delete / compress / extract finishes, any per-
+source failure is surfaced in the bottom status bar (red text) via
+`App::last_error`, formatted by the pure `batch_error_message` helper
+("Copy failed: …", or "Copy failed (N errors): …" when several
+sources failed). The error persists until the next such action starts
+(cleared at the top of `PromptSubmit` and the Enter-on-zip extract).
+Full per-source detail is still logged to stderr alongside it.
+
+**Entry points**:
+
+- SSH: the "Connect to SSH server" palette modal (`⌘P` → SSH) grew a
+  second per-row button, **Open**, that fires `Message::SshOpenInPane(alias)`
+  and navigates the active pane to `Location::Remote { backend: alias,
+  path: "~" }`. The remote shell expands `~` on the first `ls`, so there's
+  no separate `pwd` round-trip to resolve home up-front.
+- Dropbox: the **Open Dropbox** palette action (`⌘P` → Dropbox) is always
+  listed (`available_palette_actions` no longer gates it), but
+  `palette_action_enabled` returns `false` — greying the row and dropping
+  its `on_press` — unless `Config::dropbox_auth()` is `Some` (credentials
+  present in `~/.rho.yaml`). The flag is captured into
+  `Prompt::CommandPalette { dropbox_configured }` at open time. When
+  enabled it navigates the active pane to `dropbox:/` — the account root.
+
+**Dropbox transport.** Like SSH, the Dropbox backend shells out — every
+call spawns `curl` (no async HTTP client in the dep tree). Access tokens
+are minted from the configured refresh token via `oauth2/token` and cached
+in-process (`fs_ops::dropbox_access_token`) until ~1 minute before expiry.
+JSON is parsed with `serde_json`; the pure parsers (`parse_dropbox_list`,
+`parse_dropbox_token`, `dropbox_error_summary`, `dropbox_api_path`) live in
+`domain.rs` and are unit-tested. Pane paths map to the API's path
+convention via `dropbox_api_path` (the root `"/"` becomes `""`).
+
+Path quoting splits on whether a remote shell is in the loop:
+
+- **Shell-backed calls** (`ls`, `cp`, `mv`, `rm`) use
+  `fs_ops::quote_remote_path`, which leaves a leading `~` segment
+  unquoted and POSIX-single-quotes only the path tail, so the remote
+  shell still expands the tilde.
+- **sftp batch calls** (`get` / `put`) use `fs_ops::quote_sftp_path`.
+  sftp speaks the SFTP protocol with no shell, so it never expands
+  `~` — but its remote working directory already defaults to the login
+  user's home. So `~` is rewritten to `.` and `~/rest` to a home-
+  relative `rest` before quoting. Passing `~/rest` through literally
+  (as the shell calls do) makes sftp resolve it as `<home>/~/rest` and
+  fail with "not found" — the reason early remote↔local copies
+  silently did nothing.
 
 ## Streaming loads with generation tags
 

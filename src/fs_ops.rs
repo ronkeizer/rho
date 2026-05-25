@@ -9,10 +9,12 @@ use std::time::Duration;
 
 use iced::{Subscription, Task};
 
+use crate::config::{Config, DropboxAuth};
 use crate::domain::{
-    detect_archive_format, parse_docker_ps, parse_git_branches, parse_ls_la, parse_ps_output,
-    parse_ssh_config, Application, ArchiveFormat, BackendId, DockerContainer, Entry, GitBranch,
-    GitInfo, Location, Process, Side, SshServer,
+    detect_archive_format, dropbox_api_path, parse_docker_ps, parse_dropbox_list,
+    parse_dropbox_token, parse_git_branches, parse_ls_la, parse_ps_output, parse_ssh_config,
+    Application, ArchiveFormat,
+    BackendId, DockerContainer, Entry, GitBranch, GitInfo, Location, Process, Side, SshServer,
 };
 use crate::Message;
 
@@ -28,6 +30,9 @@ pub fn loading_tasks(side: Side, location: Location, generation: u64) -> Task<Me
             load_dir_task(side, path.clone(), generation),
             git_info_task(side, path, generation),
         ]),
+        Location::Remote { backend, path } if backend.is_dropbox() => {
+            load_dropbox_dir_task(side, path, generation)
+        }
         Location::Remote { backend, path } => {
             load_remote_dir_task(side, backend, path, generation)
         }
@@ -192,6 +197,35 @@ fn quote_remote_path(path: &Path) -> String {
     } else {
         posix_quote(s_ref)
     }
+}
+
+/// Quote a remote path for an **sftp batch command** (`get` / `put`).
+///
+/// Unlike [`quote_remote_path`], there is no remote shell here — the
+/// sftp protocol performs no `~` expansion. But its remote working
+/// directory already defaults to the login user's home, so rho's
+/// default remote location (`~`) maps cleanly onto sftp-relative paths:
+///
+/// - `~`        → `.`              (the home directory itself)
+/// - `~/rest`   → `'rest'`         (relative to home, single-quoted)
+/// - `/abs`     → `'/abs'`         (absolute, single-quoted)
+///
+/// Passing `~/foo` through literally (as `quote_remote_path` does for
+/// the shell-backed `cp`/`mv`/`rm`/`ls` calls) makes sftp resolve it as
+/// `<home>/~/foo` and fail with "not found" — that's the bug this
+/// avoids. `~user/...` can't be resolved without a shell and rho never
+/// generates it (panes open at `~`), so it falls through to a literal
+/// quote.
+fn quote_sftp_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let s_ref: &str = &s;
+    if s_ref == "~" {
+        return ".".to_string();
+    }
+    if let Some(rest) = s_ref.strip_prefix("~/") {
+        return posix_quote(rest);
+    }
+    posix_quote(s_ref)
 }
 
 /// Subscription that watches `folders` (non-recursively) for newly-created or
@@ -375,51 +409,72 @@ pub fn delete_task(srcs: Vec<Location>) -> Task<Message> {
     )
 }
 
+/// Which transport a [`Location`] resolves to, carrying the SSH backend
+/// id where it matters for same-host shortcuts.
+enum Transport {
+    Local,
+    Ssh(BackendId),
+    Dropbox,
+}
+
+fn transport(loc: &Location) -> Transport {
+    match loc {
+        Location::Local(_) => Transport::Local,
+        Location::Remote { backend, .. } if backend.is_dropbox() => Transport::Dropbox,
+        Location::Remote { backend, .. } => Transport::Ssh(backend.clone()),
+    }
+}
+
 fn run_copy(srcs: Vec<Location>, dst: Location) -> Vec<(Location, Result<(), String>)> {
-    let src_is_local = srcs.first().map(|s| s.is_local()).unwrap_or(true);
-    match (src_is_local, &dst) {
-        (true, Location::Local(dst_dir)) => copy_local_to_local(srcs, dst_dir),
-        (true, Location::Remote { backend, path }) => {
+    use Transport::*;
+    let src_t = match srcs.first() {
+        Some(s) => transport(s),
+        None => return Vec::new(),
+    };
+    match (src_t, transport(&dst), &dst) {
+        (Local, Local, Location::Local(dst_dir)) => copy_local_to_local(srcs, dst_dir),
+        (Local, Ssh(_), Location::Remote { backend, path }) => {
             sftp_put_each(srcs, backend.clone(), path.clone())
         }
-        (false, Location::Local(dst_dir)) => {
-            let backend = match srcs.first() {
-                Some(Location::Remote { backend, .. }) => backend.clone(),
-                _ => return Vec::new(),
-            };
-            sftp_get_each(srcs, backend, dst_dir.clone())
+        (Local, Dropbox, Location::Remote { path, .. }) => dropbox_upload_each(srcs, path.clone()),
+        (Ssh(be), Local, Location::Local(dst_dir)) => sftp_get_each(srcs, be, dst_dir.clone()),
+        (Dropbox, Local, Location::Local(dst_dir)) => {
+            dropbox_download_each(srcs, dst_dir.clone())
         }
-        (false, Location::Remote { backend: dst_be, path: dst_path }) => {
-            let src_be = match srcs.first() {
-                Some(Location::Remote { backend, .. }) => backend.clone(),
-                _ => return Vec::new(),
-            };
+        (Ssh(src_be), Ssh(_), Location::Remote { backend: dst_be, path }) => {
             if src_be == *dst_be {
-                ssh_cp_each(srcs, src_be, dst_path.clone())
+                ssh_cp_each(srcs, src_be, path.clone())
             } else {
-                cross_host_copy_each(srcs, src_be, dst_be.clone(), dst_path.clone())
+                cross_host_copy_each(srcs, src_be, dst_be.clone(), path.clone())
             }
         }
+        (Dropbox, Dropbox, Location::Remote { path, .. }) => {
+            dropbox_transfer_each(srcs, path.clone(), DropboxTransfer::Copy)
+        }
+        // Mixed remote backends (Dropbox ↔ SSH): stage through local /tmp.
+        _ => stage_copy_each(srcs, dst),
     }
 }
 
 fn run_move(srcs: Vec<Location>, dst: Location) -> Vec<(Location, Result<(), String>)> {
-    // Same-host R→R uses `ssh mv` so the move is atomic and inodes
-    // survive. Every other combination is copy-then-delete-source.
-    let src_backend = match srcs.first() {
-        Some(Location::Remote { backend, .. }) => Some(backend.clone()),
-        _ => None,
+    use Transport::*;
+    // Same-backend moves are atomic server-side (ssh mv / Dropbox
+    // move_v2) and preserve identity. Local→Local keeps the
+    // rename-or-copy+delete primitive. Every other combination falls
+    // through to copy-then-delete-source.
+    let src_t = match srcs.first() {
+        Some(s) => transport(s),
+        None => return Vec::new(),
     };
-    if let (Some(src_be), Location::Remote { backend: dst_be, path: dst_path }) = (&src_backend, &dst) {
-        if src_be == dst_be {
-            return ssh_mv_each(srcs, src_be.clone(), dst_path.clone());
+    match (&src_t, transport(&dst), &dst) {
+        (Local, Local, Location::Local(dst_dir)) => return move_local_to_local(srcs, dst_dir),
+        (Ssh(src_be), Ssh(_), Location::Remote { backend: dst_be, path }) if src_be == dst_be => {
+            return ssh_mv_each(srcs, src_be.clone(), path.clone());
         }
-    }
-    if src_backend.is_none() {
-        if let Location::Local(dst_dir) = &dst {
-            // Local move keeps the rename-or-copy+delete primitive.
-            return move_local_to_local(srcs, dst_dir);
+        (Dropbox, Dropbox, Location::Remote { path, .. }) => {
+            return dropbox_transfer_each(srcs, path.clone(), DropboxTransfer::Move);
         }
+        _ => {}
     }
     // Mixed-backend / local↔remote: copy first, then if the copy
     // succeeded delete that source.
@@ -489,6 +544,7 @@ fn move_local_to_local(
 fn delete_one(loc: &Location) -> Result<(), String> {
     match loc {
         Location::Local(p) => delete_path(p).map_err(|e| e.to_string()),
+        Location::Remote { backend, path } if backend.is_dropbox() => dropbox_delete(path),
         Location::Remote { backend, path } => ssh_rm_recursive(backend, path),
     }
 }
@@ -502,7 +558,7 @@ fn sftp_put_each(
     backend: BackendId,
     dst_path: PathBuf,
 ) -> Vec<(Location, Result<(), String>)> {
-    let dst_quoted = quote_remote_path(&dst_path);
+    let dst_quoted = quote_sftp_path(&dst_path);
     srcs.into_iter()
         .map(|loc| {
             let src_path = match &loc {
@@ -529,7 +585,7 @@ fn sftp_get_each(
                 Location::Remote { path, .. } => path.clone(),
                 _ => return (loc, Err("expected remote source".to_string())),
             };
-            let remote_quoted = quote_remote_path(&remote_path);
+            let remote_quoted = quote_sftp_path(&remote_path);
             let script = build_sftp_get_script(&remote_quoted, &local_dst_quoted);
             let res = run_sftp_batch(&backend, &script);
             (loc, res)
@@ -614,7 +670,7 @@ fn cross_host_copy_one(
     let staging =
         make_staging_dir().map_err(|e| format!("failed to create staging dir: {}", e))?;
     let stage_result = (|| -> Result<(), String> {
-        let remote_quoted = quote_remote_path(remote_src);
+        let remote_quoted = quote_sftp_path(remote_src);
         let staging_quoted = posix_quote(&staging.display().to_string());
         let get = build_sftp_get_script(&remote_quoted, &staging_quoted);
         run_sftp_batch(src_backend, &get)?;
@@ -623,7 +679,7 @@ fn cross_host_copy_one(
             .ok_or_else(|| "source has no file name".to_string())?;
         let staged = staging.join(basename);
         let staged_quoted = posix_quote(&staged.display().to_string());
-        let dst_quoted = quote_remote_path(dst_path);
+        let dst_quoted = quote_sftp_path(dst_path);
         let put = build_sftp_put_script(&staged_quoted, &dst_quoted);
         run_sftp_batch(dst_backend, &put)
     })();
@@ -701,6 +757,478 @@ fn run_ssh_command(backend: &BackendId, remote_cmd: &str) -> Result<(), String> 
             stderr
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dropbox backend (HTTP API via curl)
+//
+// Mirrors the SSH backend's "shell out to a subprocess" posture: every
+// call spawns `curl`, so there's no async HTTP client in the dep tree.
+// Access tokens are minted from the configured refresh token and cached
+// in-process. Pure JSON parsing lives in `domain` (and is unit-tested);
+// everything here is I/O and therefore exercised manually.
+// ---------------------------------------------------------------------------
+
+/// Cached short-lived access token, keyed by nothing (single account).
+/// Refreshed on demand once it's within a minute of expiry.
+static DROPBOX_TOKEN: std::sync::Mutex<Option<CachedToken>> = std::sync::Mutex::new(None);
+
+struct CachedToken {
+    token: String,
+    expires_at: std::time::Instant,
+}
+
+/// Remote sibling of [`load_remote_dir_task`] for the Dropbox backend:
+/// page through `list_folder` in a blocking thread and emit a single
+/// `EntriesChunk` + `EntriesDone`. Same fail-soft posture — errors log to
+/// stderr and the pane just shows "no entries".
+pub fn load_dropbox_dir_task(side: Side, path: PathBuf, generation: u64) -> Task<Message> {
+    use iced::futures::stream::{self, StreamExt};
+
+    let entries_msg = async move {
+        let entries = tokio::task::spawn_blocking(move || run_dropbox_ls(&path))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("dropbox list task panicked: {}", e);
+                Vec::new()
+            });
+        Message::EntriesChunk(side, generation, entries)
+    };
+    let chunk = stream::once(entries_msg);
+    let done = stream::once(async move { Message::EntriesDone(side, generation) });
+    Task::stream(chunk.chain(done))
+}
+
+fn run_dropbox_ls(path: &Path) -> Vec<Entry> {
+    match dropbox_list_api(&dropbox_api_path(path)) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("dropbox list {} failed: {}", path.display(), e);
+            Vec::new()
+        }
+    }
+}
+
+/// List every child of `api_path` (`""` for the account root), following
+/// `has_more` cursors via `list_folder/continue`.
+fn dropbox_list_api(api_path: &str) -> Result<Vec<Entry>, String> {
+    let body = serde_json::json!({ "path": api_path, "recursive": false }).to_string();
+    let mut listing = parse_dropbox_list(&dropbox_rpc("files/list_folder", &body)?)?;
+    let mut entries = listing.entries;
+    while let Some(cursor) = listing.cursor {
+        let body = serde_json::json!({ "cursor": cursor }).to_string();
+        listing = parse_dropbox_list(&dropbox_rpc("files/list_folder/continue", &body)?)?;
+        entries.extend(listing.entries);
+    }
+    Ok(entries)
+}
+
+// --- copy / move / delete primitives ---------------------------------------
+
+enum DropboxTransfer {
+    Copy,
+    Move,
+}
+
+fn dropbox_delete(path: &Path) -> Result<(), String> {
+    let body = serde_json::json!({ "path": dropbox_api_path(path) }).to_string();
+    dropbox_rpc("files/delete_v2", &body).map(|_| ())
+}
+
+/// Server-side copy/move of each source into the `dst_dir` folder,
+/// preserving its basename. Both sides share the one Dropbox account.
+fn dropbox_transfer_each(
+    srcs: Vec<Location>,
+    dst_dir: PathBuf,
+    kind: DropboxTransfer,
+) -> Vec<(Location, Result<(), String>)> {
+    let dst_dir_api = dropbox_api_path(&dst_dir);
+    let endpoint = match kind {
+        DropboxTransfer::Copy => "files/copy_v2",
+        DropboxTransfer::Move => "files/move_v2",
+    };
+    srcs.into_iter()
+        .map(|loc| {
+            let res = (|| {
+                let src_path = match &loc {
+                    Location::Remote { path, .. } => path.clone(),
+                    _ => return Err("expected dropbox source".to_string()),
+                };
+                let name = src_path
+                    .file_name()
+                    .ok_or_else(|| "source has no file name".to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let body = serde_json::json!({
+                    "from_path": dropbox_api_path(&src_path),
+                    "to_path": join_dropbox(&dst_dir_api, &name),
+                })
+                .to_string();
+                dropbox_rpc(endpoint, &body).map(|_| ())
+            })();
+            (loc, res)
+        })
+        .collect()
+}
+
+// --- upload (Local → Dropbox) ----------------------------------------------
+
+fn dropbox_upload_each(
+    srcs: Vec<Location>,
+    dst_dir: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    let dst_dir_api = dropbox_api_path(&dst_dir);
+    srcs.into_iter()
+        .map(|loc| {
+            let res = (|| {
+                let src_path = match &loc {
+                    Location::Local(p) => p.clone(),
+                    _ => return Err("expected local source".to_string()),
+                };
+                let name = src_path
+                    .file_name()
+                    .ok_or_else(|| "source has no file name".to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                dropbox_upload_recursive(&src_path, &join_dropbox(&dst_dir_api, &name))
+            })();
+            (loc, res)
+        })
+        .collect()
+}
+
+fn dropbox_upload_recursive(local: &Path, dbx: &str) -> Result<(), String> {
+    let meta = std::fs::metadata(local).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        dropbox_create_folder(dbx)?;
+        for entry in std::fs::read_dir(local).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let child_name = entry.file_name().to_string_lossy().into_owned();
+            dropbox_upload_recursive(&entry.path(), &join_dropbox(dbx, &child_name))?;
+        }
+        Ok(())
+    } else {
+        dropbox_upload_file(local, dbx)
+    }
+}
+
+/// Single-request upload to the content endpoint. Fine for the typical
+/// file-manager payload; files over Dropbox's 150 MB single-shot limit
+/// would need `upload_session` (not yet implemented).
+fn dropbox_upload_file(local: &Path, dbx: &str) -> Result<(), String> {
+    let token = dropbox_access_token()?;
+    let auth = format!("Authorization: Bearer {}", token);
+    let arg = format!(
+        "Dropbox-API-Arg: {}",
+        serde_json::json!({ "path": dbx, "mode": "overwrite", "mute": true })
+    );
+    // `@<path>` makes curl read the request body from the file; passing it
+    // as its own argv token keeps paths with spaces intact (no shell).
+    let data = format!("@{}", local.display());
+    let result = run_curl(&[
+        "-X",
+        "POST",
+        "https://content.dropboxapi.com/2/files/upload",
+        "-H",
+        &auth,
+        "-H",
+        &arg,
+        "-H",
+        "Content-Type: application/octet-stream",
+        "--data-binary",
+        &data,
+    ])?;
+    if (200..300).contains(&result.status) {
+        Ok(())
+    } else {
+        Err(dropbox_error_message(&result.body, result.status))
+    }
+}
+
+fn dropbox_create_folder(dbx: &str) -> Result<(), String> {
+    let body = serde_json::json!({ "path": dbx, "autorename": false }).to_string();
+    match dropbox_rpc("files/create_folder_v2", &body) {
+        Ok(_) => Ok(()),
+        // A pre-existing folder is fine for a recursive upload.
+        Err(e) if e.contains("conflict") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+// --- download (Dropbox → Local) --------------------------------------------
+
+fn dropbox_download_each(
+    srcs: Vec<Location>,
+    dst_dir: PathBuf,
+) -> Vec<(Location, Result<(), String>)> {
+    srcs.into_iter()
+        .map(|loc| {
+            let res = (|| {
+                let src_path = match &loc {
+                    Location::Remote { path, .. } => path.clone(),
+                    _ => return Err("expected dropbox source".to_string()),
+                };
+                let name = src_path
+                    .file_name()
+                    .ok_or_else(|| "source has no file name".to_string())?
+                    .to_owned();
+                dropbox_download_recursive(&dropbox_api_path(&src_path), &dst_dir.join(name))
+            })();
+            (loc, res)
+        })
+        .collect()
+}
+
+fn dropbox_download_recursive(dbx: &str, local: &Path) -> Result<(), String> {
+    if dropbox_is_folder(dbx)? {
+        std::fs::create_dir_all(local).map_err(|e| e.to_string())?;
+        for child in dropbox_list_api(dbx)? {
+            dropbox_download_recursive(&join_dropbox(dbx, &child.name), &local.join(&child.name))?;
+        }
+        Ok(())
+    } else {
+        dropbox_download_file(dbx, local)
+    }
+}
+
+fn dropbox_is_folder(dbx: &str) -> Result<bool, String> {
+    let body = serde_json::json!({ "path": dbx }).to_string();
+    let resp = dropbox_rpc("files/get_metadata", &body)?;
+    let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
+    Ok(v.get(".tag").and_then(|t| t.as_str()) == Some("folder"))
+}
+
+fn dropbox_download_file(dbx: &str, local: &Path) -> Result<(), String> {
+    let token = dropbox_access_token()?;
+    let auth = format!("Authorization: Bearer {}", token);
+    let arg = format!("Dropbox-API-Arg: {}", serde_json::json!({ "path": dbx }));
+    let local_str = local.display().to_string();
+    let result = run_curl(&[
+        "-X",
+        "POST",
+        "https://content.dropboxapi.com/2/files/download",
+        "-H",
+        &auth,
+        "-H",
+        &arg,
+        "-o",
+        &local_str,
+    ])?;
+    if (200..300).contains(&result.status) {
+        Ok(())
+    } else {
+        // On error the JSON body was written to the output file; read it
+        // back for the message, then remove the bogus file.
+        let msg = std::fs::read_to_string(local)
+            .ok()
+            .and_then(|b| crate::domain::dropbox_error_summary(&b))
+            .unwrap_or_else(|| format!("download failed (HTTP {})", result.status));
+        let _ = std::fs::remove_file(local);
+        Err(msg)
+    }
+}
+
+// --- cross-backend staging (Dropbox ↔ SSH) ---------------------------------
+
+/// Copy each source by staging it through a local `/tmp` directory: fetch
+/// the source down with its own transport, then push it up with the
+/// destination's. Used only for mixed remote backends.
+fn stage_copy_each(srcs: Vec<Location>, dst: Location) -> Vec<(Location, Result<(), String>)> {
+    srcs.into_iter()
+        .map(|loc| {
+            let res = stage_copy_one(&loc, &dst);
+            (loc, res)
+        })
+        .collect()
+}
+
+fn stage_copy_one(src: &Location, dst: &Location) -> Result<(), String> {
+    let staging =
+        make_staging_dir().map_err(|e| format!("failed to create staging dir: {}", e))?;
+    let result = (|| {
+        let staged = fetch_to_local(src, &staging)?;
+        push_from_local(&staged, dst)
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn fetch_to_local(src: &Location, staging: &Path) -> Result<PathBuf, String> {
+    let name = src
+        .path()
+        .file_name()
+        .ok_or_else(|| "source has no file name".to_string())?
+        .to_owned();
+    let staged = staging.join(&name);
+    match src {
+        Location::Local(p) => {
+            copy_recursive(p, &staged).map_err(|e| e.to_string())?;
+        }
+        Location::Remote { backend, path } if backend.is_dropbox() => {
+            dropbox_download_recursive(&dropbox_api_path(path), &staged)?;
+        }
+        Location::Remote { backend, path } => {
+            let remote_quoted = quote_sftp_path(path);
+            let staging_quoted = posix_quote(&staging.display().to_string());
+            let script = build_sftp_get_script(&remote_quoted, &staging_quoted);
+            run_sftp_batch(backend, &script)?;
+        }
+    }
+    Ok(staged)
+}
+
+fn push_from_local(local: &Path, dst: &Location) -> Result<(), String> {
+    match dst {
+        Location::Local(dst_dir) => {
+            let name = local
+                .file_name()
+                .ok_or_else(|| "staged file has no name".to_string())?;
+            copy_recursive(local, &dst_dir.join(name)).map_err(|e| e.to_string())
+        }
+        Location::Remote { backend, path } if backend.is_dropbox() => {
+            let name = local
+                .file_name()
+                .ok_or_else(|| "staged file has no name".to_string())?
+                .to_string_lossy()
+                .into_owned();
+            dropbox_upload_recursive(local, &join_dropbox(&dropbox_api_path(path), &name))
+        }
+        Location::Remote { backend, path } => {
+            let local_quoted = posix_quote(&local.display().to_string());
+            let dst_quoted = quote_sftp_path(path);
+            let script = build_sftp_put_script(&local_quoted, &dst_quoted);
+            run_sftp_batch(backend, &script)
+        }
+    }
+}
+
+// --- transport: tokens + curl ----------------------------------------------
+
+/// Join a Dropbox folder path (`""` for root, else `/Folder`) with a child
+/// name, yielding a leading-slash absolute Dropbox path.
+fn join_dropbox(dir_api: &str, name: &str) -> String {
+    format!("{}/{}", dir_api.trim_end_matches('/'), name)
+}
+
+/// POST a JSON body to `https://api.dropboxapi.com/2/<endpoint>` with the
+/// current access token. Non-2xx responses become `Err` with Dropbox's
+/// `error_summary` where available.
+fn dropbox_rpc(endpoint: &str, body: &str) -> Result<String, String> {
+    let token = dropbox_access_token()?;
+    let url = format!("https://api.dropboxapi.com/2/{}", endpoint);
+    let auth = format!("Authorization: Bearer {}", token);
+    let result = run_curl(&[
+        "-X",
+        "POST",
+        &url,
+        "-H",
+        &auth,
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        body,
+    ])?;
+    if (200..300).contains(&result.status) {
+        Ok(result.body)
+    } else {
+        Err(dropbox_error_message(&result.body, result.status))
+    }
+}
+
+fn dropbox_error_message(body: &str, status: u16) -> String {
+    crate::domain::dropbox_error_summary(body).unwrap_or_else(|| {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            format!("Dropbox API error (HTTP {})", status)
+        } else {
+            format!("Dropbox API error (HTTP {}): {}", status, trimmed)
+        }
+    })
+}
+
+/// Return a valid access token, refreshing from the configured refresh
+/// token when the cached one is missing or about to expire.
+fn dropbox_access_token() -> Result<String, String> {
+    {
+        let cache = DROPBOX_TOKEN.lock().unwrap();
+        if let Some(c) = cache.as_ref() {
+            if c.expires_at > std::time::Instant::now() + Duration::from_secs(60) {
+                return Ok(c.token.clone());
+            }
+        }
+    }
+    let auth = Config::load()
+        .dropbox_auth()
+        .ok_or_else(|| "Dropbox credentials not configured in ~/.rho.yaml".to_string())?;
+    let (token, expires_in) = dropbox_exchange_refresh(&auth)?;
+    let mut cache = DROPBOX_TOKEN.lock().unwrap();
+    *cache = Some(CachedToken {
+        token: token.clone(),
+        expires_at: std::time::Instant::now() + Duration::from_secs(expires_in),
+    });
+    Ok(token)
+}
+
+fn dropbox_exchange_refresh(auth: &DropboxAuth) -> Result<(String, u64), String> {
+    // Credentials are passed as `-d` form fields; on a shared machine
+    // they're briefly visible in `ps`. Acceptable for a personal file
+    // manager, same trade-off as the ssh subprocess calls.
+    let refresh = format!("refresh_token={}", auth.refresh_token);
+    let client_id = format!("client_id={}", auth.app_key);
+    let mut args: Vec<&str> = vec![
+        "-X",
+        "POST",
+        "https://api.dropbox.com/oauth2/token",
+        "-d",
+        "grant_type=refresh_token",
+        "-d",
+        &refresh,
+        "-d",
+        &client_id,
+    ];
+    let secret;
+    if let Some(s) = &auth.app_secret {
+        secret = format!("client_secret={}", s);
+        args.push("-d");
+        args.push(&secret);
+    }
+    let result = run_curl(&args)?;
+    if !(200..300).contains(&result.status) {
+        return Err(dropbox_error_message(&result.body, result.status));
+    }
+    parse_dropbox_token(&result.body)
+}
+
+struct CurlResult {
+    status: u16,
+    body: String,
+}
+
+/// Run `curl` with the given args plus a trailing `-w` that appends the
+/// HTTP status code on its own line, so we can recover both the body and
+/// the status from one invocation. A status of 0 (connection failure)
+/// becomes an `Err` carrying curl's stderr.
+fn run_curl(args: &[&str]) -> Result<CurlResult, String> {
+    let output = std::process::Command::new("curl")
+        .args(["-s", "-S"])
+        .args(args)
+        .args(["-w", "\n%{http_code}"])
+        .output()
+        .map_err(|e| format!("failed to spawn curl: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (body, status) = match stdout.rsplit_once('\n') {
+        Some((b, s)) => (b.to_string(), s.trim().parse::<u16>().unwrap_or(0)),
+        None => (stdout.to_string(), 0),
+    };
+    if status == 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "curl request failed".to_string()
+        } else {
+            stderr
+        });
+    }
+    Ok(CurlResult { status, body })
 }
 
 pub fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -1863,6 +2391,35 @@ mod tests {
         // remote shell expands to $HOME.
         assert_eq!(quote_remote_path(Path::new("~")), "~".to_string());
         assert_eq!(quote_remote_path(Path::new("~user")), "~user".to_string());
+    }
+
+    #[test]
+    fn quote_sftp_path_maps_bare_tilde_to_dot() {
+        // sftp has no shell + its cwd defaults to home, so `~` is the
+        // home dir itself → ".".
+        assert_eq!(quote_sftp_path(Path::new("~")), ".".to_string());
+    }
+
+    #[test]
+    fn quote_sftp_path_strips_leading_tilde_slash() {
+        // `~/file` must become the home-relative `'file'`, NOT a literal
+        // `~/file` (which sftp resolves as `<home>/~/file` and fails).
+        assert_eq!(
+            quote_sftp_path(Path::new("~/rho-tilde-test.txt")),
+            "'rho-tilde-test.txt'".to_string(),
+        );
+        assert_eq!(
+            quote_sftp_path(Path::new("~/Documents/My File.txt")),
+            "'Documents/My File.txt'".to_string(),
+        );
+    }
+
+    #[test]
+    fn quote_sftp_path_quotes_absolute_path_whole() {
+        assert_eq!(
+            quote_sftp_path(Path::new("/var/log/syslog")),
+            "'/var/log/syslog'".to_string(),
+        );
     }
 
     #[test]

@@ -75,7 +75,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -275,6 +275,28 @@ the first non-wildcard pattern becomes the entry's alias.
 
 If `~/.ssh/config` is missing or contains no specific Host entries,
 the modal shows an explanatory message instead of an empty list.
+
+### Open Dropbox
+
+Picking **Open Dropbox** from the command palette points the active pane
+at the Dropbox account root (`dropbox:/`). The entry is **always listed**
+so the feature is discoverable, but it's only activatable when Dropbox
+credentials are present in `~/.rho.yaml` (see
+[Configuration → Dropbox](./configuration.md#dropbox)). Without them the
+row is greyed out and non-clickable, with a hint to set credentials in
+`~/.rho.yaml`.
+
+Navigation (`Enter`, `Backspace`, arrow keys) works as normal, with each
+step paging `files/list_folder` over the Dropbox API. The pane header
+shows `dropbox:<path>`.
+
+**What works against Dropbox panes today**: directory listing, `F5`/`F6`
+(Copy/Move) in either direction between local and Dropbox, copy/move
+within Dropbox (server-side `copy_v2` / `move_v2`), copy/move between
+Dropbox and an SSH host (stages through local `/tmp`), and `Delete` on
+Dropbox selections (`delete_v2`). The same local-only actions that no-op
+for SSH panes (Compress / Uncompress, `F4` Edit, Space Quick Look, Open
+Claude Code, Git: branch) also no-op for Dropbox panes.
 
 ### Open Claude Code in this folder
 
