@@ -211,6 +211,42 @@ based on state. That's why, for example, `Backspace` always emits
 characters, the subscription stays silent — that's why Delete-modal-Enter
 handling needs the explicit redirect described above.
 
+## Folder watching (two watchers)
+
+Both live in `fs_ops.rs` on top of the `notify` crate, each a
+`Subscription::run_with_id` wrapping a `recommended_watcher` whose events
+are coalesced by a quiet-window debounce before reaching `update`:
+
+- **`file_watch_subscription`** watches the configured `watch_folders`
+  (`~/.rho.yaml`) for *new* files and emits `NewFilesDetected`, which pops
+  the `NewFiles` modal. Its id is the constant `"file-watcher"` and its
+  folder set is read once at startup.
+- **`pane_watch_subscription`** watches the two panes' *currently open*
+  local directories and emits `WatchedDirChanged`, which auto-refreshes any
+  pane showing that folder via `App::refresh_local_dir` → `Pane::reload`.
+  Because the watched set changes as the user navigates, its
+  `run_with_id` id is keyed off the folder list (`("pane-dir-watch",
+  folders)`) — so iced tears the watcher down and restarts it on the new
+  directories whenever a pane moves. Remote panes aren't watched.
+
+The pane watcher reacts to creates, removes, and renames (structural
+changes to the listing; content/metadata edits are ignored as noise, as
+are dotfiles and in-progress download temps via
+`is_ignored_watch_filename`). Its debounce is a **quiet window** (300 ms,
+pushed out on each event so a burst collapses) bounded by a **hard cap**
+(1.5 s, so a sustained stream — e.g. 500 files being moved in — still
+refreshes periodically instead of starving). A refresh re-reads the
+directory, so it never generates events that would feed back into the
+watcher.
+
+`Pane::reload` differs from `navigate`: it keeps the filter, sort, and
+scroll position and re-homes the cursor onto the same entry by name (via
+`pending_focus` with `focus_jump = false`, so the viewport doesn't jump —
+contrast the "jump to a freshly-detected file" path used by the new-file
+modal, which sets `focus_jump = true`). It still bumps the load generation
+and streams through the same tagged-chunk path, so a refresh mid-load
+can't leak stale rows.
+
 ## Async file ops
 
 `copy_task` and `delete_task` are one-shot: a `spawn_blocking` processes

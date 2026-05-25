@@ -354,6 +354,120 @@ fn is_ignored_watch_filename(name: &str) -> bool {
     matches!(ext.as_str(), "crdownload" | "part" | "download" | "tmp")
 }
 
+/// Subscription that watches the panes' currently-open directories
+/// (non-recursive) and emits a coalesced [`Message::WatchedDirChanged`] per
+/// folder when files are created, removed, or renamed there — so the listing
+/// auto-refreshes on external changes. A burst (e.g. 500 files moved in)
+/// collapses into a single refresh via a quiet-window debounce, with a hard
+/// cap so a sustained stream still refreshes periodically rather than starving.
+///
+/// Differs from [`file_watch_subscription`] (the configured-`watch_folders`
+/// new-file detector) in two ways: it reacts to removes/renames too, and its
+/// folder set changes as the user navigates — the caller keys the
+/// subscription id off `folders` so iced restarts the watcher on the new set.
+pub fn pane_watch_subscription(folders: Vec<PathBuf>) -> Subscription<Message> {
+    use iced::futures::SinkExt;
+    use iced::stream;
+    use notify::{
+        event::ModifyKind, recommended_watcher, Event, EventKind, RecursiveMode, Watcher,
+    };
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    Subscription::run_with_id(
+        ("pane-dir-watch", folders.clone()),
+        stream::channel(64, move |mut output| async move {
+            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Event>(256);
+
+            let mut watcher = match recommended_watcher(move |res| {
+                if let Ok(event) = res {
+                    let _ = raw_tx.blocking_send(event);
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("pane watcher: init failed: {}", e);
+                    return;
+                }
+            };
+
+            for folder in &folders {
+                if let Err(e) = watcher.watch(folder, RecursiveMode::NonRecursive) {
+                    eprintln!("pane watcher: skipping {}: {}", folder.display(), e);
+                }
+            }
+
+            // Coalesce changes per folder. `quiet` collapses a burst (the
+            // deadline is pushed out on every event); `max_wait` bounds the
+            // total delay so a long-running stream of changes still flushes.
+            let mut changed: HashSet<PathBuf> = HashSet::new();
+            let mut quiet_deadline: Option<Instant> = None;
+            let mut hard_deadline: Option<Instant> = None;
+            let quiet = Duration::from_millis(300);
+            let max_wait = Duration::from_millis(1500);
+            let idle_timeout = Duration::from_secs(3600);
+
+            loop {
+                let wait = match (quiet_deadline, hard_deadline) {
+                    (Some(q), Some(h)) => q.min(h).saturating_duration_since(Instant::now()),
+                    _ => idle_timeout,
+                };
+
+                tokio::select! {
+                    maybe_evt = raw_rx.recv() => {
+                        let Some(event) = maybe_evt else { break };
+                        // Structural changes to the listing: add / remove /
+                        // rename. Content/metadata edits are intentionally
+                        // ignored (chatty, and don't change membership).
+                        let relevant = matches!(
+                            event.kind,
+                            EventKind::Create(_)
+                                | EventKind::Remove(_)
+                                | EventKind::Modify(ModifyKind::Name(_))
+                        );
+                        if !relevant {
+                            continue;
+                        }
+                        for path in event.paths {
+                            if let Some(name) =
+                                path.file_name().map(|n| n.to_string_lossy().into_owned())
+                            {
+                                // Skip noise (.DS_Store, in-progress downloads)
+                                // so it doesn't trigger spurious refreshes.
+                                if is_ignored_watch_filename(&name) {
+                                    continue;
+                                }
+                            }
+                            // Non-recursive: only changes directly inside a
+                            // watched folder count (some backends report
+                            // adjacent paths).
+                            if let Some(parent) = path.parent() {
+                                if folders.iter().any(|f| f == parent) {
+                                    changed.insert(parent.to_path_buf());
+                                }
+                            }
+                        }
+                        if !changed.is_empty() {
+                            let now = Instant::now();
+                            quiet_deadline = Some(now + quiet);
+                            hard_deadline.get_or_insert(now + max_wait);
+                        }
+                    }
+                    _ = tokio::time::sleep(wait), if quiet_deadline.is_some() => {
+                        for folder in changed.drain() {
+                            let _ = output.send(Message::WatchedDirChanged(folder)).await;
+                        }
+                        quiet_deadline = None;
+                        hard_deadline = None;
+                    }
+                }
+            }
+
+            drop(watcher);
+        }),
+    )
+}
+
 /// Copy a batch of sources into `dst`. By construction the caller pulls
 /// `srcs` from the active pane's `marked_locations`, so every source
 /// shares the same backend (all `Local`, or all `Remote` with the same

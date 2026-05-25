@@ -1339,9 +1339,15 @@ pub struct Pane {
     pub has_claude_dir: bool,
     /// Name of an entry the cursor should land on as soon as it appears in
     /// the streaming load. Used to focus on a newly-detected file after the
-    /// "new files" modal opens its folder. Cleared on `navigate()`, or when
-    /// the entry has been located.
+    /// "new files" modal opens its folder, and to re-home the cursor after an
+    /// in-place `reload()`. Cleared on `navigate()`, or when the entry has
+    /// been located.
     pub pending_focus: Option<String>,
+    /// When `pending_focus` resolves, whether to recenter the scroll on it
+    /// (`true` — the "jump to a freshly-detected file" case) or leave the
+    /// scroll where it is (`false` — an in-place `reload()`, so an external
+    /// change doesn't yank the viewport around).
+    pub focus_jump: bool,
 }
 
 impl Pane {
@@ -1363,6 +1369,7 @@ impl Pane {
             has_claude_md: false,
             has_claude_dir: false,
             pending_focus: None,
+            focus_jump: false,
         }
     }
 
@@ -1416,6 +1423,27 @@ impl Pane {
         // A fresh navigation overrides any in-flight focus request. The caller
         // re-sets pending_focus *after* navigate() if it wants one.
         self.pending_focus = None;
+        self.focus_jump = false;
+        self.load_generation
+    }
+
+    /// Reload the current directory *in place* — re-stream a fresh listing
+    /// with a new generation, but unlike `navigate()` keep the filter, sort,
+    /// and scroll position, and re-home the cursor onto the same entry by name
+    /// (via `pending_focus` with `focus_jump = false`, so the viewport doesn't
+    /// jump). Used by the folder watcher to refresh after an external change
+    /// without disrupting what the user was doing. If the cursor's entry is
+    /// gone the cursor falls back to the top.
+    pub fn reload(&mut self) -> u64 {
+        self.pending_focus = self.cursor_name();
+        self.focus_jump = false;
+        self.entries.clear();
+        self.visible_indices.clear();
+        self.selected = 0;
+        self.anchor = 0;
+        self.loading = true;
+        self.load_generation += 1;
+        self.git_info = None;
         self.load_generation
     }
 
@@ -2126,6 +2154,34 @@ this is not an ls line
         assert_eq!(p.anchor, 0);
         assert!(p.loading);
         assert!(p.git_info.is_none());
+    }
+
+    #[test]
+    fn reload_keeps_filter_and_rehomes_cursor_without_jump() {
+        let mut p = pane_with_entries(
+            "/dir",
+            vec![mk_entry("alpha", false, Some(1)), mk_entry("apex", false, Some(2))],
+        );
+        p.filter = "ap".to_string();
+        p.recompute_visible(None);
+        p.selected = 1; // first matching entry (row 0 is "..")
+        let cursor = p.cursor_name();
+        assert!(cursor.is_some());
+        let gen_before = p.load_generation;
+
+        let gen_after = p.reload();
+
+        // Fresh generation + cleared listing, like navigate…
+        assert_eq!(gen_after, gen_before + 1);
+        assert!(p.entries.is_empty());
+        assert!(p.visible_indices.is_empty());
+        assert!(p.loading);
+        assert!(p.git_info.is_none());
+        // …but the filter survives and the cursor is queued for re-homing
+        // by name, with the scroll-jump suppressed.
+        assert_eq!(p.filter, "ap");
+        assert_eq!(p.pending_focus, cursor);
+        assert!(!p.focus_jump);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use iced::keyboard::{self, key::Named, Key, Modifiers};
@@ -27,7 +27,7 @@ use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
     docker_shell, extract_to_temp_task, file_watch_subscription, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, move_task, open_claude_code,
-    ps_task, ssh_connect, ssh_servers_task, uncompress_task,
+    pane_watch_subscription, ps_task, ssh_connect, ssh_servers_task, uncompress_task,
 };
 use view_modal::view_modal;
 use view_pane::{name_max_chars, scroll_id, view_pane, viewport_height_estimate};
@@ -119,6 +119,9 @@ pub(crate) enum Message {
     Resized(Size),
     /// The watcher subscription noticed new files in `folder`.
     NewFilesDetected(PathBuf, Vec<String>),
+    /// The pane-folder watcher coalesced one-or-more filesystem changes in
+    /// `folder` (debounced). Any pane currently showing it reloads in place.
+    WatchedDirChanged(PathBuf),
     /// User picked a pane in the NewFiles modal.
     NewFilesPickSide(Side),
     /// Open the command-palette modal (Cmd+Shift+P).
@@ -488,6 +491,25 @@ impl App {
             loading_tasks(Side::Left, left_loc, left_gen),
             loading_tasks(Side::Right, right_loc, right_gen),
         ])
+    }
+
+    /// Reload, in place, any pane currently showing the local directory
+    /// `path` (both, if they show the same folder). Driven by the debounced
+    /// folder watcher. `Pane::reload` keeps the filter/sort/scroll and
+    /// re-homes the cursor, and routes through the same generation-tagged
+    /// streaming load as a navigate, so a refresh mid-load can't leak stale
+    /// rows. Remote panes aren't watched, so they never match here.
+    fn refresh_local_dir(&mut self, path: &Path) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for side in [Side::Left, Side::Right] {
+            let loc = self.pane(side).location.clone();
+            if matches!(&loc, Location::Local(p) if p == path) {
+                let generation = self.pane_mut(side).reload();
+                refresh_claude_marker(self.pane_mut(side));
+                tasks.push(loading_tasks(side, loc, generation));
+            }
+        }
+        Task::batch(tasks)
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
@@ -1128,7 +1150,13 @@ impl App {
                 let pane = self.pane_mut(side);
                 if pane.load_generation == generation {
                     pane.append_chunk(chunk);
-                    if had_pending && self.pane(side).pending_focus.is_none() {
+                    // The chunk that resolves a focus request recenters the
+                    // scroll only for a "jump to new file" focus; an in-place
+                    // reload (focus_jump = false) keeps the viewport steady.
+                    if had_pending
+                        && self.pane(side).pending_focus.is_none()
+                        && self.pane(side).focus_jump
+                    {
                         return self.scroll_to_focused(side);
                     }
                     return self.ensure_active_visible();
@@ -1247,6 +1275,9 @@ impl App {
             Message::Resized(size) => {
                 self.window_size = size;
             }
+            Message::WatchedDirChanged(folder) => {
+                return self.refresh_local_dir(&folder);
+            }
             Message::NewFilesDetected(folder, files) => {
                 if files.is_empty() {
                     // Shouldn't happen — the watcher only emits non-empty
@@ -1268,8 +1299,12 @@ impl App {
                     // The watcher accumulates names in arrival order within a
                     // burst, so `.last()` is the most-recently-added file.
                     // navigate() just cleared pending_focus; set it after.
+                    // focus_jump = true so the cursor recenters on the new
+                    // file (a reload, by contrast, leaves it false).
                     if let Some(latest) = files.last().cloned() {
-                        self.pane_mut(side).pending_focus = Some(latest);
+                        let pane = self.pane_mut(side);
+                        pane.pending_focus = Some(latest);
+                        pane.focus_jump = true;
                     }
                     self.active = side;
                     self.save_state();
@@ -1958,6 +1993,24 @@ impl App {
             .collect();
         if !watched.is_empty() {
             subs.push(file_watch_subscription(watched));
+        }
+
+        // Watch the panes' own open directories and auto-refresh on change.
+        // Unlike the configured watch_folders above, this set changes as the
+        // user navigates, so `pane_watch_subscription` keys its id off the
+        // folder list — iced restarts the watcher when the panes move.
+        let mut pane_dirs: Vec<PathBuf> = [&self.left, &self.right]
+            .into_iter()
+            .filter_map(|p| match &p.location {
+                Location::Local(path) => Some(path.clone()),
+                Location::Remote { .. } => None,
+            })
+            .filter(|p| p.is_dir())
+            .collect();
+        pane_dirs.sort();
+        pane_dirs.dedup();
+        if !pane_dirs.is_empty() {
+            subs.push(pane_watch_subscription(pane_dirs));
         }
 
         Subscription::batch(subs)
