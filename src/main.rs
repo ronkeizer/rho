@@ -17,7 +17,7 @@ use config::{
 };
 use domain::{
     add_recent, available_palette_actions, default_zip_filename, filtered_actions, filtered_apps,
-    filtered_branches, filtered_recents, filtered_servers, sort_apps,
+    filtered_branches, filtered_recents, filtered_servers, modal_scroll_target, sort_apps,
     sort_containers, sort_entries, sort_processes, Application, AppsState, BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
@@ -33,6 +33,12 @@ use view_modal::view_modal;
 use view_pane::{name_max_chars, scroll_id, view_pane, viewport_height_estimate};
 
 pub(crate) const PROMPT_ID: &str = "prompt";
+/// Shared scroll id for the modal list scrollables. Only one modal is open at
+/// a time, so a single id suffices. `modal_scroll_to_selected` snaps it to
+/// follow the keyboard cursor in the navigable modals (Go to folder, Apps, Git
+/// branches, SSH servers); the mouse-only lists (Docker, Processes) carry the
+/// id too but are never snapped.
+pub(crate) const MODAL_LIST_ID: &str = "modal-list";
 const RECENT_CAP: usize = 50;
 /// Enter on a `.zip` over this size pops a confirmation modal before we
 /// shell out to `unzip`. 100 MiB.
@@ -80,6 +86,10 @@ pub(crate) enum Message {
     ActivateSelection,
     ToggleSort(Side, SortBy),
     Scrolled(Side, f32, f32),
+    /// A selection modal's list scrolled: (scroll_y, viewport_height,
+    /// content_height). Lets `modal_scroll_to_selected` track the real
+    /// geometry so it only scrolls the cursor into view when off-page.
+    ModalScrolled(f32, f32, f32),
     OpenPrompt,
     OpenCopyPrompt,
     OpenMovePrompt,
@@ -195,6 +205,16 @@ struct App {
     /// Most-recently-visited directories, front-first. Persisted to
     /// `~/.rho-state.yaml`. Updated on every successful navigate.
     recent_locations: Vec<PathBuf>,
+    /// Scroll state of the open selection modal's list, so the keyboard
+    /// cursor only scrolls the list when it would leave the viewport (see
+    /// `modal_scroll_to_selected`). `scroll_y` is the current top offset
+    /// (reset to 0 when a list modal opens, maintained by both our own
+    /// scroll commands and the user's `ModalScrolled` events); the viewport
+    /// height and per-row height come from the scrollable on the first scroll
+    /// and fall back to per-modal estimates before then.
+    modal_scroll_y: f32,
+    modal_viewport_h: Option<f32>,
+    modal_row_h: Option<f32>,
 }
 
 impl App {
@@ -246,6 +266,9 @@ impl App {
             last_error: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
+            modal_scroll_y: 0.0,
+            modal_viewport_h: None,
+            modal_row_h: None,
         };
         // Stat the initial pane paths for the CLAUDE.md / .claude marker so
         // the info bar shows on startup, not just after the first navigate.
@@ -364,6 +387,94 @@ impl App {
         let y = (row_top - vh / 3.0).max(0.0);
         pane.scroll_y = y;
         scrollable::scroll_to(scroll_id(side), scrollable::AbsoluteOffset { x: 0.0, y })
+    }
+
+    /// `(selected, row_count)` for the open selection modal whose list is
+    /// keyboard-navigable and shares `MODAL_LIST_ID` (Go to folder / Apps /
+    /// Git branches / SSH servers). `None` for everything else — modals with
+    /// no cursor or no scrollable list (Command Palette, Docker, Processes).
+    fn current_modal_selection(&self) -> Option<(usize, usize)> {
+        match self.prompt.as_ref() {
+            Some(Prompt::Open {
+                input,
+                recents,
+                selected,
+            }) => {
+                let n = filtered_recents(recents, input).len();
+                (n > 0).then_some((*selected, n))
+            }
+            Some(Prompt::Apps {
+                state: AppsState::Loaded(list),
+                input,
+                selected,
+            }) => {
+                let n = filtered_apps(list, input).len();
+                (n > 0).then_some((*selected, n))
+            }
+            Some(Prompt::GitBranches {
+                state: GitBranchesState::Loaded(list),
+                input,
+                selected,
+                ..
+            }) => {
+                let n = filtered_branches(list, input).len();
+                (n > 0).then_some((*selected, n))
+            }
+            Some(Prompt::SshServers {
+                state: SshServersState::Loaded(list),
+                input,
+                selected,
+            }) => {
+                let n = filtered_servers(list, input).len();
+                (n > 0).then_some((*selected, n))
+            }
+            _ => None,
+        }
+    }
+
+    /// (viewport_height, row_height) estimates used before the modal list has
+    /// reported real geometry via `ModalScrolled`. The Go-to-folder list is
+    /// 240px tall with slightly taller rows; the rest are 360px. Once a scroll
+    /// happens the tracked values take over and these stop mattering.
+    fn modal_fallback_geometry(&self) -> (f32, f32) {
+        match self.prompt.as_ref() {
+            Some(Prompt::Open { .. }) => (240.0, 26.0),
+            _ => (360.0, 23.0),
+        }
+    }
+
+    /// Reset the tracked modal scroll state. Called when a list modal opens so
+    /// the fresh scrollable (which starts at the top) isn't judged against a
+    /// previous modal's offset/geometry.
+    fn reset_modal_scroll(&mut self) {
+        self.modal_scroll_y = 0.0;
+        self.modal_viewport_h = None;
+        self.modal_row_h = None;
+    }
+
+    /// Scroll the open selection modal's list so the highlighted row stays in
+    /// view — but only when it would otherwise leave the viewport, so the list
+    /// doesn't drift on every arrow press (`modal_scroll_target`). Mirrors the
+    /// panes' `ensure_active_visible`, using the scroll offset / viewport /
+    /// row height tracked from `ModalScrolled` (falling back to per-modal
+    /// estimates before the first scroll).
+    fn modal_scroll_to_selected(&mut self) -> Task<Message> {
+        let Some((selected, _n)) = self.current_modal_selection() else {
+            return Task::none();
+        };
+        let (fallback_vh, fallback_row_h) = self.modal_fallback_geometry();
+        let vh = self.modal_viewport_h.unwrap_or(fallback_vh);
+        let row_h = self.modal_row_h.unwrap_or(fallback_row_h);
+        match modal_scroll_target(selected, row_h, vh, self.modal_scroll_y) {
+            Some(y) => {
+                self.modal_scroll_y = y;
+                scrollable::scroll_to(
+                    scrollable::Id::new(MODAL_LIST_ID),
+                    scrollable::AbsoluteOffset { x: 0.0, y },
+                )
+            }
+            None => Task::none(),
+        }
     }
 
     fn reload_both_panes(&mut self) -> Task<Message> {
@@ -573,7 +684,20 @@ impl App {
                 pane.scroll_y = scroll_y;
                 pane.viewport_height = Some(vh);
             }
+            Message::ModalScrolled(scroll_y, vh, content_h) => {
+                self.modal_scroll_y = scroll_y;
+                self.modal_viewport_h = Some(vh);
+                // Uniform rows: content_height / row_count is the row height.
+                // Capture it against the current count so a later filter that
+                // changes the count doesn't skew the stored height.
+                if let Some((_, n)) = self.current_modal_selection() {
+                    if n > 0 {
+                        self.modal_row_h = Some(content_h / n as f32);
+                    }
+                }
+            }
             Message::OpenPrompt => {
+                self.reset_modal_scroll();
                 self.prompt = Some(Prompt::Open {
                     input: String::new(),
                     recents: self.recent_locations.clone(),
@@ -697,6 +821,10 @@ impl App {
                         | Prompt::NewFiles { .. }
                         | Prompt::KeyboardShortcuts => {}
                     }
+                    // Filtering shifts which row the (clamped) cursor points at,
+                    // so re-follow it — e.g. typing to a single match should
+                    // bring that row into view.
+                    return self.modal_scroll_to_selected();
                 }
             }
             Message::PromptSubmit => {
@@ -1159,7 +1287,8 @@ impl App {
                 });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
-            Message::PromptMove(delta) => match self.prompt.as_mut() {
+            Message::PromptMove(delta) => {
+                match self.prompt.as_mut() {
                 Some(Prompt::Open {
                     input,
                     recents,
@@ -1219,7 +1348,9 @@ impl App {
                     }
                 }
                 _ => {}
-            },
+                };
+                return self.modal_scroll_to_selected();
+            }
             Message::OpenRecent(path) => {
                 self.prompt = None;
                 self.show_next_pending();
@@ -1363,8 +1494,16 @@ impl App {
                 // ssh, not with us.
                 self.prompt = None;
                 self.show_next_pending();
-                if let Err(e) = ssh_connect(&alias, self.config.terminal_app.as_deref()) {
-                    eprintln!("ssh connect {} failed: {}", alias, e);
+                match ssh_connect(&alias, self.config.terminal_app.as_deref()) {
+                    Ok(()) => self.last_error = None,
+                    Err(e) => {
+                        // Surface it in the status bar rather than only stderr —
+                        // most often "Not authorized to send Apple events" until
+                        // the app is granted Automation access to the terminal.
+                        let msg = format!("SSH connect to {} failed: {}", alias, e);
+                        eprintln!("{}", msg);
+                        self.last_error = Some(msg);
+                    }
                 }
             }
             Message::SshOpenInPane(alias) => {
@@ -1510,6 +1649,7 @@ impl App {
                 ])
             }
             PaletteAction::LaunchApplication => {
+                self.reset_modal_scroll();
                 self.prompt = Some(Prompt::Apps {
                     state: AppsState::Loading,
                     input: String::new(),
@@ -1525,6 +1665,7 @@ impl App {
                     return Task::none();
                 }
                 let repo_path = self.pane(self.active).path().to_path_buf();
+                self.reset_modal_scroll();
                 self.prompt = Some(Prompt::GitBranches {
                     state: GitBranchesState::Loading,
                     input: String::new(),
@@ -1541,6 +1682,7 @@ impl App {
                 Task::none()
             }
             PaletteAction::SshConnect => {
+                self.reset_modal_scroll();
                 self.prompt = Some(Prompt::SshServers {
                     state: SshServersState::Loading,
                     input: String::new(),

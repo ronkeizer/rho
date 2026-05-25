@@ -623,6 +623,27 @@ pub fn palette_action_enabled(action: PaletteAction, dropbox_configured: bool) -
     }
 }
 
+/// "Scroll into view" math for the selection modals, mirroring the panes'
+/// `ensure_active_visible`: given the highlighted row index, the uniform row
+/// height, the viewport height, and the current scroll offset, return the new
+/// offset needed to bring the row fully into view — or `None` if it's already
+/// visible. Returning `None` is the point: the list stays put on every keypress
+/// and only scrolls when the cursor would leave the page. Scrolling up snaps
+/// the row to the top edge; scrolling down snaps it to the bottom edge
+/// (clamped at 0). Used by `main::modal_scroll_to_selected`.
+pub fn modal_scroll_target(selected: usize, row_h: f32, viewport_h: f32, scroll_y: f32) -> Option<f32> {
+    let row_top = selected as f32 * row_h;
+    let row_bottom = row_top + row_h;
+    let view_bottom = scroll_y + viewport_h;
+    if row_top < scroll_y {
+        Some(row_top)
+    } else if row_bottom > view_bottom {
+        Some((row_bottom - viewport_h).max(0.0))
+    } else {
+        None
+    }
+}
+
 /// Snapshot of a single running container surfaced from `docker ps`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerContainer {
@@ -3073,6 +3094,22 @@ this is not an ls line
         // Non-Dropbox actions are enabled regardless of the flag.
         assert!(palette_action_enabled(PaletteAction::Copy, false));
         assert!(palette_action_enabled(PaletteAction::GitBranch, false));
+    }
+
+    #[test]
+    fn modal_scroll_target_only_moves_when_off_page() {
+        // Viewport 100px tall, 20px rows -> rows 0..4 fully visible at top.
+        // A row already on the page doesn't move the list.
+        assert_eq!(modal_scroll_target(0, 20.0, 100.0, 0.0), None);
+        assert_eq!(modal_scroll_target(4, 20.0, 100.0, 0.0), None);
+        // Row just below the fold scrolls down so its bottom hits the edge.
+        assert_eq!(modal_scroll_target(5, 20.0, 100.0, 0.0), Some(20.0));
+        // Row above the current top scrolls up to the row's top.
+        assert_eq!(modal_scroll_target(2, 20.0, 100.0, 80.0), Some(40.0));
+        // Already-visible row with a non-zero scroll stays put.
+        assert_eq!(modal_scroll_target(5, 20.0, 100.0, 40.0), None);
+        // Never scrolls past the top.
+        assert_eq!(modal_scroll_target(0, 20.0, 100.0, 40.0), Some(0.0));
     }
 
     #[test]

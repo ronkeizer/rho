@@ -1658,11 +1658,26 @@ fn spawn_terminal_with_command(
         }
         let app = resolve_macos_terminal_app(terminal_app);
         let script = macos_terminal_apple_script(&app, &cmd);
-        std::process::Command::new("osascript")
+        // `output()` rather than `spawn()`: osascript only *dispatches* the
+        // Apple event and exits promptly (the terminal it opens runs
+        // independently), so this doesn't block on the session — but it lets us
+        // catch a failed dispatch. The important one is a denied Automation
+        // permission (`-1743`), which otherwise leaves the user with no
+        // terminal and, because the error was swallowed, no explanation.
+        let out = std::process::Command::new("osascript")
             .args(["-e", &script])
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to launch {}: {}", app, e))
+            .output()
+            .map_err(|e| format!("failed to launch {}: {}", app, e))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("{} did not open ({})", app, out.status)
+        } else {
+            // e.g. "Not authorized to send Apple events to Terminal. (-1743)"
+            format!("{}: {}", app, stderr)
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {

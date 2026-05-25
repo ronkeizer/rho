@@ -18,7 +18,7 @@ use crate::domain::{
     Prompt, Side, SortDir, SshServersState,
 };
 use crate::view_pane::format_size;
-use crate::{Message, PROMPT_ID};
+use crate::{Message, MODAL_LIST_ID, PROMPT_ID};
 
 pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
     // Docker / Processes / Apps / GitBranches are wider so the list rows
@@ -83,6 +83,14 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                     },
                 );
                 scrollable(list_col)
+                    .id(scrollable::Id::new(MODAL_LIST_ID))
+                    .on_scroll(|v| {
+                        Message::ModalScrolled(
+                            v.absolute_offset().y,
+                            v.bounds().height,
+                            v.content_bounds().height,
+                        )
+                    })
                     .height(Length::Fixed(240.0))
                     .into()
             };
@@ -523,7 +531,17 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                                     }),
                             )
                         });
-                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                        scrollable(list_col)
+                            .id(scrollable::Id::new(MODAL_LIST_ID))
+                            .on_scroll(|v| {
+                                Message::ModalScrolled(
+                                    v.absolute_offset().y,
+                                    v.bounds().height,
+                                    v.content_bounds().height,
+                                )
+                            })
+                            .height(Length::Fixed(360.0))
+                            .into()
                     }
                 }
             };
@@ -673,7 +691,17 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                                     }),
                             )
                         });
-                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                        scrollable(list_col)
+                            .id(scrollable::Id::new(MODAL_LIST_ID))
+                            .on_scroll(|v| {
+                                Message::ModalScrolled(
+                                    v.absolute_offset().y,
+                                    v.bounds().height,
+                                    v.content_bounds().height,
+                                )
+                            })
+                            .height(Length::Fixed(360.0))
+                            .into()
                     }
                 }
             };
@@ -774,7 +802,17 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                                 )
                             },
                         );
-                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                        scrollable(list_col)
+                            .id(scrollable::Id::new(MODAL_LIST_ID))
+                            .on_scroll(|v| {
+                                Message::ModalScrolled(
+                                    v.absolute_offset().y,
+                                    v.bounds().height,
+                                    v.content_bounds().height,
+                                )
+                            })
+                            .height(Length::Fixed(360.0))
+                            .into()
                     }
                 }
             };
@@ -880,7 +918,17 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                                 )
                             },
                         );
-                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                        scrollable(list_col)
+                            .id(scrollable::Id::new(MODAL_LIST_ID))
+                            .on_scroll(|v| {
+                                Message::ModalScrolled(
+                                    v.absolute_offset().y,
+                                    v.bounds().height,
+                                    v.content_bounds().height,
+                                )
+                            })
+                            .height(Length::Fixed(360.0))
+                            .into()
                     }
                 }
             };
@@ -1013,7 +1061,17 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                                 )
                             },
                         );
-                        scrollable(list_col).height(Length::Fixed(360.0)).into()
+                        scrollable(list_col)
+                            .id(scrollable::Id::new(MODAL_LIST_ID))
+                            .on_scroll(|v| {
+                                Message::ModalScrolled(
+                                    v.absolute_offset().y,
+                                    v.bounds().height,
+                                    v.content_bounds().height,
+                                )
+                            })
+                            .height(Length::Fixed(360.0))
+                            .into()
                     }
                 }
             };

@@ -49,6 +49,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key>      <string>rho</string>
     <key>CFBundleIconFile</key>        <string>Rho.icns</string>
     <key>NSHighResolutionCapable</key> <true/>
+    <!-- Lets the bundle prompt for Automation permission so the SSH /
+         Docker shell / Claude Code actions can open a terminal via Apple
+         events. Without a usage string macOS may deny silently. -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Rho opens a terminal window to start SSH, Docker, and Claude Code sessions.</string>
 </dict>
 </plist>
 PLIST
