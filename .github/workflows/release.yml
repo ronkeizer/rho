@@ -17,7 +17,7 @@ jobs:
     # macos-latest is Apple Silicon (arm64); the unsigned DMG targets arm64.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -29,7 +29,7 @@ jobs:
         run: ./scripts/make-dmg.sh
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rho-macos-arm64-dmg
           path: target/macos/*.dmg
@@ -37,7 +37,7 @@ jobs:
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/macos/*.dmg
           fail_on_unmatched_files: true

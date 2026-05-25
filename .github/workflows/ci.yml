@@ -11,7 +11,7 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # iced's wgpu/winit backend needs these to link on Linux even though
       # the tests never open a window.
