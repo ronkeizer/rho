@@ -49,6 +49,45 @@ primitives by `scripts/gen-icon.py` (pure stdlib, no design tool), which
 writes `assets/icon.png` — re-run it after changing the script to
 regenerate the master image.
 
+## Distributing a `.dmg` (macOS)
+
+`scripts/make-dmg.sh` wraps the app bundle into a drag-to-Applications disk
+image (Apple Silicon / arm64, unsigned):
+
+```sh
+./scripts/make-dmg.sh        # → target/macos/Rho-<version>-arm64.dmg
+```
+
+It calls `make-macos-app.sh`, stages `Rho.app` next to an `/Applications`
+symlink, and runs `hdiutil create` to produce a compressed (`UDZO`) image.
+The version in the filename comes from `Cargo.toml`.
+
+### Gatekeeper
+
+The DMG is **unsigned and un-notarized**, so a downloaded copy is
+quarantined and macOS refuses to open it on first launch ("Apple cannot
+check it for malicious software"). Users get past it once with either:
+
+- **right-click → Open** in Finder, then confirm (remembered thereafter), or
+- `xattr -dr com.apple.quarantine /Applications/Rho.app`.
+
+Signing + notarization (a paid Apple Developer ID, then `codesign` →
+`notarytool` → `stapler`) would remove the warning entirely. The scripts
+are structured so that step can be slotted in later without reworking the
+DMG layout.
+
+### Automated releases
+
+`.github/workflows/release.yml` builds the DMG on a `macos-latest` (arm64)
+runner. Push a version tag and it attaches the `.dmg` to a GitHub Release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Running the workflow manually (Actions tab → *Release* → *Run workflow*)
+skips the release step and just uploads the DMG as a build artifact.
+
 ## First launch
 
 On first run Rho creates `~/.rho.yaml` with a starter template (see

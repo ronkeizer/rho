@@ -1,0 +1,43 @@
+name: Release
+
+# Build the macOS .dmg and attach it to a GitHub Release.
+# Triggered by pushing a version tag (e.g. `git tag v0.1.0 && git push --tags`),
+# or run manually from the Actions tab to just produce a downloadable artifact.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to create / update the Release
+
+jobs:
+  macos-dmg:
+    name: macOS .dmg (arm64)
+    # macos-latest is Apple Silicon (arm64); the unsigned DMG targets arm64.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # assets/icon.png is committed, so no icon regeneration step is needed;
+      # make-dmg.sh -> make-macos-app.sh use the stock sips / iconutil / hdiutil.
+      - name: Build DMG
+        run: ./scripts/make-dmg.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rho-macos-arm64-dmg
+          path: target/macos/*.dmg
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/macos/*.dmg
+          fail_on_unmatched_files: true

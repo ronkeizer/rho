@@ -34,6 +34,24 @@ See the
 [mdBook](https://ronkeizer.github.io/rho/) for the full feature list,
 keybindings, and architecture notes.
 
+## Install (macOS)
+
+Download the latest `Rho-<version>-arm64.dmg` from the
+[Releases](https://github.com/ronkeizer/rho/releases) page (Apple Silicon),
+open it, and drag **Rho** into **Applications**.
+
+The build is **unsigned and un-notarized**, so on first launch macOS
+Gatekeeper will say it "can't be opened." Either:
+
+- **right-click → Open**, then confirm once (the choice is remembered), or
+- run `xattr -dr com.apple.quarantine /Applications/Rho.app`.
+
+To build the DMG yourself:
+
+```sh
+./scripts/make-dmg.sh        # → target/macos/Rho-<version>-arm64.dmg
+```
+
 ## Build & run
 
 ```sh
