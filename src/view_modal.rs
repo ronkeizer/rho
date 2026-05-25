@@ -177,13 +177,17 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                         };
                         // Disabled rows carry a trailing hint pointing at the
                         // config; enabled rows are just the label.
+                        // Monospace to match the file-list rows and the other
+                        // filterable modals (e.g. Go to folder).
                         let label: Element<'_, Message> = if enabled {
-                            text(action.label()).size(12).into()
+                            text(action.label()).font(Font::MONOSPACE).size(12).into()
                         } else {
                             row![
-                                text(action.label()).size(12),
+                                text(action.label()).font(Font::MONOSPACE).size(12),
                                 Space::with_width(Length::Fill),
-                                text("set credentials in ~/.rho.yaml").size(10),
+                                text("set credentials in ~/.rho.yaml")
+                                    .font(Font::MONOSPACE)
+                                    .size(10),
                             ]
                             .align_y(iced::alignment::Vertical::Center)
                             .into()
