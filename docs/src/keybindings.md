@@ -13,6 +13,7 @@ key the OS treats as the "logo" / Super key. The app reads it through iced's
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move the cursor one row |
+| `⌘↑` / `⌘↓` | Jump to the top / bottom of the list |
 | `PageUp` / `PageDown` | Move by one page (computed from current viewport) |
 | `Shift +` arrow / page key | Extend the selection from the anchor |
 | `Tab` | Switch the active pane (left ↔ right) |
@@ -28,6 +29,7 @@ selection just means "this row".
 | Key | Action |
 |---|---|
 | `Shift + ↑/↓` | Extend the range one row |
+| `⌘⇧↑ / ⌘⇧↓` | Extend the range to the top / bottom of the list |
 | `Shift + PageUp/PageDown` | Extend the range by a page |
 | Click | Drop the anchor on the clicked row (single-row selection) |
 | `Shift + Click` | Extend the range from the existing anchor |
@@ -40,8 +42,9 @@ selection just means "this row".
 | `Space` | Quick Look preview the cursor row's file (macOS only; no-op elsewhere) |
 | `F5` | Open the copy modal (destination defaults to the other pane's directory) |
 | `F6` | Open the move modal (destination defaults to the other pane's directory) |
+| `F7` | Open the new-folder modal — type a name to create a directory in the active pane (local panes only) |
 | `F10` | Quit the app immediately. Works even with a modal open — no confirmation. |
-| `Delete` | Open the delete-confirm modal for the current mark |
+| `F8` / `Delete` | Open the delete-confirm modal for the current mark |
 
 Copy and delete operate on the **mark**, not just the cursor row. With no
 range selected, that's just the row under the cursor.
@@ -50,7 +53,8 @@ range selected, that's just the row under the cursor.
 
 Plain characters (no `⌘` / `Ctrl` / `Alt`) feed a type-to-filter regex on the
 active pane. The pane re-renders with only matching rows; the cursor stays
-on the same entry if it's still visible.
+on the same entry if it's still visible, otherwise it jumps to the first
+match rather than the `..` row.
 
 | Key | Action |
 |---|---|
@@ -75,7 +79,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -85,12 +89,13 @@ Inside a modal, the navigation keys behave differently:
 |---|---|
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
 | Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. |
+| New folder (text input only) | `Enter` creates the named directory in the active pane (nested names like `a/b` are created in full), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | Large-archive extract confirm | Shown when `Enter` is pressed on a `.zip` over 100 MiB. `Tab` / `←` / `→` toggle Cancel ↔ Extract focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel. |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
-| Processes | Type to filter (substring against name). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
+| Processes | Type to filter (substring against name). `↑`/`↓` move the highlighted row; `Enter` kills it (SIGTERM). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (also sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
 | Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
 | Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
 | Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
@@ -176,10 +181,14 @@ heaviest processes are at the top; click any column header to switch —
 numeric columns (PID / CPU / MEM) start descending on first click, Name
 starts ascending. Clicking the active column flips direction.
 
+`↑` / `↓` move a blue highlight over the rows (the same cursor styling
+the panes use), and `Enter` kills the highlighted process — the
+keyboard equivalent of clicking its **Kill** button.
+
 - **Kill** — sends `SIGTERM` via `kill <pid>`. Re-fetches the list on
   completion. No confirmation is shown: be deliberate about which row
-  you click, especially with system processes. Users who want SIGKILL
-  should run `kill -9` from a real terminal.
+  you target (by click or `Enter`), especially with system processes.
+  Users who want SIGKILL should run `kill -9` from a real terminal.
 
 The CPU% / MEM% values are snapshots from the moment of the `ps` call —
 they don't auto-refresh. Dismiss and reopen the modal to refresh.
@@ -254,7 +263,8 @@ the first non-wildcard pattern becomes the entry's alias.
   hosts (slow: stages through local `/tmp`), and `Delete` on remote
   selections (via `ssh <alias> rm -rf`). What doesn't (yet): Compress /
   Uncompress, `F4` Edit, Space Quick Look, "Open Claude Code in this
-  folder", and the Git branch palette action — all of those still
+  folder", "Open Terminal in this folder", "Open folder in editor", and
+  the Git branch palette action — all of those still
   silently no-op when the active pane is remote, because they hand a
   file or cwd to a local subprocess.
 
@@ -317,3 +327,37 @@ action fires and the palette closes. Per OS:
 Requires the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview)
 to be installed and on `PATH`. If `claude` isn't found you'll see the
 usual "command not found" inside the new terminal window.
+
+### Open Terminal in this folder
+
+Picking **Open Terminal in this folder** opens a new terminal window
+with an interactive shell already `cd`'d into the active pane's
+directory. Like Open Claude Code it's fire-and-forget (no modal), and it
+honors the same `terminal_app` setting. The only difference is it stops
+at the `cd` — no command is run, so you're left at a prompt. Per OS:
+
+- **macOS** — `osascript` with the resolved `terminal_app`. Terminal.app
+  types `cd '<path>'` into the shell; iTerm runs
+  `sh -c "cd '<path>' && exec ${SHELL:-/bin/sh} -l"` so the window stays
+  open (its `command` is the session's main process, so a bare `cd`
+  would exit immediately).
+- **Linux** — `x-terminal-emulator` spawned with `cwd` set to the pane's
+  path; the default interactive shell inherits it.
+- **Windows** — `cmd` spawned with `cwd` set similarly.
+
+The action no-ops for Dropbox (non-local) panes, since there's no local
+directory to open.
+
+### Open folder in editor
+
+Picking **Open folder in editor** opens the active pane's directory in an
+external editor by spawning `<editor> <folder>`. Also fire-and-forget,
+and like the terminal actions it no-ops for Dropbox (non-local) panes.
+
+The editor binary comes from the `folder_editor`
+[setting](./configuration.md), which defaults to `/usr/local/bin/code`
+— the VS Code CLI installed via *Shell Command: Install 'code' command in
+PATH*, which opens the folder as a workspace. Point it at any editor that
+accepts a directory argument (e.g. `/opt/homebrew/bin/code`, a `subl`
+path, or a wrapper script). If the binary doesn't exist the action fails
+silently (the error is logged to stderr).

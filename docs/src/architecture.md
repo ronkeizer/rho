@@ -334,8 +334,10 @@ accidentally.
 Picking "Processes" from the command palette opens `Prompt::Processes`,
 a near-mirror of the Docker modal. Same three-state machine
 (`ProcessesState::Loading | Loaded(Vec<Process>) | Error(String)`), same
-modal-on-top stacking, same filter `text_input`, same one-shot
-`PromptSubmit` no-op.
+modal-on-top stacking, same filter `text_input`. Unlike Docker it carries
+a `selected` index: `↑`/`↓` move a blue current-row highlight (reusing the
+panes' cursor styling via `cursor_fill`), and `PromptSubmit` (Enter) kills
+the highlighted process rather than being a no-op.
 
 Two subprocess interactions, both in `fs_ops.rs`:
 
@@ -352,6 +354,8 @@ Two subprocess interactions, both in `fs_ops.rs`:
 
 Both functions are `#[cfg(unix)]`. On Windows the stubs return a
 "not supported on this platform" string that the modal surfaces in place
-of the list — wiring up `tasklist` and `taskkill` is left for later. The
-modal-open suppression handles arrow keys the same way as the Docker
-modal, and `PromptSubmit` for `Prompt::Processes` is the same no-op.
+of the list — wiring up `tasklist` and `taskkill` is left for later.
+Arrow keys are redirected to `PromptMove` (like the other navigable
+modals) so they move the highlight, and `selected` is clamped back into
+range by `PromptChanged` (filtering) and `ProcessesListLoaded` (the
+post-kill reload) so it never points past the end of the list.

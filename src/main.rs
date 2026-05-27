@@ -17,7 +17,8 @@ use config::{
 };
 use domain::{
     add_recent, available_palette_actions, default_zip_filename, filtered_actions, filtered_apps,
-    filtered_branches, filtered_recents, filtered_servers, modal_scroll_target, sort_apps,
+    filtered_branches, filtered_processes, filtered_recents, filtered_servers, modal_scroll_target,
+    sort_apps,
     sort_containers, sort_entries, sort_processes, Application, AppsState, BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
@@ -26,7 +27,8 @@ use domain::{
 use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
     docker_shell, extract_to_temp_task, file_watch_subscription, git_branches_task,
-    git_checkout_task, kill_process_task, launch_app, loading_tasks, move_task, open_claude_code,
+    git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task,
+    open_claude_code, open_folder_in_editor, open_terminal,
     pane_watch_subscription, ps_task, ssh_connect, ssh_servers_task, uncompress_task,
 };
 use view_modal::view_modal;
@@ -82,6 +84,8 @@ pub(crate) enum Message {
     GoUpActive,
     MoveSelection(i32, bool),
     PageMove(i32, bool),
+    /// Jump to the top (-1) or bottom (1) of the active pane's list.
+    MoveToEdge(i32, bool),
     SwitchSide,
     ActivateSelection,
     ToggleSort(Side, SortBy),
@@ -93,6 +97,7 @@ pub(crate) enum Message {
     OpenPrompt,
     OpenCopyPrompt,
     OpenMovePrompt,
+    OpenNewFolderPrompt,
     OpenDeletePrompt,
     SwitchPromptFocus,
     OpenSettingsFile,
@@ -394,8 +399,8 @@ impl App {
 
     /// `(selected, row_count)` for the open selection modal whose list is
     /// keyboard-navigable and shares `MODAL_LIST_ID` (Go to folder / Apps /
-    /// Git branches / SSH servers). `None` for everything else — modals with
-    /// no cursor or no scrollable list (Command Palette, Docker, Processes).
+    /// Git branches / SSH servers / Processes). `None` for everything else —
+    /// modals with no cursor or no scrollable list (Command Palette, Docker).
     fn current_modal_selection(&self) -> Option<(usize, usize)> {
         match self.prompt.as_ref() {
             Some(Prompt::Open {
@@ -429,6 +434,15 @@ impl App {
                 selected,
             }) => {
                 let n = filtered_servers(list, input).len();
+                (n > 0).then_some((*selected, n))
+            }
+            Some(Prompt::Processes {
+                state: ProcessesState::Loaded(list),
+                input,
+                selected,
+                ..
+            }) => {
+                let n = filtered_processes(list, input).len();
                 (n > 0).then_some((*selected, n))
             }
             _ => None,
@@ -565,7 +579,8 @@ impl App {
                 | Some(Prompt::CommandPalette { .. })
                 | Some(Prompt::Apps { .. })
                 | Some(Prompt::GitBranches { .. })
-                | Some(Prompt::SshServers { .. }),
+                | Some(Prompt::SshServers { .. })
+                | Some(Prompt::Processes { .. }),
                 m,
             ) => match m {
                 Message::MoveSelection(delta, _) => Message::PromptMove(delta),
@@ -582,6 +597,7 @@ impl App {
             match &msg {
                 Message::MoveSelection(..)
                 | Message::PageMove(..)
+                | Message::MoveToEdge(..)
                 | Message::ActivateSelection
                 | Message::SwitchSide
                 | Message::GoUpActive
@@ -589,6 +605,7 @@ impl App {
                 | Message::QuickLook
                 | Message::OpenCopyPrompt
                 | Message::OpenMovePrompt
+                | Message::OpenNewFolderPrompt
                 | Message::OpenDeletePrompt
                 | Message::OpenCommandPalette
                 | Message::FilterAppend(..) => return Task::none(),
@@ -649,6 +666,19 @@ impl App {
                 let page = self.page_size();
                 let side = self.active;
                 self.pane_mut(side).move_by(dir * page, extend);
+                return self.ensure_active_visible();
+            }
+            Message::MoveToEdge(dir, extend) => {
+                let side = self.active;
+                let pane = self.pane_mut(side);
+                // move_to clamps to [0, visible_indices.len()]: 0 is the ".."
+                // row at the top, the count is the last entry at the bottom.
+                let target = if dir < 0 {
+                    0
+                } else {
+                    pane.visible_indices.len() as i32
+                };
+                pane.move_to(target, extend);
                 return self.ensure_active_visible();
             }
             Message::SwitchSide => {
@@ -739,6 +769,12 @@ impl App {
                 self.prompt = Some(Prompt::Move { input: dest });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
+            Message::OpenNewFolderPrompt => {
+                self.prompt = Some(Prompt::NewFolder {
+                    input: String::new(),
+                });
+                return text_input::focus(text_input::Id::new(PROMPT_ID));
+            }
             Message::OpenDeletePrompt => {
                 let paths = self.pane(self.active).marked_locations();
                 if !paths.is_empty() {
@@ -787,6 +823,7 @@ impl App {
                         }
                         Prompt::Copy { input }
                         | Prompt::Move { input }
+                        | Prompt::NewFolder { input }
                         | Prompt::Compress { input }
                         | Prompt::Uncompress { input } => {
                             *input = value;
@@ -801,8 +838,20 @@ impl App {
                             let n = filtered_actions(actions, input).len();
                             *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                         }
-                        Prompt::Docker { input, .. } | Prompt::Processes { input, .. } => {
+                        Prompt::Docker { input, .. } => {
                             *input = value;
+                        }
+                        Prompt::Processes {
+                            input,
+                            state,
+                            selected,
+                            ..
+                        } => {
+                            *input = value;
+                            if let ProcessesState::Loaded(list) = state {
+                                let n = filtered_processes(list, input).len();
+                                *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                            }
                         }
                         Prompt::Apps {
                             input,
@@ -929,6 +978,29 @@ impl App {
                                 None
                             }
                         }
+                        Prompt::NewFolder { input } => {
+                            // Local panes only — remote folder creation isn't
+                            // wired up yet, so surface that rather than failing
+                            // silently against a backend path.
+                            match self.pane(self.active).location.clone() {
+                                Location::Local(dir) => match make_dir(&dir, &input) {
+                                    Ok(_) => {
+                                        self.last_error = None;
+                                        Some(self.reload_both_panes())
+                                    }
+                                    Err(e) => {
+                                        self.last_error = Some(e);
+                                        None
+                                    }
+                                },
+                                Location::Remote { .. } => {
+                                    self.last_error = Some(
+                                        "Can't create a folder on a remote location yet".into(),
+                                    );
+                                    None
+                                }
+                            }
+                        }
                         Prompt::Delete { paths, .. } => {
                             if !paths.is_empty() {
                                 self.delete_in_progress = Some(paths.len());
@@ -973,9 +1045,9 @@ impl App {
                                 None => None,
                             }
                         }
-                        // Docker / Processes have a filter input but actions
-                        // are mouse-only — Enter is a no-op. Re-instate the
-                        // prompt so the modal doesn't close.
+                        // Docker has two per-row actions (Kill / Shell) so
+                        // Enter is ambiguous — keep it mouse-only and just
+                        // re-instate the prompt so the modal doesn't close.
                         Prompt::Docker {
                             state,
                             input,
@@ -990,19 +1062,29 @@ impl App {
                             });
                             None
                         }
+                        // Processes: Enter kills the highlighted row (SIGTERM),
+                        // mirroring its per-row Kill button. The modal stays
+                        // open and refreshes via ProcessKillFinished → ps_task.
                         Prompt::Processes {
                             state,
                             input,
                             sort_by,
                             sort_dir,
+                            selected,
                         } => {
+                            let pid = if let ProcessesState::Loaded(list) = &state {
+                                filtered_processes(list, &input).get(selected).map(|p| p.pid)
+                            } else {
+                                None
+                            };
                             self.prompt = Some(Prompt::Processes {
                                 state,
                                 input,
                                 sort_by,
                                 sort_dir,
+                                selected,
                             });
-                            None
+                            pid.map(kill_process_task)
                         }
                         // Apps modal: Enter launches the highlighted row.
                         // If no row is selectable (empty / loading / error),
@@ -1382,6 +1464,19 @@ impl App {
                         }
                     }
                 }
+                Some(Prompt::Processes {
+                    state,
+                    input,
+                    selected,
+                    ..
+                }) => {
+                    if let ProcessesState::Loaded(list) = state {
+                        let n = filtered_processes(list, input).len() as i32;
+                        if n > 0 {
+                            *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                        }
+                    }
+                }
                 _ => {}
                 };
                 return self.modal_scroll_to_selected();
@@ -1437,9 +1532,10 @@ impl App {
             Message::ProcessesListLoaded(result) => {
                 if let Some(Prompt::Processes {
                     state,
+                    input,
                     sort_by,
                     sort_dir,
-                    ..
+                    selected,
                 }) = self.prompt.as_mut()
                 {
                     *state = match result {
@@ -1449,6 +1545,12 @@ impl App {
                         }
                         Err(msg) => ProcessesState::Error(msg),
                     };
+                    // A reload (e.g. after a kill) may shrink the list — keep
+                    // the highlight pointing at a real row.
+                    if let ProcessesState::Loaded(list) = state {
+                        let n = filtered_processes(list, input).len();
+                        *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                    }
                 }
             }
             Message::ProcessKill(pid) => {
@@ -1677,6 +1779,7 @@ impl App {
                     input: String::new(),
                     sort_by: ProcessSortBy::Cpu,
                     sort_dir: SortDir::Desc,
+                    selected: 0,
                 });
                 Task::batch([
                     ps_task(),
@@ -1752,6 +1855,30 @@ impl App {
                 let path = self.pane(self.active).path().to_path_buf();
                 if let Err(e) = open_claude_code(&path, self.config.terminal_app.as_deref()) {
                     eprintln!("open Claude Code in {} failed: {}", path.display(), e);
+                }
+                Task::none()
+            }
+            PaletteAction::OpenTerminal => {
+                // Fire-and-forget: open a terminal in the active pane's
+                // directory using the configured terminal app.
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
+                let path = self.pane(self.active).path().to_path_buf();
+                if let Err(e) = open_terminal(&path, self.config.terminal_app.as_deref()) {
+                    eprintln!("open Terminal in {} failed: {}", path.display(), e);
+                }
+                Task::none()
+            }
+            PaletteAction::OpenInEditor => {
+                // Fire-and-forget: open the active pane's folder in the
+                // configured editor (`folder_editor`, defaults to VS Code).
+                if !self.pane(self.active).location.is_local() {
+                    return Task::none();
+                }
+                let path = self.pane(self.active).path().to_path_buf();
+                if let Err(e) = open_folder_in_editor(&path, self.config.folder_editor()) {
+                    eprintln!("open {} in editor failed: {}", path.display(), e);
                 }
                 Task::none()
             }
@@ -1893,7 +2020,7 @@ impl App {
             .into();
 
         if let Some(prompt) = &self.prompt {
-            stack![base, view_modal(prompt)].into()
+            stack![base, view_modal(prompt, colors)].into()
         } else {
             base
         }
@@ -1919,6 +2046,13 @@ impl App {
                 // only fires on Ignored events) makes the user hit Esc
                 // twice. `event::listen_with` sees the press regardless
                 // of widget capture.
+                // ⌘↑/⌘↓ jump to the top/bottom of the list; plain ↑/↓ step.
+                Key::Named(Named::ArrowUp) if mods.command() => {
+                    Some(Message::MoveToEdge(-1, mods.shift()))
+                }
+                Key::Named(Named::ArrowDown) if mods.command() => {
+                    Some(Message::MoveToEdge(1, mods.shift()))
+                }
                 Key::Named(Named::ArrowUp) => Some(Message::MoveSelection(-1, mods.shift())),
                 Key::Named(Named::ArrowDown) => Some(Message::MoveSelection(1, mods.shift())),
                 Key::Named(Named::PageUp) => Some(Message::PageMove(-1, mods.shift())),
@@ -1936,6 +2070,8 @@ impl App {
                 Key::Named(Named::Space) => Some(Message::QuickLook),
                 Key::Named(Named::F5) => Some(Message::OpenCopyPrompt),
                 Key::Named(Named::F6) => Some(Message::OpenMovePrompt),
+                Key::Named(Named::F7) => Some(Message::OpenNewFolderPrompt),
+                Key::Named(Named::F8) => Some(Message::OpenDeletePrompt),
                 Key::Named(Named::F10) => Some(Message::ExitApp),
                 // Plain character keys (no Ctrl/Cmd/Alt) feed the type-to-filter.
                 // The earlier Cmd+P / Cmd+, guards have already matched before

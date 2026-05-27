@@ -69,6 +69,11 @@ A filterable list of one-shot actions:
 - Connect to SSH server — reads `~/.ssh/config`, picks a Host, opens
   a new terminal running `ssh <alias>`.
 - Open Claude Code in this folder.
+- Open Terminal in this folder — opens a shell already `cd`'d into the
+  active pane's directory (uses the `terminal_app` setting).
+- Open folder in editor — opens the active pane's directory in an
+  external editor (uses the `folder_editor` setting, defaults to the VS
+  Code CLI).
 - Keyboard shortcuts — same content as the
   [Keybindings](./keybindings.md) chapter, in-app.
 - Exit.

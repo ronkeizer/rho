@@ -9,7 +9,7 @@ use iced::widget::{
 };
 use iced::{Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector};
 
-use crate::config::dim;
+use crate::config::{blend, dim, RowColors};
 use crate::domain::{
     filtered_actions, filtered_apps, filtered_branches, filtered_containers, filtered_processes,
     filtered_recents, filtered_servers, keyboard_shortcuts, palette_action_enabled, AppsState,
@@ -20,7 +20,7 @@ use crate::domain::{
 use crate::view_pane::format_size;
 use crate::{Message, MODAL_LIST_ID, PROMPT_ID};
 
-pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
+pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
     // Docker / Processes / Apps / GitBranches are wider so the list rows
     // have room. KeyboardShortcuts is two-column text — wider than the
     // single-column modals but narrower than the table-shaped ones.
@@ -121,6 +121,16 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                 .on_submit(Message::PromptSubmit)
                 .padding(8),
             text("Enter to move  ·  Esc or click outside to cancel").size(11),
+        ]
+        .spacing(10),
+        Prompt::NewFolder { input } => column![
+            text("New folder").size(15),
+            text_input("folder name", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8),
+            text("Created in the active pane  ·  Enter to create  ·  Esc cancels").size(11),
         ]
         .spacing(10),
         Prompt::Compress { input } => column![
@@ -560,6 +570,7 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
             input,
             sort_by,
             sort_dir,
+            selected,
         } => {
             let filter_widget = text_input("filter by name…", input)
                 .id(text_input::Id::new(PROMPT_ID))
@@ -629,16 +640,34 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                             .padding(Padding::from([8, 8]))
                             .into()
                     } else {
-                        let list_col = filtered.iter().fold(column![].spacing(3), |col, p| {
+                        let list_col = filtered.iter().enumerate().fold(
+                            column![],
+                            |col, (row_index, p)| {
                             let pid = p.pid;
-                            let dim_style = |theme: &Theme| iced::widget::text::Style {
-                                color: Some(dim(theme.extended_palette().background.base.text)),
+                            let is_selected = row_index == *selected;
+                            // On the highlighted (blue) row every cell uses the
+                            // cursor foreground so it stays legible; off-row,
+                            // the metric columns are dimmed like before.
+                            let dim_style = move |theme: &Theme| iced::widget::text::Style {
+                                color: Some(if is_selected {
+                                    cursor_fill(theme, colors).1
+                                } else {
+                                    dim(theme.extended_palette().background.base.text)
+                                }),
+                            };
+                            let name_style = move |theme: &Theme| iced::widget::text::Style {
+                                color: Some(if is_selected {
+                                    cursor_fill(theme, colors).1
+                                } else {
+                                    theme.extended_palette().background.base.text
+                                }),
                             };
                             let name_cell = text(p.name.clone())
                                 .font(Font::MONOSPACE)
                                 .size(11)
                                 .width(Length::Fill)
-                                .wrapping(iced::widget::text::Wrapping::None);
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .style(name_style);
                             let pid_cell = text(format!("PID {}", p.pid))
                                 .font(Font::MONOSPACE)
                                 .size(11)
@@ -677,15 +706,15 @@ pub fn view_modal(prompt: &Prompt) -> Element<'_, Message> {
                             col.push(
                                 container(row_widget)
                                     .padding(Padding::from([3, 8]))
-                                    .style(|theme: &Theme| container::Style {
-                                        // Inherit the modal's background
-                                        // (palette.background.base) — rows
-                                        // are visually separated by the
-                                        // border alone.
-                                        border: Border {
-                                            color: theme.extended_palette().background.strong.color,
-                                            width: 1.0,
-                                            radius: 4.0.into(),
+                                    .style(move |theme: &Theme| container::Style {
+                                        // The highlighted row gets the blue
+                                        // cursor fill (like the panes); the rest
+                                        // use the same odd/even zebra stripe the
+                                        // panes use — no borders.
+                                        background: if is_selected {
+                                            Some(cursor_fill(theme, colors).0.into())
+                                        } else {
+                                            process_stripe(theme, colors, row_index)
                                         },
                                         ..Default::default()
                                     }),
@@ -1200,6 +1229,40 @@ fn process_header<'a>(
     .into()
 }
 
+/// Zebra-stripe background for a process row, mirroring the panes'
+/// `compute_row_style`: odd rows get `colors.stripe` (falling back to a blend
+/// of the base and weak background, the same default the panes use), even rows
+/// inherit the modal background (`None`).
+fn process_stripe(theme: &Theme, colors: RowColors, row_index: usize) -> Option<iced::Background> {
+    if row_index % 2 == 1 {
+        let palette = theme.extended_palette();
+        let stripe = colors.stripe.unwrap_or_else(|| {
+            blend(
+                palette.background.base.color,
+                palette.background.weak.color,
+                0.15,
+            )
+        });
+        Some(stripe.into())
+    } else {
+        None
+    }
+}
+
+/// `(background, foreground)` for the highlighted "current" process row,
+/// mirroring the panes' cursor styling in `compute_row_style`: `colors.cursor`
+/// (or the theme's primary-strong) as the fill, with a contrasting text color.
+fn cursor_fill(theme: &Theme, colors: RowColors) -> (Color, Color) {
+    let pair = theme.extended_palette().primary.strong;
+    let bg = colors.cursor.unwrap_or(pair.color);
+    let fg = if colors.cursor.is_some() {
+        Color::WHITE
+    } else {
+        pair.text
+    };
+    (bg, fg)
+}
+
 /// Style for a non-selected, disabled command-palette row: same flat
 /// background as `button::text`, but with dimmed text so it reads as
 /// unavailable. Selected rows use `button::primary` regardless of enablement.
@@ -1232,5 +1295,74 @@ fn backdrop_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::Background;
+
+    #[test]
+    fn process_stripe_alternates_with_configured_color() {
+        let stripe = Color::from_rgb(0.1, 0.2, 0.3);
+        let colors = RowColors {
+            cursor: None,
+            mark: None,
+            stripe: Some(stripe),
+            folder: None,
+        };
+        let theme = Theme::Dark;
+        // Even rows inherit the modal background (no override).
+        assert!(process_stripe(&theme, colors, 0).is_none());
+        assert!(process_stripe(&theme, colors, 2).is_none());
+        // Odd rows get the configured stripe color verbatim.
+        match process_stripe(&theme, colors, 1) {
+            Some(Background::Color(c)) => assert_eq!(c, stripe),
+            other => panic!("expected configured stripe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn process_stripe_falls_back_to_theme_blend_without_config() {
+        let colors = RowColors {
+            cursor: None,
+            mark: None,
+            stripe: None,
+            folder: None,
+        };
+        let theme = Theme::Dark;
+        // Odd rows still get a (theme-derived) stripe; even rows stay bare.
+        assert!(process_stripe(&theme, colors, 1).is_some());
+        assert!(process_stripe(&theme, colors, 0).is_none());
+    }
+
+    #[test]
+    fn cursor_fill_uses_configured_cursor_color_with_white_text() {
+        let cursor = Color::from_rgb(0.0, 0.4, 0.9);
+        let colors = RowColors {
+            cursor: Some(cursor),
+            mark: None,
+            stripe: None,
+            folder: None,
+        };
+        let (bg, fg) = cursor_fill(&Theme::Dark, colors);
+        assert_eq!(bg, cursor);
+        // A configured cursor color pairs with white text for contrast.
+        assert_eq!(fg, Color::WHITE);
+    }
+
+    #[test]
+    fn cursor_fill_falls_back_to_theme_primary() {
+        let colors = RowColors {
+            cursor: None,
+            mark: None,
+            stripe: None,
+            folder: None,
+        };
+        let pair = Theme::Dark.extended_palette().primary.strong;
+        let (bg, fg) = cursor_fill(&Theme::Dark, colors);
+        assert_eq!(bg, pair.color);
+        assert_eq!(fg, pair.text);
     }
 }

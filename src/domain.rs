@@ -275,6 +275,12 @@ pub enum Prompt {
     Move {
         input: String,
     },
+    /// `NewFolder`: name for a directory to create inside the active pane's
+    /// current (local) folder. Submit runs `make_dir` and reloads. Starts
+    /// empty so the user just types a name.
+    NewFolder {
+        input: String,
+    },
     /// `Compress`: pre-filled destination zip path (defaults to other-pane
     /// + first-mark-stem.zip). On submit, runs `zip -r` on the marks.
     Compress {
@@ -337,12 +343,14 @@ pub enum Prompt {
     },
     /// "Processes" action. Same shape as Docker but backed by `ps -axo …`.
     /// `input` filters by process name; per-row action is `Kill` (SIGTERM).
-    /// Defaults to sorting by CPU descending.
+    /// Defaults to sorting by CPU descending. `selected` is the
+    /// keyboard-navigable highlight (↑/↓), and Enter kills that row.
     Processes {
         state: ProcessesState,
         input: String,
         sort_by: ProcessSortBy,
         sort_dir: SortDir,
+        selected: usize,
     },
     /// "Launch Application" action (macOS only). Lists `.app` bundles under
     /// `/Applications` (+ Utilities + `~/Applications`). `selected` is the
@@ -428,6 +436,13 @@ pub enum PaletteAction {
     /// active pane at the Dropbox account root.
     OpenDropbox,
     OpenClaudeCode,
+    /// Open a terminal window in the active pane's folder. The terminal app
+    /// is taken from the `terminal_app` setting in `~/.rho.yaml`.
+    OpenTerminal,
+    /// Open the active pane's folder in an editor. The editor binary is taken
+    /// from the `folder_editor` setting in `~/.rho.yaml` (defaults to the VS
+    /// Code CLI).
+    OpenInEditor,
     KeyboardShortcuts,
     Exit,
 }
@@ -447,6 +462,8 @@ impl PaletteAction {
         PaletteAction::SshConnect,
         PaletteAction::OpenDropbox,
         PaletteAction::OpenClaudeCode,
+        PaletteAction::OpenTerminal,
+        PaletteAction::OpenInEditor,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -464,6 +481,8 @@ impl PaletteAction {
         PaletteAction::SshConnect,
         PaletteAction::OpenDropbox,
         PaletteAction::OpenClaudeCode,
+        PaletteAction::OpenTerminal,
+        PaletteAction::OpenInEditor,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -482,6 +501,8 @@ impl PaletteAction {
             PaletteAction::SshConnect => "Connect to SSH server",
             PaletteAction::OpenDropbox => "Open Dropbox",
             PaletteAction::OpenClaudeCode => "Open Claude Code in this folder",
+            PaletteAction::OpenTerminal => "Open Terminal in this folder",
+            PaletteAction::OpenInEditor => "Open folder in editor",
             PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
         }
@@ -569,7 +590,8 @@ pub fn keyboard_shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static st
                 ("Space", "Quick Look preview (macOS only)"),
                 ("F5", "Open the copy modal"),
                 ("F6", "Open the move modal"),
-                ("Delete", "Open the delete-confirm modal"),
+                ("F7", "Create a new folder in the active pane"),
+                ("F8 / Delete", "Open the delete-confirm modal"),
                 ("F10", "Quit the app immediately"),
             ],
         ),
@@ -1509,6 +1531,20 @@ impl Pane {
                 self.selected.min(max)
             }
         };
+
+        // When a filter is active, the cursor should land on a real matching
+        // entry rather than the synthetic ".." row. If the preserved cursor
+        // didn't survive the filter (or there was none), jump to the first
+        // match instead of sitting on "..".
+        let new_selected = if !self.filter.is_empty()
+            && new_selected == 0
+            && !self.visible_indices.is_empty()
+        {
+            1
+        } else {
+            new_selected
+        };
+
         self.selected = new_selected;
         self.anchor = new_selected;
     }
@@ -2382,20 +2418,49 @@ this is not an ls line
     }
 
     #[test]
-    fn cursor_resets_when_previously_focused_entry_filtered_out() {
+    fn cursor_jumps_to_first_match_when_previously_focused_entry_filtered_out() {
         let mut p = alpha_pane();
         p.selected = 3; // "beta" after sorting
         p.anchor = 3;
         let prior = p.cursor_name();
         assert_eq!(prior.as_deref(), Some("beta"));
 
-        // Filter excludes "beta".
+        // Filter excludes "beta" but matches "alpha"/"alphabet".
         p.filter = "alpha".to_string();
         p.recompute_visible(prior.as_deref());
 
-        // Cursor falls back to the ".." row.
+        // Cursor jumps to the first match rather than the ".." row.
+        assert_eq!(p.selected, 1);
+        assert_eq!(p.anchor, 1);
+        assert_eq!(p.cursor_name().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn cursor_jumps_to_first_match_when_starting_from_dotdot() {
+        let mut p = alpha_pane();
+        // Cursor on the synthetic ".." row, as is typical right after
+        // navigating into a folder and then beginning to type a filter.
+        p.selected = 0;
+        p.anchor = 0;
+        assert_eq!(p.cursor_name(), None);
+
+        p.filter = "beta".to_string();
+        p.recompute_visible(None);
+
+        // Filter is active and matches "beta" — cursor lands on it, not "..".
+        assert_eq!(p.selected, 1);
+        assert_eq!(p.cursor_name().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn cursor_stays_on_dotdot_when_filter_matches_nothing() {
+        let mut p = alpha_pane();
+        p.filter = "no-such-entry".to_string();
+        p.recompute_visible(None);
+
+        // No matches → nothing to select → cursor remains on the ".." row.
+        assert!(p.visible_indices.is_empty());
         assert_eq!(p.selected, 0);
-        assert_eq!(p.anchor, 0);
     }
 
     #[test]
@@ -3144,6 +3209,21 @@ this is not an ls line
     }
 
     #[test]
+    fn available_palette_actions_always_lists_open_terminal() {
+        // Always offered (in or out of a git repo) — it's never contextual.
+        assert!(available_palette_actions(false).contains(&PaletteAction::OpenTerminal));
+        assert!(available_palette_actions(true).contains(&PaletteAction::OpenTerminal));
+        assert_eq!(PaletteAction::OpenTerminal.label(), "Open Terminal in this folder");
+    }
+
+    #[test]
+    fn available_palette_actions_always_lists_open_in_editor() {
+        assert!(available_palette_actions(false).contains(&PaletteAction::OpenInEditor));
+        assert!(available_palette_actions(true).contains(&PaletteAction::OpenInEditor));
+        assert_eq!(PaletteAction::OpenInEditor.label(), "Open folder in editor");
+    }
+
+    #[test]
     fn palette_action_enabled_gates_dropbox_on_credentials() {
         assert!(!palette_action_enabled(PaletteAction::OpenDropbox, false));
         assert!(palette_action_enabled(PaletteAction::OpenDropbox, true));
@@ -3346,7 +3426,7 @@ this is not an ls line
             .flat_map(|(_, b)| b.into_iter().map(|(k, _)| k))
             .collect::<Vec<_>>()
             .join(" | ");
-        for needle in ["⌘P", "⌘⇧P", "F4", "F5", "F10", "Tab", "Esc"] {
+        for needle in ["⌘P", "⌘⇧P", "F4", "F5", "F7", "F8", "F10", "Tab", "Esc"] {
             assert!(joined.contains(needle), "missing binding: {}", needle);
         }
     }

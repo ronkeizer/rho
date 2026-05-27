@@ -1370,6 +1370,28 @@ pub fn delete_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Create directory `name` inside `parent`. `name` is taken relative to
+/// `parent` and may include nested components (`a/b` → `parent/a/b`); leading
+/// and trailing whitespace is trimmed. Rejects an empty or absolute name, and
+/// refuses to clobber an existing path. Returns the created directory on
+/// success. Pure enough to unit-test against a tempdir.
+pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name is empty".into());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err("Folder name must be relative".into());
+    }
+    let target = parent.join(candidate);
+    if target.exists() {
+        return Err(format!("{} already exists", trimmed));
+    }
+    std::fs::create_dir_all(&target).map_err(|e| format!("Create folder failed: {}", e))?;
+    Ok(target)
+}
+
 /// Move `src` to `dst`. Tries `fs::rename` first (atomic on the same
 /// filesystem) and falls back to `copy_recursive` + `delete_path` when
 /// rename fails with EXDEV (Linux/macOS = 18, Windows = 17 / ERROR_NOT_
@@ -2235,9 +2257,139 @@ fn macos_claude_apple_script(app: &str, path: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Open Terminal
+// ---------------------------------------------------------------------------
+
+/// Open a new terminal window with an interactive shell whose working
+/// directory is `path`. Mirrors [`open_claude_code`] but stops at the `cd` —
+/// no command is exec'd, so the user is left at a prompt in that folder.
+pub fn open_terminal(path: &Path, terminal_app: Option<&str>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = resolve_macos_terminal_app(terminal_app);
+        let script = macos_terminal_cwd_apple_script(&app, &path.display().to_string());
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch {}: {}", app, e))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // current_dir makes the terminal — and the shell it spawns — inherit
+        // that cwd. No `-e` command, so the default interactive shell runs.
+        let _ = terminal_app;
+        std::process::Command::new("x-terminal-emulator")
+            .current_dir(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch x-terminal-emulator: {}", e))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = terminal_app;
+        std::process::Command::new("cmd")
+            .current_dir(path)
+            .args(["/C", "start", "cmd"])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch cmd: {}", e))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (path, terminal_app);
+        Err("opening a terminal isn't supported on this platform".to_string())
+    }
+}
+
+/// Build the AppleScript that opens `app` with a session that has cd'd into
+/// `path` and then left an interactive shell running. Same iTerm-vs-Terminal
+/// dispatch as [`macos_claude_apple_script`]; the only difference is the inner
+/// command stops after `cd` (iTerm re-`exec`s a login shell so the window
+/// stays open, since its `command` is the session's main process).
+#[cfg(target_os = "macos")]
+fn macos_terminal_cwd_apple_script(app: &str, path: &str) -> String {
+    let single_quoted_path = path.replace('\'', "'\\''");
+    let lowered = app.to_ascii_lowercase();
+    if lowered == "iterm" || lowered == "iterm2" {
+        // iTerm runs `command` as the session's argv. A bare `cd` would exit
+        // immediately, so re-exec a login shell to keep the window alive.
+        // `${SHELL:-/bin/sh}` is left unquoted (shell paths have no spaces) so
+        // it doesn't collide with the surrounding `sh -c "..."` quoting.
+        let shell_cmd = format!("cd '{}' && exec ${{SHELL:-/bin/sh}} -l", single_quoted_path);
+        let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "tell application \"{app}\"\n    \
+                 activate\n    \
+                 create window with default profile command \"sh -c \\\"{escaped}\\\"\"\n\
+             end tell"
+        )
+    } else {
+        // Terminal `do script` types into the user's shell, which stays open.
+        let shell_cmd = format!("cd '{}'", single_quoted_path);
+        let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("tell application \"{app}\" to do script \"{escaped}\"")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open folder in editor
+// ---------------------------------------------------------------------------
+
+/// Open `path` (a folder) in the configured editor by spawning
+/// `<editor> <path>`. Used by the "Open folder in editor" palette action;
+/// `editor` comes from `Config::folder_editor` (defaults to the VS Code CLI,
+/// which opens the folder as a workspace). Fire-and-forget — we don't follow
+/// the editor process. A missing / non-executable editor surfaces as an error
+/// string the caller logs.
+pub fn open_folder_in_editor(path: &Path, editor: &str) -> Result<(), String> {
+    std::process::Command::new(editor)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to launch editor `{}`: {}", editor, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn make_dir_creates_simple_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = make_dir(dir.path(), "newfolder").unwrap();
+        assert_eq!(created, dir.path().join("newfolder"));
+        assert!(created.is_dir());
+    }
+
+    #[test]
+    fn make_dir_trims_and_creates_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = make_dir(dir.path(), "  a/b/c  ").unwrap();
+        assert_eq!(created, dir.path().join("a/b/c"));
+        assert!(created.is_dir());
+    }
+
+    #[test]
+    fn make_dir_rejects_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(make_dir(dir.path(), "   ").is_err());
+    }
+
+    #[test]
+    fn make_dir_rejects_absolute_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("abs");
+        assert!(make_dir(dir.path(), abs.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn make_dir_refuses_to_clobber_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dup")).unwrap();
+        assert!(make_dir(dir.path(), "dup").is_err());
+    }
 
     #[test]
     fn copy_recursive_single_file() {
@@ -2463,6 +2615,41 @@ mod tests {
         // Shell-level: cd 'it'\''s'  — at AppleScript layer the backslash is
         // doubled because shell_quote escapes \ for AppleScript embedding.
         assert!(script.contains("'/Users/me/it'\\\\''s/here'"));
+    }
+
+    #[test]
+    fn macos_terminal_cwd_script_terminal_does_plain_cd() {
+        // Terminal `do script` types into an interactive shell that stays
+        // open, so a bare `cd` is enough — no exec, no command wrapper.
+        let script = macos_terminal_cwd_apple_script("Terminal", "/Users/me/project");
+        assert_eq!(
+            script,
+            "tell application \"Terminal\" to do script \"cd '/Users/me/project'\""
+        );
+    }
+
+    #[test]
+    fn macos_terminal_cwd_script_iterm_reexecs_login_shell() {
+        // iTerm's `command` is the session's main process, so a bare `cd`
+        // would exit; re-exec a login shell to keep the window alive.
+        let script = macos_terminal_cwd_apple_script("iTerm", "/Users/me/project");
+        assert!(script.contains("create window with default profile command"));
+        assert!(script.contains("sh -c \\\"cd '/Users/me/project' && exec ${SHELL:-/bin/sh} -l\\\""));
+    }
+
+    #[test]
+    fn macos_terminal_cwd_script_quotes_path_with_spaces() {
+        let script = macos_terminal_cwd_apple_script("Terminal", "/Users/me/My Projects/rho");
+        assert!(script.contains("cd '/Users/me/My Projects/rho'"));
+    }
+
+    #[test]
+    fn open_folder_in_editor_errors_on_missing_binary() {
+        // A non-existent editor binary fails fast with a descriptive error
+        // rather than silently doing nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let err = open_folder_in_editor(dir.path(), "/nonexistent/editor-xyz").unwrap_err();
+        assert!(err.contains("/nonexistent/editor-xyz"));
     }
 
     #[test]

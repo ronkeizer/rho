@@ -12,6 +12,10 @@ use crate::domain::{Location, Side};
 pub const SETTINGS_FILENAME: &str = ".rho.yaml";
 pub const STATE_FILENAME: &str = ".rho-state.yaml";
 
+/// Default editor binary for the "Open folder in editor" action — the VS Code
+/// CLI as installed by "Shell Command: Install 'code' command in PATH".
+pub const DEFAULT_FOLDER_EDITOR: &str = "/usr/local/bin/code";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -37,6 +41,13 @@ pub struct Config {
     /// to `"iTerm"` when `/Applications/iTerm.app` exists, otherwise
     /// `"Terminal"`. On Linux / Windows this field is currently ignored.
     pub terminal_app: Option<String>,
+    /// Editor binary launched by the "Open folder in editor" palette action,
+    /// invoked as `<folder_editor> <folder-path>`. Defaults to
+    /// [`DEFAULT_FOLDER_EDITOR`] (the VS Code CLI). Resolve via
+    /// [`Config::folder_editor`] so an empty / whitespace value falls back to
+    /// the default rather than trying to spawn `""`.
+    #[serde(default)]
+    pub folder_editor: Option<String>,
     /// Dropbox app key (client id) from the Dropbox App Console. Combined
     /// with `dropbox_refresh_token` to mint short-lived access tokens for
     /// the `dropbox:` remote backend. `None` (the default) hides the
@@ -72,6 +83,7 @@ impl Default for Config {
             folder_color: Some("#6db4ff".to_string()),
             watch_folders: vec!["~/Downloads".to_string()],
             terminal_app: None,
+            folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
             dropbox_app_key: None,
             dropbox_app_secret: None,
             dropbox_refresh_token: None,
@@ -130,6 +142,16 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// The editor binary for "Open folder in editor". Falls back to
+    /// [`DEFAULT_FOLDER_EDITOR`] when unset or blank.
+    pub fn folder_editor(&self) -> &str {
+        self.folder_editor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_FOLDER_EDITOR)
     }
 
     pub fn row_padding_y(&self) -> u16 {
@@ -272,6 +294,9 @@ fn default_template_yaml() -> &'static str {
      # macOS only. Which terminal app the SSH / Docker shell actions use.\n\
      # Defaults to \"iTerm\" if /Applications/iTerm.app exists, else \"Terminal\".\n\
      # terminal_app: \"iTerm\"\n\
+     # Editor launched by \"Open folder in editor\" (run as `<editor> <folder>`).\n\
+     # Defaults to the VS Code CLI; point it at any editor that opens a folder.\n\
+     # folder_editor: \"/usr/local/bin/code\"\n\
      # Dropbox backend. Lets panes browse / copy / move / delete under dropbox:/\n\
      # and enables the \"Open Dropbox\" command. Full setup (create app, grant\n\
      # files.* scopes, mint a refresh token via the authorize flow) is in the\n\
@@ -475,6 +500,35 @@ mod tests {
         // Default ships with folder color set so users see colored dirs out of
         // the box.
         assert!(c.folder_color.is_some());
+    }
+
+    #[test]
+    fn folder_editor_defaults_to_vscode_cli() {
+        // Out of the box the action targets the VS Code CLI.
+        assert_eq!(Config::default().folder_editor(), DEFAULT_FOLDER_EDITOR);
+    }
+
+    #[test]
+    fn folder_editor_uses_configured_value_and_trims() {
+        let c = Config {
+            folder_editor: Some("  /opt/nvim/bin/nvim  ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(c.folder_editor(), "/opt/nvim/bin/nvim");
+    }
+
+    #[test]
+    fn folder_editor_falls_back_when_blank_or_unset() {
+        let blank = Config {
+            folder_editor: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(blank.folder_editor(), DEFAULT_FOLDER_EDITOR);
+        let unset = Config {
+            folder_editor: None,
+            ..Config::default()
+        };
+        assert_eq!(unset.folder_editor(), DEFAULT_FOLDER_EDITOR);
     }
 
     #[test]
