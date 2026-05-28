@@ -16,7 +16,7 @@ use iced::widget::{button, column, container, mouse_area, row, scrollable, text,
 use iced::{Border, Color, Element, Font, Length, Padding, Shadow, Theme};
 
 use crate::config::{blend, dim, Config, RowColors};
-use crate::domain::{GitInfo, Pane, RowVisual, Side, SortBy, SortDir};
+use crate::domain::{file_has_custom_action, GitInfo, Pane, RowVisual, Side, SortBy, SortDir};
 use crate::Message;
 
 pub fn view_pane<'a>(
@@ -123,7 +123,7 @@ pub fn view_pane<'a>(
 
     // ".." row — treated as a directory for color purposes, never dimmed.
     let up_visual = row_visual(pane, 0);
-    let up_name_color = folder_name_color(true, up_visual, active, colors);
+    let up_name_color = entry_name_color(true, false, up_visual, active, colors);
     let up = build_row(
         0,
         "..".to_string(),
@@ -165,7 +165,8 @@ pub fn view_pane<'a>(
         let size_str = entry.size.map(format_size).unwrap_or_default();
         let mod_str = entry.modified.map(format_modified).unwrap_or_default();
         let visual = row_visual(pane, row_idx);
-        let name_color = folder_name_color(entry.is_dir, visual, active, colors);
+        let has_action = !entry.is_dir && file_has_custom_action(&config.file_actions, &entry.name);
+        let name_color = entry_name_color(entry.is_dir, has_action, visual, active, colors);
         let in_selection = active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
         let dim_row = entry.name.starts_with('.') && !in_selection;
         let git_modified = pane
@@ -331,15 +332,25 @@ fn filter_bar<'a>(pane: &Pane, config: &Config, active: bool) -> Element<'a, Mes
 
 /// Folder color applies only when the row is *not* part of the active pane's
 /// selection — otherwise the cursor/mark text color would clash with it.
-fn folder_name_color(
+/// Name-cell color override for a row: the folder color for directories, the
+/// action color for files that have a matching `file_actions` entry, and
+/// `None` (theme default) otherwise. Suppressed while the row is part of the
+/// active pane's selection so the highlight stays unambiguous — same rule the
+/// folder color always followed.
+fn entry_name_color(
     is_dir: bool,
+    has_action: bool,
     visual: RowVisual,
     pane_active: bool,
     colors: RowColors,
 ) -> Option<Color> {
     let in_selection = pane_active && matches!(visual, RowVisual::Cursor | RowVisual::Marked);
-    if !in_selection && is_dir {
+    if in_selection {
+        None
+    } else if is_dir {
         colors.folder
+    } else if has_action {
+        colors.action
     } else {
         None
     }
@@ -643,6 +654,47 @@ mod tests {
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
+    }
+
+    fn test_colors() -> RowColors {
+        RowColors {
+            cursor: Some(Color::from_rgb(0.0, 0.0, 1.0)),
+            mark: None,
+            stripe: None,
+            folder: Some(Color::from_rgb(0.1, 0.2, 0.3)),
+            action: Some(Color::from_rgb(0.7, 0.4, 0.7)),
+        }
+    }
+
+    #[test]
+    fn entry_name_color_files_with_action_use_action_color() {
+        let c = test_colors();
+        // A plain file with a matching action gets the action color…
+        assert_eq!(
+            entry_name_color(false, true, RowVisual::None, true, c),
+            c.action
+        );
+        // …a file without one gets the theme default (None)…
+        assert_eq!(entry_name_color(false, false, RowVisual::None, true, c), None);
+        // …and a directory always wins with the folder color.
+        assert_eq!(
+            entry_name_color(true, true, RowVisual::None, true, c),
+            c.folder
+        );
+    }
+
+    #[test]
+    fn entry_name_color_suppressed_in_active_selection() {
+        let c = test_colors();
+        // Cursor / marked rows in the active pane drop the override so the
+        // selection highlight reads cleanly — for both folders and actions.
+        assert_eq!(entry_name_color(false, true, RowVisual::Cursor, true, c), None);
+        assert_eq!(entry_name_color(true, false, RowVisual::Marked, true, c), None);
+        // In the *inactive* pane the override stays (no selection there).
+        assert_eq!(
+            entry_name_color(false, true, RowVisual::Cursor, false, c),
+            c.action
+        );
     }
 
     #[test]

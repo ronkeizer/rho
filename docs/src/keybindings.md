@@ -17,7 +17,7 @@ key the OS treats as the "logo" / Super key. The app reads it through iced's
 | `PageUp` / `PageDown` | Move by one page (computed from current viewport) |
 | `Shift +` arrow / page key | Extend the selection from the anchor |
 | `Tab` | Switch the active pane (left ↔ right) |
-| `Enter` | If cursor is on `..`, go up. On a directory, descend. On a `.zip`, extract to `/tmp` and browse (large archives prompt first — see below). On any other file, open via the OS default app. |
+| `Enter` | If cursor is on `..`, go up. On a directory, descend. On a `.zip`, extract to `/tmp` and browse (large archives prompt first — see below). On any other file, open the **file-action chooser** (see the modal table below) — always "Open with default application", plus any matching [`file_actions`](./configuration.md). Files with a matching action are highlighted in the listing. |
 | `Backspace` | Go to the parent directory (or, if a filter is active, delete one character from it) |
 
 ## Marking & range selection
@@ -90,6 +90,7 @@ Inside a modal, the navigation keys behave differently:
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
 | Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. |
 | New folder (text input only) | `Enter` creates the named directory in the active pane (nested names like `a/b` are created in full), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
+| Open file (chooser) | Shown when `Enter` is pressed on a non-archive file. `↑` / `↓` / `Tab` move the highlight, `Enter` or a click runs it, `Esc` cancels. The first row is always "Open with default application"; the rest are [`file_actions`](./configuration.md) whose pattern matched. Background actions show "Running…" in the status bar and refresh the panes when done; `terminal: true` actions open a terminal window. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | Large-archive extract confirm | Shown when `Enter` is pressed on a `.zip` over 100 MiB. `Tab` / `←` / `→` toggle Cancel ↔ Extract focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel. |

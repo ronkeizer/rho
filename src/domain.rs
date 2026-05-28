@@ -255,6 +255,192 @@ pub enum RowVisual {
 }
 
 /// Modal flavors. Each carries the data the modal needs.
+/// A user-defined "open with…" action for files matching `pattern`, read from
+/// the `file_actions` list in `~/.rho.yaml`. When Enter is pressed on a file
+/// whose name matches `pattern` (a `*`/`?` glob, see [`glob_match`]), `label`
+/// appears as a choice in the [`Prompt::FileActions`] modal and `command` is
+/// run on activation. `command` is a shell line with placeholders substituted
+/// by [`substitute_command`]; `terminal` decides whether it runs in the
+/// background (`false`, default) or in a terminal window (`true`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct FileAction {
+    pub pattern: String,
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub terminal: bool,
+}
+
+/// One row in the [`Prompt::FileActions`] modal. `OpenDefault` is the built-in
+/// "open in the OS default app" choice (always first); `Custom` wraps a
+/// matched [`FileAction`] (label + raw command template + terminal flag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChoice {
+    OpenDefault,
+    Custom {
+        label: String,
+        command: String,
+        terminal: bool,
+    },
+}
+
+impl FileChoice {
+    /// Display label for the choice's primary line.
+    pub fn label(&self) -> &str {
+        match self {
+            FileChoice::OpenDefault => "Open with default application",
+            FileChoice::Custom { label, .. } => label,
+        }
+    }
+}
+
+/// Case-insensitive glob match of `name` against `pattern`, supporting `*`
+/// (any run, including empty) and `?` (exactly one char). Everything else is
+/// a literal. The whole name must match (the pattern is implicitly anchored at
+/// both ends), so `*.md` matches `notes.md` but `*.md` does not match `a.mdx`.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    // Classic two-pointer wildcard match with backtracking on the last `*`.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Mismatch: let the last `*` swallow one more char and retry.
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `*`s in the pattern match the empty remainder.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// The configured file actions whose `pattern` matches `name`, in config order.
+pub fn matching_file_actions<'a>(actions: &'a [FileAction], name: &str) -> Vec<&'a FileAction> {
+    actions
+        .iter()
+        .filter(|a| glob_match(&a.pattern, name))
+        .collect()
+}
+
+/// Whether any configured action matches `name` — drives the pane row
+/// highlight (a colored name) so the user knows Enter offers more than the
+/// default open.
+pub fn file_has_custom_action(actions: &[FileAction], name: &str) -> bool {
+    actions.iter().any(|a| glob_match(&a.pattern, name))
+}
+
+/// Build the choice list for the [`Prompt::FileActions`] modal: the built-in
+/// default-open first, then every matching custom action in config order.
+pub fn build_file_choices(actions: &[FileAction], name: &str) -> Vec<FileChoice> {
+    let mut choices = vec![FileChoice::OpenDefault];
+    for a in matching_file_actions(actions, name) {
+        choices.push(FileChoice::Custom {
+            label: a.label.clone(),
+            command: a.command.clone(),
+            terminal: a.terminal,
+        });
+    }
+    choices
+}
+
+/// POSIX single-quote a string for safe interpolation into a `sh` command
+/// line. Embeds the input verbatim except for `'`, which becomes the canonical
+/// `'\''` close-reopen sequence. Single-quoting neutralises `$`, `` ` ``, `"`,
+/// `\`, spaces and globs — everything except `'` passes through literally.
+pub fn posix_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Expand the placeholders in a custom-action command template against `path`:
+///
+/// - `{file}` → file name with extension (`report.md`)
+/// - `{stem}` → file name without its final extension (`report`)
+/// - `{ext}`  → final extension without the dot (`md`; empty if none)
+/// - `{path}` → the absolute path as given
+/// - `{dir}`  → the parent directory path (empty if none)
+///
+/// Each substituted value is **POSIX-shell-quoted** ([`posix_quote`]), so file
+/// names containing spaces or shell metacharacters (`$(…)`, `;`, `'`, …) are
+/// passed as a single literal argument and can't inject commands — the
+/// template author must therefore NOT add their own quotes around a
+/// placeholder. The surrounding template text is left untouched, so pipes,
+/// redirects and `&&` in the template still work. The command runs with the
+/// file's parent directory as the working directory.
+///
+/// Substitution is a single left-to-right pass, so a value that happens to
+/// contain a placeholder-looking substring (a file literally named
+/// `a{ext}b`) is never re-expanded. Unknown `{…}` tokens are passed through
+/// verbatim.
+pub fn substitute_command(template: &str, path: &Path) -> String {
+    let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let path_str = path.to_str().unwrap_or("");
+    let dir = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        // Look for the closing brace after this '{'.
+        match rest[open + 1..].find('}') {
+            Some(rel_close) => {
+                let token = &rest[open + 1..open + 1 + rel_close];
+                let value = match token {
+                    "file" => Some(file),
+                    "stem" => Some(stem),
+                    "ext" => Some(ext),
+                    "path" => Some(path_str),
+                    "dir" => Some(dir),
+                    _ => None,
+                };
+                match value {
+                    Some(v) => out.push_str(&posix_quote(v)),
+                    // Unknown token — emit it untouched so the user sees their
+                    // literal `{whatever}` rather than a silent deletion.
+                    None => {
+                        out.push('{');
+                        out.push_str(token);
+                        out.push('}');
+                    }
+                }
+                rest = &rest[open + 1 + rel_close + 1..];
+            }
+            // No closing brace: emit the rest (including this '{') and stop.
+            None => {
+                out.push_str(&rest[open..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[derive(Debug, Clone)]
 pub enum Prompt {
     /// "Go to folder" — typed input plus a filterable list of recent locations
@@ -378,6 +564,16 @@ pub enum Prompt {
     SshServers {
         state: SshServersState,
         input: String,
+        selected: usize,
+    },
+    /// "Open file" chooser, shown when Enter is pressed on a (non-archive)
+    /// file. `choices[0]` is always [`FileChoice::OpenDefault`]; any remaining
+    /// entries are config-defined [`FileChoice::Custom`] actions whose glob
+    /// matched the file's name. `selected` is the keyboard highlight (↑/↓),
+    /// Enter activates it. `path` is the absolute file path the action runs on.
+    FileActions {
+        path: PathBuf,
+        choices: Vec<FileChoice>,
         selected: usize,
     },
 }
@@ -3649,5 +3845,165 @@ Host work
         // as the stem so we don't end up with an empty filename.
         let srcs = vec![PathBuf::from("/tmp/.gitignore")];
         assert_eq!(default_zip_filename(&srcs), ".gitignore.zip");
+    }
+
+    // ---- file actions ---------------------------------------------------
+
+    #[test]
+    fn glob_match_extension_patterns() {
+        assert!(glob_match("*.md", "notes.md"));
+        assert!(glob_match("*.md", "a.b.md"));
+        assert!(!glob_match("*.md", "notes.mdx"));
+        assert!(!glob_match("*.md", "mdfile"));
+    }
+
+    #[test]
+    fn glob_match_is_case_insensitive() {
+        assert!(glob_match("*.MD", "notes.md"));
+        assert!(glob_match("*.md", "NOTES.MD"));
+    }
+
+    #[test]
+    fn glob_match_question_mark_is_single_char() {
+        assert!(glob_match("a?c.txt", "abc.txt"));
+        assert!(!glob_match("a?c.txt", "ac.txt"));
+        assert!(!glob_match("a?c.txt", "abbc.txt"));
+    }
+
+    #[test]
+    fn glob_match_multiple_stars_and_double_extension() {
+        assert!(glob_match("*.tar.gz", "archive.tar.gz"));
+        assert!(glob_match("*report*", "q3-report-final.pdf"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn matching_file_actions_filters_and_preserves_order() {
+        let actions = vec![
+            FileAction {
+                pattern: "*.md".into(),
+                label: "PDF".into(),
+                command: "pandoc {file}".into(),
+                terminal: false,
+            },
+            FileAction {
+                pattern: "*.png".into(),
+                label: "Open".into(),
+                command: "view {file}".into(),
+                terminal: false,
+            },
+            FileAction {
+                pattern: "*".into(),
+                label: "Hash".into(),
+                command: "shasum {file}".into(),
+                terminal: true,
+            },
+        ];
+        let m = matching_file_actions(&actions, "readme.md");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].label, "PDF");
+        assert_eq!(m[1].label, "Hash");
+        assert!(file_has_custom_action(&actions, "x.png"));
+        // The catch-all `*` means every file has at least one action here.
+        assert!(file_has_custom_action(&actions, "anything.xyz"));
+    }
+
+    #[test]
+    fn build_file_choices_prepends_default_open() {
+        let actions = vec![FileAction {
+            pattern: "*.md".into(),
+            label: "Convert to PDF".into(),
+            command: "pandoc -o {stem}.pdf {file}".into(),
+            terminal: false,
+        }];
+        let choices = build_file_choices(&actions, "notes.md");
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0], FileChoice::OpenDefault);
+        assert_eq!(choices[0].label(), "Open with default application");
+        assert_eq!(
+            choices[1],
+            FileChoice::Custom {
+                label: "Convert to PDF".into(),
+                command: "pandoc -o {stem}.pdf {file}".into(),
+                terminal: false,
+            }
+        );
+        // A file with no matching action still gets the default-open choice.
+        assert_eq!(build_file_choices(&actions, "photo.png").len(), 1);
+    }
+
+    #[test]
+    fn posix_quote_wraps_and_escapes() {
+        assert_eq!(posix_quote("foo"), "'foo'");
+        assert_eq!(posix_quote("/var/log"), "'/var/log'");
+        // `it's` → 'it'\''s' (close, escaped quote, reopen).
+        assert_eq!(posix_quote("it's"), r"'it'\''s'");
+        // $ \ " ` etc. pass through untouched inside the single quotes.
+        assert_eq!(posix_quote(r#"a $b \c "d" `e`"#), r#"'a $b \c "d" `e`'"#);
+    }
+
+    #[test]
+    fn substitute_command_quotes_each_value() {
+        let p = Path::new("/Users/ron/docs/report.md");
+        // Values are single-quoted; the template text around them is verbatim,
+        // so `'report'.pdf` concatenates to report.pdf in the shell.
+        assert_eq!(
+            substitute_command("pandoc -o {stem}.pdf {file}", p),
+            "pandoc -o 'report'.pdf 'report.md'"
+        );
+        assert_eq!(substitute_command("echo {ext}", p), "echo 'md'");
+        assert_eq!(substitute_command("ls {dir}", p), "ls '/Users/ron/docs'");
+        assert_eq!(
+            substitute_command("cat {path}", p),
+            "cat '/Users/ron/docs/report.md'"
+        );
+        // Pipes / && in the template survive (only values are quoted).
+        assert_eq!(
+            substitute_command("cat {file} | wc -l", p),
+            "cat 'report.md' | wc -l"
+        );
+    }
+
+    #[test]
+    fn substitute_command_dotfile_stem_is_whole_name() {
+        // `.gitignore` has no separating extension — stem is the whole name.
+        let p = Path::new("/tmp/.gitignore");
+        assert_eq!(substitute_command("edit {stem}", p), "edit '.gitignore'");
+    }
+
+    #[test]
+    fn substitute_command_neutralizes_command_injection_in_filename() {
+        // A hostile file name can't break out of the quoting to run commands.
+        let p = Path::new("/tmp/$(rm -rf ~).md");
+        assert_eq!(
+            substitute_command("pandoc {file}", p),
+            "pandoc '$(rm -rf ~).md'"
+        );
+        // A name containing a single quote is escaped, not terminated early.
+        let q = Path::new("/tmp/it's a file.md");
+        assert_eq!(
+            substitute_command("wc -l {file}", q),
+            r"wc -l 'it'\''s a file.md'"
+        );
+    }
+
+    #[test]
+    fn substitute_command_single_pass_does_not_re_expand() {
+        // A file literally named with `{ext}` in it must not have that token
+        // re-expanded by a later pass.
+        let p = Path::new("/tmp/a{ext}b.md");
+        assert_eq!(substitute_command("echo {file}", p), "echo 'a{ext}b.md'");
+    }
+
+    #[test]
+    fn substitute_command_passes_through_unknown_tokens() {
+        let p = Path::new("/tmp/x.md");
+        assert_eq!(
+            substitute_command("tool {file} {unknown}", p),
+            "tool 'x.md' {unknown}"
+        );
+        // An unterminated brace is emitted verbatim.
+        assert_eq!(substitute_command("echo {file", p), "echo {file");
     }
 }

@@ -29,6 +29,8 @@ to see it.
 | `cursor_color` | string `#rrggbb` | _(theme-derived)_ | Selection cursor color. Omit to use the iced theme's primary-strong color. |
 | `mark_color` | string `#rrggbb` | _(theme-derived)_ | Background for marked rows (range selection). Omit to use the theme's primary-weak color. |
 | `folder_color` | string `#rrggbb` | `#6db4ff` | Name color for directory entries. |
+| `action_color` | string `#rrggbb` | `#b48ead` | Name color for files that have a matching `file_actions` entry — a cue that `Enter` offers more than the default open. |
+| `file_actions` | list of actions | _(empty)_ | Custom "open with…" entries shown in the file-action chooser. See [File actions](#file-actions) below. |
 | `watch_folders` | list of strings | `["~/Downloads"]` | Folders to watch for new files. Read once at startup; restart to apply changes. |
 | `terminal_app` | string | _(auto)_ | macOS only. Which terminal app to launch for the SSH `Connect`, Docker `Shell`, `Open Claude Code in this folder`, and `Open Terminal in this folder` actions. Common values: `"iTerm"`, `"Terminal"`. Omit (or leave `None`) to auto-pick: `iTerm` when `/Applications/iTerm.app` exists, otherwise `Terminal`. Ignored on Linux / Windows. |
 | `folder_editor` | string | `/usr/local/bin/code` | Editor binary for the **Open folder in editor** action, invoked as `<folder_editor> <folder>`. Defaults to the VS Code CLI. Point it at any editor that opens a directory argument (Sublime's `subl`, a `code` under `/opt/homebrew/bin`, an editor wrapper script, etc.). A blank value falls back to the default. |
@@ -155,6 +157,56 @@ app shows a modal asking whether to switch one of the panes to that folder.
 - A 500ms quiet window coalesces bursts (e.g. extracting an archive) into a
   single modal.
 
+## File actions
+
+Pressing `Enter` on a file (other than a `.zip`, which still extracts) opens a
+small chooser. The first row is always **Open with default application**; below
+it are any `file_actions` entries whose `pattern` matched the file name. Files
+that have at least one matching action are shown in `action_color` in the
+listing, so you can tell at a glance that `Enter` offers more than a plain open.
+
+Each entry has these fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `pattern` | yes | Filename glob, matched case-insensitively. `*` matches any run (incl. empty), `?` matches one character; everything else is literal. The whole name must match, so `*.md` matches `notes.md` but not `notes.mdx`. |
+| `label` | yes | Text shown for the choice in the chooser. |
+| `command` | yes | Shell line to run, with placeholders substituted (see below). |
+| `terminal` | no (default `false`) | `false` runs the command in the background and refreshes the panes when it finishes (errors go to the status bar). `true` opens a terminal window running it — use it for interactive or long-running commands. |
+
+Commands run with the file's **own folder as the working directory**, so bare
+relative names usually suffice. Placeholders in `command`:
+
+| Placeholder | Expands to | Example (`/docs/report.md`) |
+|---|---|---|
+| `{file}` | file name with extension | `report.md` |
+| `{stem}` | file name without its final extension | `report` |
+| `{ext}` | final extension, no dot | `md` |
+| `{path}` | the absolute path | `/docs/report.md` |
+| `{dir}` | the parent directory | `/docs` |
+
+Each placeholder is **shell-quoted automatically**, so a file name containing
+spaces, quotes, or shell metacharacters (`$(…)`, `;`, `` ` ``) is passed as one
+literal argument and can't inject commands — **don't add your own quotes**
+around a placeholder (write `pandoc -o {stem}.pdf {file}`, not `"{file}"`). The
+template text around placeholders is left as-is, so pipes, `&&`, and redirects
+still work. `terminal: false` commands discard stdout (there's no terminal to
+show it) and report a non-zero exit in the status bar; a command that streams a
+lot of output or never exits (`tail -f`) should use `terminal: true`. On macOS
+the `terminal: true` variant honors the `terminal_app` setting; only local
+panes are supported (the action no-ops on a remote pane).
+
+```yaml
+file_actions:
+  - pattern: "*.md"
+    label: "Convert to PDF (pandoc)"
+    command: "pandoc -o {stem}.pdf {file}"
+  - pattern: "*.tar.gz"
+    label: "Inspect in shell"
+    command: "tar tzvf {file} | less"
+    terminal: true
+```
+
 ## Example
 
 ```yaml
@@ -172,6 +224,13 @@ folder_color: "#6db4ff"
 # stripe_color: "#1c1d1f"
 # cursor_color: "#3a80c8"
 # mark_color: "#2a4a6a"
+# Name color for files that have a matching file_actions entry.
+# action_color: "#b48ead"
+# Custom "open with…" actions — see the File actions section above.
+# file_actions:
+#   - pattern: "*.md"
+#     label: "Convert to PDF (pandoc)"
+#     command: "pandoc -o {stem}.pdf {file}"
 # Folders to watch for new files.
 watch_folders:
   - "~/Downloads"

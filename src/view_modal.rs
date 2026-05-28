@@ -14,7 +14,7 @@ use crate::domain::{
     filtered_actions, filtered_apps, filtered_branches, filtered_containers, filtered_processes,
     filtered_recents, filtered_servers, keyboard_shortcuts, palette_action_enabled, AppsState,
     DeleteFocus, DockerSortBy,
-    DockerState, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
+    DockerState, FileChoice, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
     Prompt, Side, SortDir, SshServersState,
 };
 use crate::view_pane::format_size;
@@ -31,6 +31,7 @@ pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
         | Prompt::GitBranches { .. }
         | Prompt::SshServers { .. } => 720.0,
         Prompt::KeyboardShortcuts => 600.0,
+        Prompt::FileActions { .. } => 520.0,
         _ => 440.0,
     };
     let dialog_inner = container(match prompt {
@@ -1143,6 +1144,74 @@ pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
             ]
             .spacing(8)
         }
+        Prompt::FileActions {
+            path,
+            choices,
+            selected,
+        } => {
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let list_col = choices.iter().enumerate().fold(
+                column![].spacing(2),
+                |col, (i, choice)| {
+                    let highlighted = i == *selected;
+                    // Primary line: the choice label. Secondary (dim) line:
+                    // the command, or a hint for the built-in default-open.
+                    let (subtitle, terminal) = match choice {
+                        FileChoice::OpenDefault => ("opens in the OS default app".to_string(), false),
+                        FileChoice::Custom {
+                            command, terminal, ..
+                        } => (command.clone(), *terminal),
+                    };
+                    let label_line = if terminal {
+                        format!("{}  ⧉ terminal", choice.label())
+                    } else {
+                        choice.label().to_string()
+                    };
+                    let row_body = column![
+                        text(label_line).size(13),
+                        text(subtitle)
+                            .font(Font::MONOSPACE)
+                            .size(10)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .style(|theme: &Theme| iced::widget::text::Style {
+                                color: Some(dim(theme.extended_palette().background.base.text)),
+                            }),
+                    ]
+                    .spacing(2);
+                    let style: fn(&Theme, button::Status) -> button::Style = if highlighted {
+                        button::primary
+                    } else {
+                        button::text
+                    };
+                    col.push(
+                        button(row_body)
+                            .on_press(Message::FileChoiceActivate(i))
+                            .padding(Padding::from([6, 8]))
+                            .width(Length::Fill)
+                            .style(style),
+                    )
+                },
+            );
+            column![
+                text(format!("Open  {}", file_name)).size(15),
+                scrollable(list_col)
+                    .id(scrollable::Id::new(MODAL_LIST_ID))
+                    .on_scroll(|v| {
+                        Message::ModalScrolled(
+                            v.absolute_offset().y,
+                            v.bounds().height,
+                            v.content_bounds().height,
+                        )
+                    })
+                    .height(Length::Shrink),
+                text("↑/↓ select  ·  Enter or click to open  ·  Esc cancels").size(11),
+            ]
+            .spacing(8)
+        }
     })
     .padding(16)
     .width(Length::Fixed(modal_width))
@@ -1311,6 +1380,7 @@ mod tests {
             mark: None,
             stripe: Some(stripe),
             folder: None,
+            action: None,
         };
         let theme = Theme::Dark;
         // Even rows inherit the modal background (no override).
@@ -1330,6 +1400,7 @@ mod tests {
             mark: None,
             stripe: None,
             folder: None,
+            action: None,
         };
         let theme = Theme::Dark;
         // Odd rows still get a (theme-derived) stripe; even rows stay bare.
@@ -1345,6 +1416,7 @@ mod tests {
             mark: None,
             stripe: None,
             folder: None,
+            action: None,
         };
         let (bg, fg) = cursor_fill(&Theme::Dark, colors);
         assert_eq!(bg, cursor);
@@ -1359,6 +1431,7 @@ mod tests {
             mark: None,
             stripe: None,
             folder: None,
+            action: None,
         };
         let pair = Theme::Dark.extended_palette().primary.strong;
         let (bg, fg) = cursor_fill(&Theme::Dark, colors);

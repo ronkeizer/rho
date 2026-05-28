@@ -16,6 +16,10 @@ pub const STATE_FILENAME: &str = ".rho-state.yaml";
 /// CLI as installed by "Shell Command: Install 'code' command in PATH".
 pub const DEFAULT_FOLDER_EDITOR: &str = "/usr/local/bin/code";
 
+/// Default name color for files that have a matching `file_actions` entry — a
+/// soft violet, distinct from the blue `folder_color` and the amber git marker.
+pub const DEFAULT_ACTION_COLOR: &str = "#b48ead";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -32,6 +36,16 @@ pub struct Config {
     pub cursor_color: Option<String>,
     pub mark_color: Option<String>,
     pub folder_color: Option<String>,
+    /// Name color for files that have at least one matching `file_actions`
+    /// entry — a cue that Enter offers more than the default open. `None`
+    /// falls back to [`DEFAULT_ACTION_COLOR`].
+    #[serde(default)]
+    pub action_color: Option<String>,
+    /// User-defined "open with…" actions, matched by filename glob. When Enter
+    /// is pressed on a file the [`Prompt::FileActions`](crate::domain::Prompt)
+    /// modal lists the default-open plus every action whose `pattern` matches.
+    #[serde(default)]
+    pub file_actions: Vec<crate::domain::FileAction>,
     /// Folders to watch for new files. Each accepts a `~/` prefix. Non-recursive.
     /// Read once at startup — editing this requires restarting the app.
     pub watch_folders: Vec<String>,
@@ -81,6 +95,8 @@ impl Default for Config {
             cursor_color: None,
             mark_color: None,
             folder_color: Some("#6db4ff".to_string()),
+            action_color: Some(DEFAULT_ACTION_COLOR.to_string()),
+            file_actions: Vec::new(),
             watch_folders: vec!["~/Downloads".to_string()],
             terminal_app: None,
             folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
@@ -297,6 +313,26 @@ fn default_template_yaml() -> &'static str {
      # Editor launched by \"Open folder in editor\" (run as `<editor> <folder>`).\n\
      # Defaults to the VS Code CLI; point it at any editor that opens a folder.\n\
      # folder_editor: \"/usr/local/bin/code\"\n\
+     # Name color for files that have a matching file_actions entry (see below).\n\
+     # action_color: \"#b48ead\"\n\
+     # Custom \"open with…\" actions. Pressing Enter on a file shows a chooser:\n\
+     # \"Open with default application\" plus every action whose pattern (a\n\
+     # *.glob, case-insensitive) matches the file name. command placeholders:\n\
+     #   {file} name (report.md)  {stem} name w/o ext (report)  {ext} ext (md)\n\
+     #   {path} absolute path     {dir} parent dir\n\
+     # Commands run with the file's folder as the working directory. Each\n\
+     # placeholder is shell-quoted automatically, so DON'T add your own quotes\n\
+     # around one (names with spaces / special chars are handled). terminal:\n\
+     # true opens a terminal window (for interactive / long-running commands);\n\
+     # the default (false) runs in the background and refreshes the pane.\n\
+     # file_actions:\n\
+     #   - pattern: \"*.md\"\n\
+     #     label: \"Convert to PDF (pandoc)\"\n\
+     #     command: \"pandoc -o {stem}.pdf {file}\"\n\
+     #   - pattern: \"*.tar.gz\"\n\
+     #     label: \"Inspect in shell\"\n\
+     #     command: \"tar tzvf {file} | less\"\n\
+     #     terminal: true\n\
      # Dropbox backend. Lets panes browse / copy / move / delete under dropbox:/\n\
      # and enables the \"Open Dropbox\" command. Full setup (create app, grant\n\
      # files.* scopes, mint a refresh token via the authorize flow) is in the\n\
@@ -316,6 +352,9 @@ pub struct RowColors {
     pub mark: Option<Color>,
     pub stripe: Option<Color>,
     pub folder: Option<Color>,
+    /// Name color for files with a matching `file_actions` entry. Falls back
+    /// to [`DEFAULT_ACTION_COLOR`] when unset / unparseable.
+    pub action: Option<Color>,
 }
 
 pub fn row_colors_from(config: &Config) -> RowColors {
@@ -324,6 +363,11 @@ pub fn row_colors_from(config: &Config) -> RowColors {
         mark: config.mark_color.as_deref().and_then(parse_hex_color),
         stripe: config.stripe_color.as_deref().and_then(parse_hex_color),
         folder: config.folder_color.as_deref().and_then(parse_hex_color),
+        action: config
+            .action_color
+            .as_deref()
+            .and_then(parse_hex_color)
+            .or_else(|| parse_hex_color(DEFAULT_ACTION_COLOR)),
     }
 }
 
@@ -529,6 +573,52 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(unset.folder_editor(), DEFAULT_FOLDER_EDITOR);
+    }
+
+    #[test]
+    fn action_color_defaults_and_parses_into_row_colors() {
+        // Out of the box RowColors.action resolves to the default violet.
+        let colors = row_colors_from(&Config::default());
+        assert_eq!(colors.action, parse_hex_color(DEFAULT_ACTION_COLOR));
+        // A configured color wins; an unparseable one falls back to default.
+        let custom = Config {
+            action_color: Some("#102030".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(row_colors_from(&custom).action, parse_hex_color("#102030"));
+        let bad = Config {
+            action_color: Some("not-a-color".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            row_colors_from(&bad).action,
+            parse_hex_color(DEFAULT_ACTION_COLOR)
+        );
+    }
+
+    #[test]
+    fn file_actions_deserialize_from_yaml() {
+        let yaml = r#"
+file_actions:
+  - pattern: "*.md"
+    label: "Convert to PDF"
+    command: "pandoc -o {stem}.pdf {file}"
+  - pattern: "*.tar.gz"
+    label: "Inspect"
+    command: "tar tzvf {file} | less"
+    terminal: true
+"#;
+        let c: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(c.file_actions.len(), 2);
+        // `terminal` defaults to false when omitted.
+        assert!(!c.file_actions[0].terminal);
+        assert_eq!(c.file_actions[0].pattern, "*.md");
+        assert!(c.file_actions[1].terminal);
+    }
+
+    #[test]
+    fn file_actions_default_to_empty() {
+        assert!(Config::default().file_actions.is_empty());
     }
 
     #[test]

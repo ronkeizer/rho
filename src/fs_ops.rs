@@ -13,7 +13,7 @@ use crate::config::{Config, DropboxAuth};
 use crate::domain::{
     detect_archive_format, dropbox_api_path, parse_docker_ps, parse_dropbox_list,
     parse_dropbox_token, parse_git_branches, parse_ls_la, parse_ps_output, parse_ssh_config,
-    Application, ArchiveFormat,
+    posix_quote, Application, ArchiveFormat,
     BackendId, DockerContainer, Entry, GitBranch, GitInfo, Location, Process, Side, SshServer,
 };
 use crate::Message;
@@ -163,23 +163,6 @@ fn run_remote_ls(backend: &BackendId, path: &Path) -> Vec<Entry> {
             Vec::new()
         }
     }
-}
-
-/// POSIX single-quote a string for safe interpolation into a remote
-/// shell command. Embeds the input verbatim except for `'`, which is
-/// turned into the canonical `'\''` close-reopen sequence.
-fn posix_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Quote a remote path for inclusion in an ssh-dispatched command, but
@@ -2351,6 +2334,157 @@ pub fn open_folder_in_editor(path: &Path, editor: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to launch editor `{}`: {}", editor, e))
 }
 
+// ---------------------------------------------------------------------------
+// Custom file actions
+// ---------------------------------------------------------------------------
+
+/// Run a custom file-action `command` (already placeholder-substituted) in the
+/// background, with `cwd` as the working directory. The command is a full
+/// shell line — run through `sh -c` (Unix) / `cmd /C` (Windows) so pipes,
+/// redirects and `&&` work. Returns a one-shot [`Message::FileActionFinished`]
+/// carrying the outcome; on success the caller reloads the panes so any output
+/// file the command produced shows up.
+pub fn run_file_action_task(command: String, cwd: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || run_file_action(&command, &cwd))
+                .await
+                .unwrap_or_else(|e| Err(format!("file action task panicked: {}", e)))
+        },
+        Message::FileActionFinished,
+    )
+}
+
+/// Blocking body of [`run_file_action_task`]: run `command` via the platform
+/// shell in `cwd`, mapping a non-zero exit (or spawn failure) to an `Err` whose
+/// message prefers the command's stderr.
+///
+/// `stdout` is discarded (`Stdio::null`): a background action has no terminal
+/// to show it, and capturing it would buffer the whole stream in memory — a
+/// command that streams a lot (`cat hugefile`) or never exits (`tail -f`)
+/// should use `terminal: true` instead. We still capture stderr for the error
+/// message but cap it so a pathological stderr can't balloon either.
+fn run_file_action(command: &str, cwd: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+    let output = cmd
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run `{}`: {}", command, e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return Err(format!("`{}` exited with status {}", command, output.status));
+    }
+    // Cap the surfaced error so a chatty stderr doesn't flood the status bar.
+    const MAX: usize = 500;
+    if stderr.chars().count() > MAX {
+        Err(format!("{}…", stderr.chars().take(MAX).collect::<String>()))
+    } else {
+        Err(stderr.to_string())
+    }
+}
+
+/// Run a custom file-action `command` in a new terminal window, with `cwd` as
+/// the working directory. Used for actions flagged `terminal: true` — long or
+/// interactive commands whose output the user wants to see. Fire-and-forget
+/// (we only detect a failed *dispatch*). Mirrors [`open_terminal`] but runs the
+/// command after the `cd` instead of dropping the user at a bare prompt.
+pub fn run_file_action_in_terminal(
+    command: &str,
+    cwd: &Path,
+    terminal_app: Option<&str>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = resolve_macos_terminal_app(terminal_app);
+        let script = macos_terminal_run_apple_script(&app, &cwd.display().to_string(), command);
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch {}: {}", app, e))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = terminal_app;
+        // `-e sh -c "<command>"` with cwd inherited from current_dir.
+        std::process::Command::new("x-terminal-emulator")
+            .current_dir(cwd)
+            .args(["-e", "sh", "-c", command])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch x-terminal-emulator: {}", e))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = terminal_app;
+        // `/K` keeps the window open after the command finishes.
+        std::process::Command::new("cmd")
+            .current_dir(cwd)
+            .args(["/C", "start", "cmd", "/K", command])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch cmd: {}", e))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (command, cwd, terminal_app);
+        Err("running a terminal command isn't supported on this platform".to_string())
+    }
+}
+
+/// Build the AppleScript that runs `command` in `app` after cd'ing into `cwd`.
+/// Like [`macos_terminal_cwd_apple_script`] but with the user's command
+/// appended; iTerm re-execs a login shell afterwards so the window stays open
+/// once the command exits (Terminal's `do script` shell stays open on its own).
+#[cfg(target_os = "macos")]
+fn macos_terminal_run_apple_script(app: &str, cwd: &str, command: &str) -> String {
+    let lowered = app.to_ascii_lowercase();
+    if lowered == "iterm" || lowered == "iterm2" {
+        // iTerm runs `command` through shell-style word splitting, so the
+        // whole `sh -c <arg>` line must be quote-safe. We single-quote the
+        // entire shell line (posix_quote) instead of wrapping it in double
+        // quotes — that way any `"`, `$`, backtick or space inside the user's
+        // command can't terminate the argument. Only the trailing AppleScript
+        // `\`/`"` escaping remains.
+        let shell_cmd = format!(
+            "cd {} && {} ; exec ${{SHELL:-/bin/sh}} -l",
+            posix_quote(cwd),
+            command
+        );
+        let sh_c = format!("sh -c {}", posix_quote(&shell_cmd));
+        let escaped = sh_c.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "tell application \"{app}\"\n    \
+                 activate\n    \
+                 create window with default profile command \"{escaped}\"\n\
+             end tell"
+        )
+    } else {
+        // Terminal's `do script` runs the string directly in the shell (no
+        // extra `sh -c` layer), so only the AppleScript string escaping is
+        // needed; the cwd is posix_quoted so paths with quotes are safe.
+        let shell_cmd = format!("cd {} && {}", posix_quote(cwd), command);
+        let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("tell application \"{app}\" to do script \"{escaped}\"")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2389,6 +2523,76 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("dup")).unwrap();
         assert!(make_dir(dir.path(), "dup").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_file_action_runs_in_cwd_and_reports_success() {
+        // The command's working directory is `cwd`, so a relative path it
+        // creates lands there — proving cwd is honored.
+        let dir = tempfile::tempdir().unwrap();
+        run_file_action("touch made-here.txt", dir.path()).unwrap();
+        assert!(dir.path().join("made-here.txt").is_file());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_file_action_surfaces_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // `false` exits non-zero with empty stderr → status-based message.
+        let err = run_file_action("false", dir.path()).unwrap_err();
+        assert!(err.contains("exited with status"));
+        // A command that writes to stderr surfaces that text instead.
+        let err2 = run_file_action("echo boom >&2; exit 1", dir.path()).unwrap_err();
+        assert_eq!(err2, "boom");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_run_script_terminal_cds_then_runs() {
+        let script = macos_terminal_run_apple_script(
+            "Terminal",
+            "/Users/me/project",
+            "pandoc -o out.pdf in.md",
+        );
+        assert_eq!(
+            script,
+            "tell application \"Terminal\" to do script \
+             \"cd '/Users/me/project' && pandoc -o out.pdf in.md\""
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_run_script_iterm_keeps_window_open() {
+        let script = macos_terminal_run_apple_script("iTerm", "/Users/me/p", "tar tzvf a.tgz");
+        assert!(script.contains("create window with default profile command"));
+        // The sh -c argument is single-quoted (not the old double-quote form),
+        // and $SHELL stays live inside it.
+        assert!(script.contains("command \"sh -c '"));
+        assert!(!script.contains("sh -c \\\""));
+        assert!(script.contains("exec ${SHELL:-/bin/sh} -l"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_run_script_iterm_quotes_double_quotes_safely() {
+        // A command containing `"` must stay inside the single-quoted sh -c
+        // argument (AppleScript-escaped) rather than terminating it.
+        let script = macos_terminal_run_apple_script("iTerm", "/tmp", "echo \"hi there\"");
+        assert!(script.contains("sh -c '"));
+        assert!(script.contains("echo \\\"hi there\\\""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_run_script_terminal_quotes_cwd_with_quote() {
+        // A cwd containing a single quote is escaped via posix_quote (→ '\'')
+        // and the backslash is then AppleScript-escaped (\ → \\), so the
+        // literal in the script is `'\\''`. After osascript parses the string
+        // the shell sees the correct `cd '/Users/me/it'\''s' && ls`.
+        let script = macos_terminal_run_apple_script("Terminal", "/Users/me/it's", "ls");
+        assert!(script.contains(r"cd '/Users/me/it'\\''s' && ls"));
     }
 
     #[test]
@@ -2650,25 +2854,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = open_folder_in_editor(dir.path(), "/nonexistent/editor-xyz").unwrap_err();
         assert!(err.contains("/nonexistent/editor-xyz"));
-    }
-
-    #[test]
-    fn posix_quote_wraps_simple_string() {
-        assert_eq!(posix_quote("foo"), "'foo'");
-        assert_eq!(posix_quote("/var/log"), "'/var/log'");
-    }
-
-    #[test]
-    fn posix_quote_escapes_embedded_single_quote() {
-        // `it's` → 'it'\''s'  (close, escaped quote, reopen)
-        assert_eq!(posix_quote("it's"), r"'it'\''s'");
-    }
-
-    #[test]
-    fn posix_quote_handles_special_chars_passively() {
-        // Single-quoting neutralises $ \ " ` etc. — they pass through
-        // untouched.
-        assert_eq!(posix_quote(r#"a $b \c "d" `e`"#), r#"'a $b \c "d" `e`'"#);
     }
 
     #[test]

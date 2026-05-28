@@ -46,6 +46,11 @@ input device.
 - Compress marked files / folders into a `.zip` (palette → Compress);
   extract `.zip` / `.tar.gz` archives (palette → Uncompress). Both
   default the destination to the other pane.
+- `Enter` on a file opens a chooser: "Open with default application"
+  plus any user-defined [`file_actions`](./configuration.md) whose glob
+  matches (e.g. `*.md` → run pandoc). Matching files are highlighted in
+  the listing. Actions run in the background (panes refresh on completion)
+  or in a terminal window.
 - "Go to folder" prompt (`⌘P`) with a recent-locations cache —
   filter-as-you-type and arrow-key picker; typing a fresh path also
   just works.

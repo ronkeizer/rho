@@ -16,11 +16,14 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, SavedState,
 };
 use domain::{
-    add_recent, available_palette_actions, default_zip_filename, filtered_actions, filtered_apps,
+    add_recent, available_palette_actions, build_file_choices, default_zip_filename,
+    filtered_actions, filtered_apps,
     filtered_branches, filtered_processes, filtered_recents, filtered_servers, modal_scroll_target,
     sort_apps,
-    sort_containers, sort_entries, sort_processes, Application, AppsState, BackendId, DeleteFocus,
-    DockerContainer, DockerSortBy, DockerState, Entry, GitBranch, GitBranchesState, GitInfo,
+    sort_containers, sort_entries, sort_processes, substitute_command, Application, AppsState,
+    BackendId, DeleteFocus,
+    DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, GitBranch, GitBranchesState,
+    GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
     ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState,
 };
@@ -29,7 +32,8 @@ use fs_ops::{
     docker_shell, extract_to_temp_task, file_watch_subscription, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task,
     open_claude_code, open_folder_in_editor, open_terminal,
-    pane_watch_subscription, ps_task, ssh_connect, ssh_servers_task, uncompress_task,
+    pane_watch_subscription, ps_task, run_file_action_in_terminal, run_file_action_task,
+    ssh_connect, ssh_servers_task, uncompress_task,
 };
 use view_modal::view_modal;
 use view_pane::{name_max_chars, scroll_id, view_pane, viewport_height_estimate};
@@ -173,6 +177,12 @@ pub(crate) enum Message {
     /// User clicked Open on an SSH server row — point the active pane
     /// at the host's home directory via the remote backend dispatch.
     SshOpenInPane(String),
+    /// User clicked a row in the FileActions ("Open file") modal — run the
+    /// choice at that index.
+    FileChoiceActivate(usize),
+    /// A background custom file action finished. On success the panes reload
+    /// so any produced file appears; on failure the error goes to the status bar.
+    FileActionFinished(Result<(), String>),
     /// Global "quit the app" — currently bound to F10.
     ExitApp,
     NoOp,
@@ -203,6 +213,9 @@ struct App {
     uncompress_in_progress: Option<(usize, PathBuf)>,
     /// Source archive path while an Enter-on-zip extraction is running.
     extract_in_progress: Option<PathBuf>,
+    /// Action label while a background custom file action is running. Drives
+    /// the "Running…" status indicator; cleared in `FileActionFinished`.
+    file_action_in_progress: Option<String>,
     /// Error from the most recently finished copy/move/delete/compress/
     /// extract task, shown in red in the status bar until the next such
     /// action starts. `None` once an operation completes cleanly.
@@ -271,6 +284,7 @@ impl App {
             compress_in_progress: None,
             uncompress_in_progress: None,
             extract_in_progress: None,
+            file_action_in_progress: None,
             last_error: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
@@ -445,6 +459,12 @@ impl App {
                 let n = filtered_processes(list, input).len();
                 (n > 0).then_some((*selected, n))
             }
+            Some(Prompt::FileActions {
+                choices, selected, ..
+            }) => {
+                let n = choices.len();
+                (n > 0).then_some((*selected, n))
+            }
             _ => None,
         }
     }
@@ -568,6 +588,16 @@ impl App {
                     other => other,
                 }
             }
+            // FileActions has no text_input, so Enter reaches us as
+            // ActivateSelection (rewritten to PromptSubmit, which runs the
+            // highlighted choice) and ↑/↓/Tab move the highlight.
+            (Some(Prompt::FileActions { .. }), m) => match m {
+                Message::MoveSelection(delta, _) => Message::PromptMove(delta),
+                Message::PageMove(dir, _) => Message::PromptMove(dir * 5),
+                Message::SwitchSide => Message::PromptMove(1),
+                Message::ActivateSelection => Message::PromptSubmit,
+                other => other,
+            },
             // Open, CommandPalette, and Apps all have a text_input on top
             // and a filterable list below. text_input consumes Enter / Left
             // / Right / Backspace / printable chars, so ↑/↓/PgUp/PgDn/Tab
@@ -721,9 +751,15 @@ impl App {
                         self.extract_in_progress = Some(path.clone());
                         return extract_to_temp_task(path);
                     }
-                    if let Err(e) = open::that_detached(&path) {
-                        eprintln!("failed to open {}: {}", path.display(), e);
-                    }
+                    // Every other file opens the chooser modal: the default-open
+                    // option plus any configured file_actions matching the name.
+                    let choices = build_file_choices(&self.config.file_actions, &entry.name);
+                    self.reset_modal_scroll();
+                    self.prompt = Some(Prompt::FileActions {
+                        path,
+                        choices,
+                        selected: 0,
+                    });
                 }
             }
             Message::ToggleSort(side, by) => {
@@ -890,6 +926,7 @@ impl App {
                         Prompt::Delete { .. }
                         | Prompt::ConfirmLargeExtract { .. }
                         | Prompt::NewFiles { .. }
+                        | Prompt::FileActions { .. }
                         | Prompt::KeyboardShortcuts => {}
                     }
                     // Filtering shifts which row the (clamped) cursor points at,
@@ -1176,6 +1213,15 @@ impl App {
                                 None
                             }
                         }
+                        // FileActions: Enter runs the highlighted choice and
+                        // closes the modal (the prompt was already taken).
+                        Prompt::FileActions {
+                            path,
+                            choices,
+                            selected,
+                        } => choices
+                            .get(selected)
+                            .map(|choice| self.run_file_choice(&path, choice)),
                     }
                 } else {
                     None
@@ -1477,6 +1523,14 @@ impl App {
                         }
                     }
                 }
+                Some(Prompt::FileActions {
+                    choices, selected, ..
+                }) => {
+                    let n = choices.len() as i32;
+                    if n > 0 {
+                        *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                    }
+                }
                 _ => {}
                 };
                 return self.modal_scroll_to_selected();
@@ -1658,6 +1712,41 @@ impl App {
                         path: PathBuf::from("~"),
                     },
                 );
+            }
+            Message::FileChoiceActivate(index) => {
+                // A click on a row in the "Open file" modal. Close the modal
+                // and run the chosen action (or restore it if the index is
+                // somehow stale).
+                if let Some(Prompt::FileActions {
+                    path,
+                    choices,
+                    selected,
+                }) = self.prompt.take()
+                {
+                    if let Some(choice) = choices.get(index) {
+                        self.last_error = None;
+                        let task = self.run_file_choice(&path, choice);
+                        self.show_next_pending();
+                        return task;
+                    }
+                    self.prompt = Some(Prompt::FileActions {
+                        path,
+                        choices,
+                        selected,
+                    });
+                }
+            }
+            Message::FileActionFinished(result) => {
+                self.file_action_in_progress = None;
+                match result {
+                    // Reload both panes so an output file (e.g. the generated
+                    // PDF) shows up immediately.
+                    Ok(()) => {
+                        self.last_error = None;
+                        return self.reload_both_panes();
+                    }
+                    Err(e) => self.last_error = Some(format!("File action failed: {}", e)),
+                }
             }
             Message::GitCheckoutFinished(branch, result) => {
                 match result {
@@ -1913,6 +2002,45 @@ impl App {
     /// Priority is copy > delete > load (copy/delete usually start *after*
     /// the panes have loaded, so this ordering surfaces the user-initiated
     /// action over background loading noise).
+    /// Run one [`FileChoice`] against `path` for the "Open file" modal. The
+    /// default-open and `terminal: true` actions are fire-and-forget (errors
+    /// land in the status bar); a background custom action returns its task so
+    /// the panes reload on completion.
+    fn run_file_choice(&mut self, path: &std::path::Path, choice: &FileChoice) -> Task<Message> {
+        match choice {
+            FileChoice::OpenDefault => {
+                if let Err(e) = open::that_detached(path) {
+                    self.last_error =
+                        Some(format!("Failed to open {}: {}", path.display(), e));
+                }
+                Task::none()
+            }
+            FileChoice::Custom {
+                label,
+                command,
+                terminal,
+            } => {
+                // Run with the file's folder as the working directory, so bare
+                // {file}/{stem} placeholders resolve relative to it.
+                let cwd = path.parent().unwrap_or(path).to_path_buf();
+                let cmd = substitute_command(command, path);
+                if *terminal {
+                    if let Err(e) = run_file_action_in_terminal(
+                        &cmd,
+                        &cwd,
+                        self.config.terminal_app.as_deref(),
+                    ) {
+                        self.last_error = Some(e);
+                    }
+                    Task::none()
+                } else {
+                    self.file_action_in_progress = Some(label.clone());
+                    run_file_action_task(cmd, cwd)
+                }
+            }
+        }
+    }
+
     fn status_text(&self) -> Option<String> {
         if let Some((count, dest)) = &self.copy_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
@@ -1950,6 +2078,9 @@ impl App {
         if let Some(count) = self.delete_in_progress {
             let noun = if count == 1 { "file" } else { "files" };
             return Some(format!("Deleting {} {}…", count, noun));
+        }
+        if let Some(label) = &self.file_action_in_progress {
+            return Some(format!("Running “{}”…", label));
         }
         if self.left.loading || self.right.loading {
             let loading_side = if self.left.loading {

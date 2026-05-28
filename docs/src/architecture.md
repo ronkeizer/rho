@@ -181,8 +181,9 @@ original cause of keyboard stalls on large directories.
 
 One `Option<Prompt>` field drives all modals. `Prompt` is an enum:
 `Open` (text input), `Copy` (text input), `Delete` (confirm), `NewFiles`
-(watcher-triggered), `CommandPalette`. The view stacks `view_modal(prompt)`
-on top of the panes via iced's `stack![..]`.
+(watcher-triggered), `CommandPalette`, `FileActions` (the Enter-on-file
+chooser; see below), and the list-backed action modals. The view stacks
+`view_modal(prompt)` on top of the panes via iced's `stack![..]`.
 
 Two non-obvious wiring points:
 
@@ -359,3 +360,34 @@ Arrow keys are redirected to `PromptMove` (like the other navigable
 modals) so they move the highlight, and `selected` is clamped back into
 range by `PromptChanged` (filtering) and `ProcessesListLoaded` (the
 post-kill reload) so it never points past the end of the list.
+
+## File actions
+
+Pressing `Enter` on a non-archive file opens `Prompt::FileActions { path,
+choices, selected }` instead of opening the OS default app directly. The
+choice list is built by `domain::build_file_choices`: `FileChoice::OpenDefault`
+is always first, followed by one `FileChoice::Custom` per configured
+`file_actions` entry whose glob (`domain::glob_match`, `*`/`?`, case-
+insensitive) matched the file name. The same `glob_match` drives the listing
+highlight — `view_pane` colors a file's name with `action_color` when
+`file_has_custom_action` is true (suppressed inside the active selection, like
+the folder color; both go through the renamed `entry_name_color` helper).
+
+The modal has **no `text_input`**, so unlike Docker/Processes its `Enter`
+arrives as `ActivateSelection`. A dedicated redirect arm rewrites it to
+`PromptSubmit` (and arrows/Tab to `PromptMove`); a row click emits
+`FileChoiceActivate(index)`. Both paths funnel through `App::run_file_choice`:
+
+- `OpenDefault` → `open::that_detached` (errors to the status bar).
+- `Custom` → `domain::substitute_command` expands `{file}`/`{stem}`/`{ext}`/
+  `{path}`/`{dir}` against the path, then either `run_file_action_in_terminal`
+  (when `terminal: true`, reusing the macOS AppleScript / `x-terminal-emulator`
+  / `cmd` dispatch) or the background `run_file_action_task`. The latter runs
+  the line through `sh -c` / `cmd /C` with the file's folder as the working
+  directory and returns `FileActionFinished`, which clears the
+  `file_action_in_progress` status indicator and reloads both panes so any
+  produced file appears.
+
+`.zip` files keep their existing extract-and-browse flow (with the large-
+archive confirm) — they're handled before the chooser, so they don't go
+through `FileActions`.
