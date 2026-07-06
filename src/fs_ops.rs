@@ -2515,7 +2515,7 @@ const QUICK_VIEW_MAX_BYTES: usize = 200 * 1024;
 /// a failure. Quick view fires on every settled cursor move — automatic and
 /// unattended — so a command that reads stdin or otherwise hangs must not
 /// wedge anything.
-const QUICK_VIEW_TIMEOUT: Duration = Duration::from_secs(5);
+const QUICK_VIEW_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run a `quick_view` entry for `path`: `Some(command)` shells out (with a
 /// timeout); `None` reads the file's raw bytes directly. Either way the
