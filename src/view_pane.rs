@@ -16,7 +16,10 @@ use iced::widget::{button, column, container, mouse_area, row, scrollable, text,
 use iced::{Border, Color, Element, Font, Length, Padding, Shadow, Theme};
 
 use crate::config::{blend, dim, Config, RowColors};
-use crate::domain::{file_has_custom_action, GitInfo, Pane, RowVisual, Side, SortBy, SortDir};
+use crate::domain::{
+    file_has_custom_action, GitInfo, Pane, QuickViewOutput, QuickViewState, RowVisual, Side,
+    SortBy, SortDir,
+};
 use crate::Message;
 
 pub fn view_pane<'a>(
@@ -27,6 +30,7 @@ pub fn view_pane<'a>(
     config: &Config,
     colors: RowColors,
     window_height: f32,
+    quick_view: Option<&'a QuickViewState>,
 ) -> Element<'a, Message> {
     let path_header = text(pane.location.to_string())
         .font(Font::MONOSPACE)
@@ -220,7 +224,19 @@ pub fn view_pane<'a>(
     if pane.has_claude_marker() {
         inner_col = inner_col.push(claude_info_bar(pane, config, active));
     }
-    let inner = container(inner_col).padding(6);
+    let top_half = container(inner_col).padding(6);
+
+    // A `quick_view` match on the *other* pane's cursor splits this pane:
+    // listing keeps the top 30%, the live preview takes the bottom 70%.
+    let inner: Element<'a, Message> = match quick_view {
+        Some(state) => column![
+            container(top_half).height(Length::FillPortion(3)),
+            container(quick_view_panel(state, config)).height(Length::FillPortion(7)),
+        ]
+        .spacing(4)
+        .into(),
+        None => top_half.into(),
+    };
 
     // No border around the pane any more. The "which pane is active" cue is
     // carried by the row-level text dimming (`compute_row_style` + the name
@@ -232,6 +248,56 @@ pub fn view_pane<'a>(
     mouse_area(pane_container)
         .on_press(Message::Activate(side))
         .into()
+}
+
+/// Bottom-half live preview driven by `quick_view` config: a label bar plus
+/// scrollable monospace body showing the loading state, command output /
+/// file contents, or an error (command failed / timed out / file unreadable).
+fn quick_view_panel<'a>(state: &QuickViewState, config: &Config) -> Element<'a, Message> {
+    let (body, is_error) = match &state.output {
+        QuickViewOutput::Loading => ("Loading…".to_string(), false),
+        QuickViewOutput::Ready(s) => (s.clone(), false),
+        QuickViewOutput::Error(e) => (e.clone(), true),
+    };
+
+    let label = container(
+        text(state.label.clone())
+            .font(Font::MONOSPACE)
+            .size(config.layout.header_font_size),
+    )
+    .padding(Padding::from([2, 8]))
+    .width(Length::Fill)
+    .style(move |theme: &Theme| {
+        let palette = theme.extended_palette();
+        container::Style {
+            background: Some(palette.background.weak.color.into()),
+            ..Default::default()
+        }
+    });
+
+    // No word wrap — long lines (log lines, `ls -l` rows, …) stay on one
+    // line and scroll horizontally instead of wrapping into a wall of text.
+    let body_widget = text(body)
+        .font(Font::MONOSPACE)
+        .size(config.layout.row_font_size)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .style(move |_theme: &Theme| iced::widget::text::Style {
+            color: if is_error {
+                Some(Color::from_rgb(1.0, 0.45, 0.45))
+            } else {
+                None
+            },
+        });
+
+    let content = scrollable(container(body_widget).padding(Padding::from([4, 8])))
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::new(),
+            horizontal: scrollable::Scrollbar::new(),
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    column![label, content].spacing(0).into()
 }
 
 /// Orange info bar shown when the active directory has a `CLAUDE.md` and/or

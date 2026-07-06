@@ -357,6 +357,51 @@ pub fn build_file_choices(actions: &[FileAction], name: &str) -> Vec<FileChoice>
     choices
 }
 
+/// A `quick_view` entry from `~/.rho.yaml`: when the cursor sits on a file
+/// matching `pattern`, `label` and the output of `command` are shown live in
+/// the *opposite* pane's bottom half. `command` is optional — when omitted,
+/// the file's raw contents are shown instead of running anything. `command`
+/// (when present) is a shell line with placeholders substituted by
+/// [`substitute_command`], same as [`FileAction`], minus the `terminal` flag
+/// (there is no terminal window here — the output is always captured).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct QuickViewAction {
+    pub pattern: String,
+    pub label: String,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+/// The first configured `quick_view` entry whose `pattern` matches `name`, in
+/// config order. Unlike [`matching_file_actions`] (which lists every match for
+/// a chooser modal), only one quick-view output can be shown at a time, so the
+/// first match wins — this is what lets a catch-all `pattern: "*"` entry act
+/// as a fallback after more specific patterns.
+pub fn matching_quick_view<'a>(actions: &'a [QuickViewAction], name: &str) -> Option<&'a QuickViewAction> {
+    actions.iter().find(|a| glob_match(&a.pattern, name))
+}
+
+/// State of the live preview shown in the pane opposite `source_side` (see
+/// `App::refresh_quick_view` / `view_pane`). `request_id` and `source_side`
+/// let stale debounce fires or task completions (cursor moved on since) be
+/// dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickViewState {
+    pub request_id: u64,
+    pub source_side: Side,
+    pub path: std::path::PathBuf,
+    pub label: String,
+    pub command: Option<String>,
+    pub output: QuickViewOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuickViewOutput {
+    Loading,
+    Ready(String),
+    Error(String),
+}
+
 /// POSIX single-quote a string for safe interpolation into a `sh` command
 /// line. Embeds the input verbatim except for `'`, which becomes the canonical
 /// `'\''` close-reopen sequence. Single-quoting neutralises `$`, `` ` ``, `"`,
@@ -4185,6 +4230,39 @@ Host work
         assert!(file_has_custom_action(&actions, "x.png"));
         // The catch-all `*` means every file has at least one action here.
         assert!(file_has_custom_action(&actions, "anything.xyz"));
+    }
+
+    #[test]
+    fn matching_quick_view_first_match_wins() {
+        let actions = vec![
+            QuickViewAction {
+                pattern: "*.log".into(),
+                label: "Tail".into(),
+                command: Some("tail -n 200 {file}".into()),
+            },
+            QuickViewAction {
+                pattern: "*".into(),
+                label: "Preview".into(),
+                command: None,
+            },
+        ];
+        let m = matching_quick_view(&actions, "app.log").unwrap();
+        assert_eq!(m.label, "Tail");
+        // Falls through to the catch-all for anything else.
+        let m = matching_quick_view(&actions, "notes.txt").unwrap();
+        assert_eq!(m.label, "Preview");
+        assert_eq!(m.command, None);
+    }
+
+    #[test]
+    fn matching_quick_view_no_match_returns_none() {
+        let actions = vec![QuickViewAction {
+            pattern: "*.log".into(),
+            label: "Tail".into(),
+            command: Some("tail {file}".into()),
+        }];
+        assert!(matching_quick_view(&actions, "notes.txt").is_none());
+        assert!(matching_quick_view(&[], "anything").is_none());
     }
 
     #[test]

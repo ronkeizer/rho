@@ -36,6 +36,7 @@ its default.
 | `theme.folder` | string `#rrggbb` | `#6db4ff` | Name color for directory entries. |
 | `theme.action` | string `#rrggbb` | `#b48ead` | Name color for files that have a matching `file_actions` entry — a cue that `Enter` offers more than the default open. |
 | `file_actions` | list of actions | _(empty)_ | Custom "open with…" entries shown in the file-action chooser. See [File actions](#file-actions) below. |
+| `quick_view` | list of actions | _(empty)_ | Live cursor-driven previews shown in the opposite pane. See [Quick view](#quick-view) below. |
 | `watch_folders` | list of strings | `["~/Downloads"]` | Folders to watch for new files. Read once at startup; restart to apply changes. |
 | `terminal_app` | string | _(auto)_ | macOS only. Which terminal app to launch for the SSH `Connect`, Docker `Shell`, `Open Claude Code in this folder`, and `Open Terminal in this folder` actions. Common values: `"iTerm"`, `"Terminal"`. Omit (or leave `None`) to auto-pick: `iTerm` when `/Applications/iTerm.app` exists, otherwise `Terminal`. Ignored on Linux / Windows. |
 | `folder_editor` | string | `/usr/local/bin/code` | Editor binary for the **Open folder in editor** action, invoked as `<folder_editor> <folder>`. Defaults to the VS Code CLI. Point it at any editor that opens a directory argument (Sublime's `subl`, a `code` under `/opt/homebrew/bin`, an editor wrapper script, etc.). A blank value falls back to the default. |
@@ -213,6 +214,39 @@ file_actions:
     terminal: true
 ```
 
+## Quick view
+
+While the cursor sits on a file (arrow keys or a click, in either pane),
+`quick_view` lets rho show a live preview of it in the **opposite** pane's
+bottom half, in a fixed-width font. Unlike file actions there's no chooser —
+the first entry whose `pattern` matches wins, so put more specific patterns
+before a catch-all `pattern: "*"`. Moving the cursor off the file (including
+onto a directory or `..`) clears the preview; only local panes are supported.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `pattern` | yes | Filename glob, same rules as `file_actions.pattern`. |
+| `label` | yes | Text shown above the preview body. |
+| `command` | no | Shell line to run, with the same placeholders as `file_actions.command` (see above), run in the file's own folder. **Omit it** to show the file's raw contents instead of running anything. |
+
+There's no `terminal` option — output is always captured, never interactive.
+A few limits keep an automatic, unattended preview from ever hanging or
+ballooning memory: the cursor must settle for ~150ms before anything runs (so
+scrolling with an arrow key held down doesn't spawn a process per row),
+`command` is killed and reported as an error if it runs longer than 5
+seconds, and output (command or raw file) is capped at 200KB with a
+`(truncated)` marker. Non-UTF-8 bytes are lossily decoded — binary files
+won't crash the preview, but won't render as anything useful either.
+
+```yaml
+quick_view:
+  - pattern: "*.log"
+    label: "Tail"
+    command: "tail -n 200 {file}"
+  - pattern: "*"
+    label: "Preview"
+```
+
 ## FTP server
 
 Settings for the in-app FTP server (Command Palette → **FTP server**).
@@ -331,6 +365,14 @@ theme:
 #   - pattern: "*.md"
 #     label: "Convert to PDF (pandoc)"
 #     command: "pandoc -o {stem}.pdf {file}"
+# Live cursor-driven previews in the opposite pane — see the Quick view
+# section above.
+# quick_view:
+#   - pattern: "*.log"
+#     label: "Tail"
+#     command: "tail -n 200 {file}"
+#   - pattern: "*"
+#     label: "Preview"
 # Folders to watch for new files.
 watch_folders:
   - "~/Downloads"

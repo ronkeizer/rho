@@ -2487,6 +2487,125 @@ fn macos_terminal_run_apple_script(app: &str, cwd: &str, command: &str) -> Strin
 }
 
 // ---------------------------------------------------------------------------
+// Quick view (cursor-driven live preview in the opposite pane)
+// ---------------------------------------------------------------------------
+
+/// Cap on captured quick-view output (command stdout/stderr or raw file
+/// bytes) — large enough for any reasonable preview, small enough that
+/// `cat hugefile` or a chatty command can't balloon memory. Truncated output
+/// gets a marker appended so the cut isn't mistaken for the whole thing.
+const QUICK_VIEW_MAX_BYTES: usize = 200 * 1024;
+
+/// How long a quick-view `command` may run before it's killed and treated as
+/// a failure. Quick view fires on every settled cursor move — automatic and
+/// unattended — so a command that reads stdin or otherwise hangs must not
+/// wedge anything.
+const QUICK_VIEW_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a `quick_view` entry for `path`: `Some(command)` shells out (with a
+/// timeout); `None` reads the file's raw bytes directly. Either way the
+/// result is capped at [`QUICK_VIEW_MAX_BYTES`] and reported as one
+/// `Message::QuickViewLoaded(id, side, ..)` — `id` and `side` are threaded
+/// through untouched so the caller can drop stale results (cursor moved
+/// again, or the active side changed, before this finished).
+pub fn quick_view_task(
+    command: Option<String>,
+    path: PathBuf,
+    cwd: PathBuf,
+    id: u64,
+    side: Side,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            match command {
+                Some(cmd) => run_quick_view_command(&cmd, &cwd, QUICK_VIEW_TIMEOUT).await,
+                None => read_quick_view_file(&path).await,
+            }
+        },
+        move |r| Message::QuickViewLoaded(id, side, r),
+    )
+}
+
+/// Truncate `bytes` to at most [`QUICK_VIEW_MAX_BYTES`], lossily decoding as
+/// UTF-8 (so arbitrary/binary bytes render as replacement chars instead of
+/// panicking) and appending a marker when the cut is real.
+fn truncate_quick_view_bytes(bytes: &[u8]) -> String {
+    if bytes.len() <= QUICK_VIEW_MAX_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut s = String::from_utf8_lossy(&bytes[..QUICK_VIEW_MAX_BYTES]).into_owned();
+    s.push_str("\n…(truncated)");
+    s
+}
+
+/// Read a file's raw contents for the no-`command` quick_view case. Capped
+/// via `take` rather than reading the whole file and truncating after —
+/// a multi-GB file shouldn't get fully buffered just to be thrown away.
+async fn read_quick_view_file(path: &Path) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let mut buf = Vec::new();
+    file.take(QUICK_VIEW_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    Ok(truncate_quick_view_bytes(&buf))
+}
+
+/// Run a quick_view `command` (already placeholder-substituted) via the
+/// platform shell in `cwd`, capturing stdout. Unlike [`run_file_action`] this
+/// uses `tokio::process` + [`QUICK_VIEW_TIMEOUT`] (with `kill_on_drop`)
+/// instead of a blocking `std::process` call: quick view runs unattended on
+/// every cursor move, so a hung command (e.g. one that reads stdin) must be
+/// killed rather than left to block a worker thread indefinitely.
+async fn run_quick_view_command(command: &str, cwd: &Path, timeout: Duration) -> Result<String, String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+    let child = cmd
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run `{}`: {}", command, e))?;
+
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|e| format!("failed to run `{}`: {}", command, e))?,
+        Err(_) => {
+            return Err(format!(
+                "`{}` timed out after {}s",
+                command,
+                timeout.as_secs_f32()
+            ));
+        }
+    };
+
+    if output.status.success() {
+        return Ok(truncate_quick_view_bytes(&output.stdout));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        Err(format!("`{}` exited with status {}", command, output.status))
+    } else {
+        Err(truncate_quick_view_bytes(stderr.as_bytes()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-app FTP server (Command Palette → "FTP server")
 // ---------------------------------------------------------------------------
 //
@@ -3606,5 +3725,65 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].1.is_ok());
         assert!(!src.exists());
+    }
+
+    #[tokio::test]
+    async fn read_quick_view_file_returns_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"hello quick view").unwrap();
+        let out = read_quick_view_file(&path).await.unwrap();
+        assert_eq!(out, "hello quick view");
+    }
+
+    #[tokio::test]
+    async fn read_quick_view_file_missing_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_quick_view_file(&dir.path().join("nope.txt"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("failed to open"));
+    }
+
+    #[tokio::test]
+    async fn read_quick_view_file_truncates_oversized_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        std::fs::write(&path, vec![b'a'; QUICK_VIEW_MAX_BYTES + 500]).unwrap();
+        let out = read_quick_view_file(&path).await.unwrap();
+        assert!(out.ends_with("…(truncated)"));
+        // Body length is capped, plus the marker appended on top.
+        assert!(out.len() < QUICK_VIEW_MAX_BYTES + 100);
+    }
+
+    #[tokio::test]
+    async fn run_quick_view_command_captures_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_quick_view_command("printf hi", dir.path(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out, "hi");
+    }
+
+    #[tokio::test]
+    async fn run_quick_view_command_nonzero_exit_surfaces_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_quick_view_command(
+            "echo boom 1>&2; exit 1",
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "boom");
+    }
+
+    #[tokio::test]
+    async fn run_quick_view_command_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_quick_view_command("sleep 10", dir.path(), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"));
     }
 }

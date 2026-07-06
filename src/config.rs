@@ -39,6 +39,12 @@ pub struct Config {
     /// modal lists the default-open plus every action whose `pattern` matches.
     #[serde(default)]
     pub file_actions: Vec<crate::domain::FileAction>,
+    /// User-defined "quick view" previews, matched by filename glob. When the
+    /// cursor sits on a matching file, the first match's `label` and command
+    /// output (or, if `command` is omitted, the raw file contents) are shown
+    /// live in the opposite pane's bottom half.
+    #[serde(default)]
+    pub quick_view: Vec<crate::domain::QuickViewAction>,
     /// Folders to watch for new files. Each accepts a `~/` prefix. Non-recursive.
     /// Read once at startup — editing this requires restarting the app.
     pub watch_folders: Vec<String>,
@@ -74,6 +80,7 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             theme: ThemeConfig::default(),
             file_actions: Vec::new(),
+            quick_view: Vec::new(),
             watch_folders: vec!["~/Downloads".to_string()],
             terminal_app: None,
             folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
@@ -556,6 +563,18 @@ fn default_template_yaml() -> &'static str {
      #     label: \"Inspect in shell\"\n\
      #     command: \"tar tzvf {file} | less\"\n\
      #     terminal: true\n\
+     # Quick view: while the cursor sits on a matching file, the first entry\n\
+     # whose pattern matches runs (or, with no command, just reads the file)\n\
+     # and shows the result live in the opposite pane's bottom half. Same\n\
+     # placeholders as file_actions. Commands time out after 5s and output is\n\
+     # capped at 200KB; no terminal option (output is always captured, never\n\
+     # interactive).\n\
+     # quick_view:\n\
+     #   - pattern: \"*.log\"\n\
+     #     label: \"Tail\"\n\
+     #     command: \"tail -n 200 {file}\"\n\
+     #   - pattern: \"*\"\n\
+     #     label: \"Preview\"\n\
      # Dropbox backend. Lets panes browse / copy / move / delete under dropbox:/\n\
      # and enables the \"Open Dropbox\" command. Full setup (create app, grant\n\
      # files.* scopes, mint a refresh token via the authorize flow) is in the\n\
@@ -876,6 +895,28 @@ file_actions:
     #[test]
     fn file_actions_default_to_empty() {
         assert!(Config::default().file_actions.is_empty());
+    }
+
+    #[test]
+    fn quick_view_deserialize_from_yaml() {
+        let yaml = r#"
+quick_view:
+  - pattern: "*.log"
+    label: "Tail"
+    command: "tail -n 200 {file}"
+  - pattern: "*"
+    label: "Preview"
+"#;
+        let c: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(c.quick_view.len(), 2);
+        assert_eq!(c.quick_view[0].command.as_deref(), Some("tail -n 200 {file}"));
+        // `command` is optional — omitted means "show raw file contents".
+        assert_eq!(c.quick_view[1].command, None);
+    }
+
+    #[test]
+    fn quick_view_defaults_to_empty() {
+        assert!(Config::default().quick_view.is_empty());
     }
 
     #[test]

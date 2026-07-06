@@ -392,6 +392,60 @@ arrives as `ActivateSelection`. A dedicated redirect arm rewrites it to
 archive confirm) — they're handled before the chooser, so they don't go
 through `FileActions`.
 
+## Quick view
+
+`quick_view` config entries drive a passive, always-on preview instead of a
+modal: whenever the cursor sits on a matching file, the *opposite* pane's
+bottom half shows `domain::matching_quick_view`'s pick (first-match-wins,
+unlike `file_actions`' full list) — either the output of its `command` or, if
+`command` is omitted, the file's raw contents.
+
+**Trigger: piggybacking on `ensure_active_visible`, not a new message per
+navigation site.** Every message that can move the cursor, change the filter,
+or stream in new entries (`RowClicked`, `MoveSelection`, `PageMove`,
+`MoveToEdge`, `SwitchSide`, `FilterAppend`, `EntriesChunk`, `navigate`, …)
+already calls `App::ensure_active_visible` to keep the scroll position
+correct. `App::refresh_quick_view` is called from there — one choke point,
+same reasoning as the scroll-follow logic it sits next to — instead of
+threading a quick-view refresh into each call site individually.
+
+**Debounce + request-id staleness, mirroring the load-generation pattern.**
+`refresh_quick_view` doesn't run the match immediately: it stashes the
+matched `domain::QuickViewState` (path, label, command) with a freshly
+bumped `App.quick_view_seq` as `request_id`, and returns a
+`Task::perform(tokio::time::sleep(150ms), …)` that fires
+`Message::QuickViewDebounceFire(id)`. This is the same shape as `Pane::
+load_generation` tagging directory-load chunks — holding an arrow key re-
+enters `refresh_quick_view` on every row, bumping `quick_view_seq` each time,
+so only the debounce fire whose `id` still matches `self.quick_view.
+request_id` proceeds to actually spawn `fs_ops::quick_view_task`; every
+earlier one is stale and silently dropped. `QuickViewLoaded(id, side, ..)` on
+completion re-checks the same `id` (plus `source_side`, in case the active
+side changed mid-flight) before applying the result.
+
+**Why `tokio::process` instead of `std::process` + `spawn_blocking`.**
+`file_actions` commands (`fs_ops::run_file_action`) run via blocking
+`std::process::Command::output()` inside `spawn_blocking` — fine there
+because they're explicitly user-triggered once. Quick view fires
+automatically on every settled cursor move, unattended, so a command that
+hangs (e.g. reads stdin) can't be allowed to block a worker thread
+indefinitely. `fs_ops::run_quick_view_command` instead uses
+`tokio::process::Command` with `kill_on_drop(true)` and races
+`child.wait_with_output()` against a `tokio::time::timeout` (5s); when the
+timeout wins, the future carrying `Child` is dropped, which — thanks to
+`kill_on_drop` — kills the process instead of leaking it. Output (command
+stdout/stderr, or the raw file read for the no-`command` case) is capped at
+200KB (`fs_ops::QUICK_VIEW_MAX_BYTES`) with a `(truncated)` marker, and
+decoded with `String::from_utf8_lossy` so a binary file can't panic the
+preview (it just renders as replacement characters).
+
+**View wiring.** `App::view` computes, per side, whether `self.quick_view`
+belongs to *that* side by checking `qv.source_side.other() == side`, passing
+`Option<&QuickViewState>` into `view_pane`. When `Some`, `view_pane` splits
+its `inner_col` into two `Length::FillPortion(1)` halves via `column!` — the
+existing listing on top, `quick_view_panel` (label bar + scrollable
+monospace body) on the bottom — instead of the usual single-container layout.
+
 ## FTP server
 
 The **FTP server** palette action runs a libunftp server in-process. State

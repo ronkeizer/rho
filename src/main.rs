@@ -27,7 +27,8 @@ use domain::{
     FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch, GitBranchesState,
     GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
-    ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState,
+    ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState, matching_quick_view,
+    QuickViewOutput, QuickViewState,
 };
 use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
@@ -35,7 +36,7 @@ use fs_ops::{
     ftp_start_task, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task,
     open_claude_code, open_folder_in_editor, open_terminal,
-    pane_watch_subscription, ps_task, run_file_action_in_terminal, run_file_action_task,
+    pane_watch_subscription, ps_task, quick_view_task, run_file_action_in_terminal, run_file_action_task,
     ssh_connect, ssh_servers_task, uncompress_task,
 };
 use view_modal::view_modal;
@@ -202,6 +203,14 @@ pub(crate) enum Message {
     FtpServerReplaceConfirmed(PathBuf),
     /// Global "quit the app" — currently bound to F10.
     ExitApp,
+    /// The cursor settled on a quick_view-matching file `id` ago and the
+    /// debounce delay elapsed — if `id` is still current, actually run the
+    /// quick_view command/read.
+    QuickViewDebounceFire(u64),
+    /// A quick_view command/read finished for request `id`, triggered by the
+    /// cursor sitting in `Side`'s pane. Stale (`id` doesn't match the current
+    /// request, or the source side changed) results are dropped.
+    QuickViewLoaded(u64, Side, Result<String, String>),
     NoOp,
 }
 
@@ -230,6 +239,11 @@ struct FtpRuntime {
 /// (`fs_ops::FTP_LOG_BUS_CAPACITY`) is independently sized to handle a
 /// burst before the App drains it.
 const FTP_LOG_BUFFER_CAP: usize = 200;
+
+/// Delay between the cursor settling on a quick_view-matching file and the
+/// command/read actually firing — holding an arrow key must not spawn a
+/// subprocess per row scrolled past.
+const QUICK_VIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 
 impl Drop for FtpRuntime {
     fn drop(&mut self) {
@@ -287,6 +301,14 @@ struct App {
     modal_scroll_y: f32,
     modal_viewport_h: Option<f32>,
     modal_row_h: Option<f32>,
+    /// Live preview for the file under the active pane's cursor, shown in the
+    /// opposite pane's bottom half. `None` when the cursor isn't on a file
+    /// matching any `quick_view` entry. See `refresh_quick_view`.
+    quick_view: Option<QuickViewState>,
+    /// Monotonic source of `QuickViewState::request_id` / the id threaded
+    /// through `QuickViewDebounceFire` / `QuickViewLoaded` — lets a stale
+    /// debounce fire or task completion (cursor moved on since) be dropped.
+    quick_view_seq: u64,
 }
 
 impl App {
@@ -343,6 +365,8 @@ impl App {
             modal_scroll_y: 0.0,
             modal_viewport_h: None,
             modal_row_h: None,
+            quick_view: None,
+            quick_view_seq: 0,
         };
         // Stat the initial pane paths for the CLAUDE.md / .claude marker so
         // the info bar shows on startup, not just after the first navigate.
@@ -439,12 +463,67 @@ impl App {
             None
         };
 
-        if let Some(y) = target {
+        let scroll_task = if let Some(y) = target {
             pane.scroll_y = y;
             scrollable::scroll_to(scroll_id(side), scrollable::AbsoluteOffset { x: 0.0, y })
         } else {
             Task::none()
+        };
+        Task::batch([scroll_task, self.refresh_quick_view()])
+    }
+
+    /// Re-derive `self.quick_view` from the active pane's cursor. Called from
+    /// `ensure_active_visible` — every message that can move the cursor,
+    /// change the filter, or stream in new entries already routes through it,
+    /// so this is the single choke point (mirrors that function's own doc
+    /// comment reasoning). Clears the preview when the cursor isn't on a
+    /// local file matching any `quick_view` entry; otherwise stashes the
+    /// matched command/path and schedules a debounced fetch so holding an
+    /// arrow key doesn't spawn a subprocess per row.
+    fn refresh_quick_view(&mut self) -> Task<Message> {
+        let side = self.active;
+        let pane = self.pane(side);
+        if pane.selected == 0 || !pane.location.is_local() {
+            self.quick_view = None;
+            return Task::none();
         }
+        let entry = match pane.entry_at(pane.selected) {
+            Some(e) if !e.is_dir => e,
+            _ => {
+                self.quick_view = None;
+                return Task::none();
+            }
+        };
+        let action = match matching_quick_view(&self.config.quick_view, &entry.name) {
+            Some(a) => a,
+            None => {
+                self.quick_view = None;
+                return Task::none();
+            }
+        };
+        let label = action.label.clone();
+        let path = pane.path().join(&entry.name);
+        // Substitute {file}/{stem}/{ext}/{path}/{dir} now, same as
+        // run_file_choice does for file_actions — quick_view_task/
+        // run_quick_view_command run the raw shell line as-is.
+        let command = action
+            .command
+            .as_ref()
+            .map(|tpl| substitute_command(tpl, &path));
+
+        self.quick_view_seq += 1;
+        let id = self.quick_view_seq;
+        self.quick_view = Some(QuickViewState {
+            request_id: id,
+            source_side: side,
+            path,
+            label,
+            command,
+            output: QuickViewOutput::Loading,
+        });
+        Task::perform(tokio::time::sleep(QUICK_VIEW_DEBOUNCE), move |_| {
+            Message::QuickViewDebounceFire(id)
+        })
     }
 
     /// Force-scroll `side`'s pane so its selected row sits roughly a third of
@@ -1964,6 +2043,27 @@ impl App {
                     }
                 }
             }
+            Message::QuickViewDebounceFire(id) => {
+                if let Some(qv) = &self.quick_view {
+                    if qv.request_id == id {
+                        let path = qv.path.clone();
+                        let command = qv.command.clone();
+                        let cwd = path.parent().unwrap_or(&path).to_path_buf();
+                        let side = qv.source_side;
+                        return quick_view_task(command, path, cwd, id, side);
+                    }
+                }
+            }
+            Message::QuickViewLoaded(id, side, result) => {
+                if let Some(qv) = &mut self.quick_view {
+                    if qv.request_id == id && qv.source_side == side {
+                        qv.output = match result {
+                            Ok(s) => QuickViewOutput::Ready(s),
+                            Err(e) => QuickViewOutput::Error(e),
+                        };
+                    }
+                }
+            }
             Message::NoOp => {}
         }
         Task::none()
@@ -2322,6 +2422,11 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let colors = row_colors_from(&self.config);
         let name_max = name_max_chars(self.window_size.width, &self.config);
+        let quick_view_for = |side: Side| {
+            self.quick_view
+                .as_ref()
+                .filter(|qv| qv.source_side.other() == side)
+        };
         let panes = row![
             view_pane(
                 Side::Left,
@@ -2331,6 +2436,7 @@ impl App {
                 &self.config,
                 colors,
                 self.window_size.height,
+                quick_view_for(Side::Left),
             ),
             view_pane(
                 Side::Right,
@@ -2340,6 +2446,7 @@ impl App {
                 &self.config,
                 colors,
                 self.window_size.height,
+                quick_view_for(Side::Right),
             ),
         ]
         .spacing(8)
