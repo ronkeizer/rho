@@ -1157,6 +1157,7 @@ pub fn view_modal<'a>(
             path,
             choices,
             selected,
+            edit,
         } => {
             let file_name = path
                 .file_name()
@@ -1176,33 +1177,63 @@ pub fn view_modal<'a>(
                         } => (command.clone(), *terminal),
                     };
                     let label_line = if terminal {
-                        format!("{}  ▶ terminal", choice.label())
+                        format!("terminal: {}", choice.label())
                     } else {
                         choice.label().to_string()
                     };
-                    let row_body = column![
-                        text(label_line).size(13),
-                        text(subtitle)
+                    // Only the highlighted row can be expanded, and only
+                    // `Custom` rows have a command worth editing.
+                    let editing = highlighted && edit.is_some() && matches!(choice, FileChoice::Custom { .. });
+                    if editing {
+                        let editor = text_input("command…", edit.as_deref().unwrap_or(""))
+                            .id(text_input::Id::new(PROMPT_ID))
                             .font(Font::MONOSPACE)
-                            .size(10)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .style(|theme: &Theme| iced::widget::text::Style {
-                                color: Some(dim(theme.extended_palette().background.base.text)),
-                            }),
-                    ]
-                    .spacing(2);
-                    let style: fn(&Theme, button::Status) -> button::Style = if highlighted {
-                        button::primary
+                            .size(11)
+                            .padding(4)
+                            .on_input(Message::PromptChanged)
+                            .on_submit(Message::PromptSubmit);
+                        let row_body = column![text(label_line).size(13), editor].spacing(4);
+                        col.push(
+                            container(row_body)
+                                .padding(Padding::from([6, 8]))
+                                .width(Length::Fill)
+                                .style(|theme: &Theme| container::Style {
+                                    background: Some(
+                                        theme.extended_palette().primary.weak.color.into(),
+                                    ),
+                                    border: Border {
+                                        color: theme.extended_palette().primary.strong.color,
+                                        width: 1.0,
+                                        radius: 4.0.into(),
+                                    },
+                                    ..Default::default()
+                                }),
+                        )
                     } else {
-                        button::text
-                    };
-                    col.push(
-                        button(row_body)
-                            .on_press(Message::FileChoiceActivate(i))
-                            .padding(Padding::from([6, 8]))
-                            .width(Length::Fill)
-                            .style(style),
-                    )
+                        let row_body = column![
+                            text(label_line).size(13),
+                            text(subtitle)
+                                .font(Font::MONOSPACE)
+                                .size(10)
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .style(|theme: &Theme| iced::widget::text::Style {
+                                    color: Some(dim(theme.extended_palette().background.base.text)),
+                                }),
+                        ]
+                        .spacing(2);
+                        let style: fn(&Theme, button::Status) -> button::Style = if highlighted {
+                            button::primary
+                        } else {
+                            button::text
+                        };
+                        col.push(
+                            button(row_body)
+                                .on_press(Message::FileChoiceActivate(i))
+                                .padding(Padding::from([6, 8]))
+                                .width(Length::Fill)
+                                .style(style),
+                        )
+                    }
                 },
             );
             column![
@@ -1217,7 +1248,7 @@ pub fn view_modal<'a>(
                         )
                     })
                     .height(Length::Shrink),
-                text("↑/↓ select  ·  Enter or click to open  ·  Esc cancels").size(11),
+                text("↑/↓ select  ·  Tab expand/edit command  ·  Enter or click to open  ·  Esc cancels").size(11),
             ]
             .spacing(8)
         }

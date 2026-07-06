@@ -2336,6 +2336,21 @@ pub fn open_folder_in_editor(path: &Path, editor: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Open folder in Finder (macOS)
+// ---------------------------------------------------------------------------
+
+/// Reveal `path` (a folder) in Finder by spawning `open <path>`. Used by the
+/// "Open folder in Finder" palette action, macOS-only. Fire-and-forget.
+#[cfg(target_os = "macos")]
+pub fn open_in_finder(path: &Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to launch `open`: {}", e))
+}
+
+// ---------------------------------------------------------------------------
 // Custom file actions
 // ---------------------------------------------------------------------------
 

@@ -39,6 +39,8 @@ use fs_ops::{
     pane_watch_subscription, ps_task, quick_view_task, run_file_action_in_terminal, run_file_action_task,
     ssh_connect, ssh_servers_task, uncompress_task,
 };
+#[cfg(target_os = "macos")]
+use fs_ops::open_in_finder;
 use view_modal::view_modal;
 use view_pane::{name_max_chars, scroll_id, view_pane, viewport_height_estimate};
 
@@ -184,6 +186,10 @@ pub(crate) enum Message {
     /// User clicked a row in the FileActions ("Open file") modal — run the
     /// choice at that index.
     FileChoiceActivate(usize),
+    /// `Tab` in the FileActions modal: expand the highlighted `Custom` row
+    /// into an editable command (pre-filled with the substituted command),
+    /// or collapse it back if already expanded. No-op on `OpenDefault`.
+    FileActionToggleEdit,
     /// A background custom file action finished. On success the panes reload
     /// so any produced file appears; on failure the error goes to the status bar.
     FileActionFinished(Result<(), String>),
@@ -752,13 +758,16 @@ impl App {
                     other => other,
                 }
             }
-            // FileActions has no text_input, so Enter reaches us as
-            // ActivateSelection (rewritten to PromptSubmit, which runs the
-            // highlighted choice) and ↑/↓/Tab move the highlight.
+            // FileActions has no text_input until a row is expanded for
+            // editing (`Tab`), so Enter reaches us as ActivateSelection
+            // (rewritten to PromptSubmit, which runs the highlighted choice
+            // or, if expanded, the edited command) and ↑/↓ move the
+            // highlight. `Tab` toggles the expand/edit view instead of
+            // moving the highlight (unlike the other list modals below).
             (Some(Prompt::FileActions { .. }), m) => match m {
                 Message::MoveSelection(delta, _) => Message::PromptMove(delta),
                 Message::PageMove(dir, _) => Message::PromptMove(dir * 5),
-                Message::SwitchSide => Message::PromptMove(1),
+                Message::SwitchSide => Message::FileActionToggleEdit,
                 Message::ActivateSelection => Message::PromptSubmit,
                 other => other,
             },
@@ -923,6 +932,7 @@ impl App {
                         path,
                         choices,
                         selected: 0,
+                        edit: None,
                     });
                 }
             }
@@ -991,6 +1001,12 @@ impl App {
                 Some(Prompt::NewFiles { focus, .. }) => *focus = focus.next(),
                 Some(Prompt::FtpInfo { focus, .. }) => *focus = focus.toggle(),
                 Some(Prompt::FtpReplace { focus, .. }) => *focus = focus.toggle(),
+                // No modal open: ←/→ behave like Tab and flip the active pane.
+                None => {
+                    self.active = self.active.other();
+                    self.save_state();
+                    return self.ensure_active_visible();
+                }
                 _ => {}
             },
             Message::OpenSettingsFile => {
@@ -1089,10 +1105,16 @@ impl App {
                                 *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                             }
                         }
+                        Prompt::FileActions { edit, .. } => {
+                            // Only reachable while a row is expanded — that's
+                            // the only time a text_input exists in this modal.
+                            if edit.is_some() {
+                                *edit = Some(value);
+                            }
+                        }
                         Prompt::Delete { .. }
                         | Prompt::ConfirmLargeExtract { .. }
                         | Prompt::NewFiles { .. }
-                        | Prompt::FileActions { .. }
                         | Prompt::FtpInfo { .. }
                         | Prompt::FtpReplace { .. }
                         | Prompt::KeyboardShortcuts => {}
@@ -1130,7 +1152,8 @@ impl App {
                                 .map(|p| self.navigate(self.active, Location::Local(p)))
                         }
                         Prompt::Copy { input } => {
-                            let dest = parse_dest_location(&input);
+                            let base = self.pane(self.active).path().to_path_buf();
+                            let dest = parse_dest_location(&input, &base);
                             if dest_exists(&dest) {
                                 let srcs = self.pane(self.active).marked_locations();
                                 if !srcs.is_empty() {
@@ -1144,7 +1167,8 @@ impl App {
                             }
                         }
                         Prompt::Move { input } => {
-                            let dest = parse_dest_location(&input);
+                            let base = self.pane(self.active).path().to_path_buf();
+                            let dest = parse_dest_location(&input, &base);
                             if dest_exists(&dest) {
                                 let srcs = self.pane(self.active).marked_locations();
                                 if !srcs.is_empty() {
@@ -1382,14 +1406,17 @@ impl App {
                             }
                         }
                         // FileActions: Enter runs the highlighted choice and
-                        // closes the modal (the prompt was already taken).
+                        // closes the modal (the prompt was already taken). If
+                        // the row was expanded for editing, `edit` overrides
+                        // the template-substituted command.
                         Prompt::FileActions {
                             path,
                             choices,
                             selected,
+                            edit,
                         } => choices
                             .get(selected)
-                            .map(|choice| self.run_file_choice(&path, choice)),
+                            .map(|choice| self.run_file_choice(&path, choice, edit)),
                         // FTP modals: Enter is rewritten by the top-of-update
                         // redirect into FtpServerStopRequest / FtpServerStart…
                         // / PromptCancel based on the focused button. If we
@@ -1731,12 +1758,17 @@ impl App {
                     }
                 }
                 Some(Prompt::FileActions {
-                    choices, selected, ..
+                    choices,
+                    selected,
+                    edit,
+                    ..
                 }) => {
                     let n = choices.len() as i32;
                     if n > 0 {
                         *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
                     }
+                    // Moving off the expanded row loses its half-typed edit.
+                    *edit = None;
                 }
                 _ => {}
                 };
@@ -1928,11 +1960,15 @@ impl App {
                     path,
                     choices,
                     selected,
+                    edit,
                 }) = self.prompt.take()
                 {
                     if let Some(choice) = choices.get(index) {
                         self.last_error = None;
-                        let task = self.run_file_choice(&path, choice);
+                        // Only honor the in-progress edit if the click landed
+                        // on the row that's actually expanded.
+                        let edit = if index == selected { edit } else { None };
+                        let task = self.run_file_choice(&path, choice, edit);
                         self.show_next_pending();
                         return task;
                     }
@@ -1940,7 +1976,26 @@ impl App {
                         path,
                         choices,
                         selected,
+                        edit,
                     });
+                }
+            }
+            Message::FileActionToggleEdit => {
+                if let Some(Prompt::FileActions {
+                    path,
+                    choices,
+                    selected,
+                    edit,
+                }) = self.prompt.as_mut()
+                {
+                    if edit.is_some() {
+                        *edit = None;
+                    } else if let Some(FileChoice::Custom { command, .. }) =
+                        choices.get(*selected)
+                    {
+                        *edit = Some(substitute_command(command, path));
+                        return text_input::focus(text_input::Id::new(PROMPT_ID));
+                    }
                 }
             }
             Message::FileActionFinished(result) => {
@@ -2247,6 +2302,21 @@ impl App {
                 Task::none()
             }
             PaletteAction::FtpServer => self.invoke_ftp_server(),
+            PaletteAction::RevealInFinder => {
+                // Fire-and-forget: reveal the active pane's folder in Finder.
+                // Only offered on macOS (see PaletteAction::ALL).
+                #[cfg(target_os = "macos")]
+                {
+                    if !self.pane(self.active).location.is_local() {
+                        return Task::none();
+                    }
+                    let path = self.pane(self.active).path().to_path_buf();
+                    if let Err(e) = open_in_finder(&path) {
+                        eprintln!("open Finder at {} failed: {}", path.display(), e);
+                    }
+                }
+                Task::none()
+            }
             PaletteAction::Exit => window::get_oldest().and_then(window::close),
         }
     }
@@ -2321,8 +2391,15 @@ impl App {
     /// Run one [`FileChoice`] against `path` for the "Open file" modal. The
     /// default-open and `terminal: true` actions are fire-and-forget (errors
     /// land in the status bar); a background custom action returns its task so
-    /// the panes reload on completion.
-    fn run_file_choice(&mut self, path: &std::path::Path, choice: &FileChoice) -> Task<Message> {
+    /// the panes reload on completion. `edit`, when present, is the
+    /// user-edited command from the modal's expand/edit view and is run
+    /// verbatim in place of substituting `choice`'s command template.
+    fn run_file_choice(
+        &mut self,
+        path: &std::path::Path,
+        choice: &FileChoice,
+        edit: Option<String>,
+    ) -> Task<Message> {
         match choice {
             FileChoice::OpenDefault => {
                 if let Err(e) = open::that_detached(path) {
@@ -2339,7 +2416,7 @@ impl App {
                 // Run with the file's folder as the working directory, so bare
                 // {file}/{stem} placeholders resolve relative to it.
                 let cwd = path.parent().unwrap_or(path).to_path_buf();
-                let cmd = substitute_command(command, path);
+                let cmd = edit.unwrap_or_else(|| substitute_command(command, path));
                 if *terminal {
                     if let Err(e) = run_file_action_in_terminal(
                         &cmd,
@@ -2530,8 +2607,8 @@ impl App {
                 Key::Named(Named::ArrowDown) => Some(Message::MoveSelection(1, mods.shift())),
                 Key::Named(Named::PageUp) => Some(Message::PageMove(-1, mods.shift())),
                 Key::Named(Named::PageDown) => Some(Message::PageMove(1, mods.shift())),
-                // ←/→ are only meaningful inside the Delete modal; in main
-                // view the SwitchPromptFocus handler is a no-op.
+                // ←/→ flip focus-y modal buttons (Delete, FTP info, etc.);
+                // with no modal open they flip the active pane, like Tab.
                 Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowRight) => {
                     Some(Message::SwitchPromptFocus)
                 }
@@ -2650,13 +2727,26 @@ fn refresh_claude_marker(pane: &mut Pane) {
 /// Parse the trimmed text of a Copy/Move prompt input into a
 /// [`Location`]. Wraps `Location::from_str` (which is infallible) with
 /// the tilde-expansion the prompts have always done for local paths.
-fn parse_dest_location(input: &str) -> Location {
+/// Parse a Copy/Move destination typed into the prompt. `base` is the active
+/// pane's current directory — a relative local path (e.g. `test/` to copy
+/// into a subfolder of the same pane you're copying from) is resolved
+/// against it rather than the process's own working directory, which almost
+/// never matches any pane and made relative destinations silently fail.
+fn parse_dest_location(input: &str, base: &Path) -> Location {
     let trimmed = input.trim();
     let parsed: Location = trimmed.parse().expect("Location::from_str is infallible");
     match parsed {
         // Tilde-expand local paths so `~/Downloads` resolves like it
         // used to before the Location refactor.
-        Location::Local(p) => Location::Local(PathBuf::from(expand_tilde(&p.to_string_lossy()))),
+        Location::Local(p) => {
+            let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
+            let resolved = if expanded.is_relative() {
+                base.join(expanded)
+            } else {
+                expanded
+            };
+            Location::Local(resolved)
+        }
         other => other,
     }
 }
@@ -2699,8 +2789,9 @@ fn batch_error_message<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_error_message, is_zip, APP_ICON};
-    use std::path::Path;
+    use super::{batch_error_message, is_zip, parse_dest_location, APP_ICON};
+    use crate::domain::Location;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn app_icon_is_valid_png_and_decodes() {
@@ -2751,5 +2842,46 @@ mod tests {
     #[test]
     fn is_zip_rejects_no_extension() {
         assert!(!is_zip(Path::new("README")));
+    }
+
+    #[test]
+    fn parse_dest_location_resolves_relative_path_against_base() {
+        let base = Path::new("/Users/ron/docs");
+        let dest = parse_dest_location("test/", base);
+        assert_eq!(dest, Location::Local(base.join("test")));
+    }
+
+    #[test]
+    fn parse_dest_location_bare_name_resolves_against_base() {
+        let base = Path::new("/Users/ron/docs");
+        let dest = parse_dest_location("test", base);
+        assert_eq!(dest, Location::Local(base.join("test")));
+    }
+
+    #[test]
+    fn parse_dest_location_absolute_path_ignores_base() {
+        let base = Path::new("/Users/ron/docs");
+        let dest = parse_dest_location("/tmp/out", base);
+        assert_eq!(dest, Location::Local(Path::new("/tmp/out").to_path_buf()));
+    }
+
+    #[test]
+    fn parse_dest_location_tilde_ignores_base() {
+        let base = Path::new("/Users/ron/docs");
+        let dest = parse_dest_location("~", base);
+        assert_eq!(dest, Location::Local(crate::config::home_dir()));
+    }
+
+    #[test]
+    fn parse_dest_location_remote_ignores_base() {
+        let base = Path::new("/Users/ron/docs");
+        let dest = parse_dest_location("myhost:/var/log", base);
+        assert_eq!(
+            dest,
+            Location::Remote {
+                backend: crate::domain::BackendId::new("myhost"),
+                path: PathBuf::from("/var/log"),
+            }
+        );
     }
 }

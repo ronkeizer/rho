@@ -17,6 +17,7 @@ key the OS treats as the "logo" / Super key. The app reads it through iced's
 | `PageUp` / `PageDown` | Move by one page (computed from current viewport) |
 | `Shift +` arrow / page key | Extend the selection from the anchor |
 | `Tab` | Switch the active pane (left ↔ right) |
+| `←` / `→` | Switch the active pane (left ↔ right) — same as `Tab`. Inside a modal these flip the modal's own focus instead (see the modal table below). |
 | `Enter` | If cursor is on `..`, go up. On a directory, descend. On a `.zip`, extract to `/tmp` and browse (large archives prompt first — see below). On any other file, open the **file-action chooser** (see the modal table below) — always "Open with default application", plus any matching [`file_actions`](./configuration.md). Files with a matching action are highlighted in the listing. |
 | `Backspace` | Go to the parent directory (or, if a filter is active, delete one character from it) |
 
@@ -79,7 +80,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / FTP server / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / FTP server / Open folder in Finder (macOS) / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -88,9 +89,9 @@ Inside a modal, the navigation keys behave differently:
 | Modal | Keys |
 |---|---|
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
-| Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. |
+| Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. A relative destination (e.g. `test/` for a subfolder) resolves against the active pane's current directory, not just an absolute path or the other pane's location. |
 | New folder (text input only) | `Enter` creates the named directory in the active pane (nested names like `a/b` are created in full), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
-| Open file (chooser) | Shown when `Enter` is pressed on a non-archive file. `↑` / `↓` / `Tab` move the highlight, `Enter` or a click runs it, `Esc` cancels. The first row is always "Open with default application"; the rest are [`file_actions`](./configuration.md) whose pattern matched. Background actions show "Running…" in the status bar and refresh the panes when done; `terminal: true` actions open a terminal window. |
+| Open file (chooser) | Shown when `Enter` is pressed on a non-archive file. `↑` / `↓` move the highlight, `Enter` or a click runs it, `Esc` cancels. The first row is always "Open with default application"; the rest are [`file_actions`](./configuration.md) whose pattern matched. `Tab` expands the highlighted custom action into an editable command pre-filled with its placeholders already substituted — edit it, then `Enter` runs the edited text verbatim (not the original template); `Tab` again collapses back without running anything. Background actions show "Running…" in the status bar and refresh the panes when done; `terminal: true` actions open a terminal window. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | Large-archive extract confirm | Shown when `Enter` is pressed on a `.zip` over 100 MiB. `Tab` / `←` / `→` toggle Cancel ↔ Extract focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel. |
@@ -266,10 +267,10 @@ the first non-wildcard pattern becomes the entry's alias.
   hosts (slow: stages through local `/tmp`), and `Delete` on remote
   selections (via `ssh <alias> rm -rf`). What doesn't (yet): Compress /
   Uncompress, `F4` Edit, Space Quick Look, "Open Claude Code in this
-  folder", "Open Terminal in this folder", "Open folder in editor", and
-  the Git branch palette action — all of those still
-  silently no-op when the active pane is remote, because they hand a
-  file or cwd to a local subprocess.
+  folder", "Open Terminal in this folder", "Open folder in editor",
+  "Open folder in Finder", and the Git branch palette action — all of
+  those still silently no-op when the active pane is remote, because
+  they hand a file or cwd to a local subprocess.
 
 - **Connect** — opens a new terminal window with `ssh <alias>` as its
   main process. Per OS:
@@ -309,7 +310,8 @@ within Dropbox (server-side `copy_v2` / `move_v2`), copy/move between
 Dropbox and an SSH host (stages through local `/tmp`), and `Delete` on
 Dropbox selections (`delete_v2`). The same local-only actions that no-op
 for SSH panes (Compress / Uncompress, `F4` Edit, Space Quick Look, Open
-Claude Code, Git: branch) also no-op for Dropbox panes.
+Claude Code, Open folder in Finder, Git: branch) also no-op for Dropbox
+panes.
 
 ### Open Claude Code in this folder
 
@@ -389,6 +391,13 @@ leaves the server running; the status bar shows `FTP server on
 HOST:PORT → ROOT` until you explicitly stop it. Stopping happens from
 the FTP info modal's *Stop server* button — quitting the app also tears
 the server down via the runtime's `Drop` impl.
+
+### Open folder in Finder
+
+Picking **Open folder in Finder** spawns `open <folder>`, revealing the
+active pane's directory in Finder. Fire-and-forget (no modal), macOS-only
+— the action isn't listed in the palette on other platforms. Like the
+terminal/editor actions it no-ops for non-local (SSH/Dropbox) panes.
 
 The modal also shows a **streaming log** of client activity below the
 connection details: a row per event, newest at the top. Coverage:

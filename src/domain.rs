@@ -616,10 +616,15 @@ pub enum Prompt {
     /// entries are config-defined [`FileChoice::Custom`] actions whose glob
     /// matched the file's name. `selected` is the keyboard highlight (↑/↓),
     /// Enter activates it. `path` is the absolute file path the action runs on.
+    /// `edit` is `None` normally; `Tab` on a `Custom` row expands it and fills
+    /// `edit` with the substituted command, editable before running (Enter
+    /// submits the edited text verbatim instead of re-substituting the
+    /// template). Moving the highlight clears `edit`.
     FileActions {
         path: PathBuf,
         choices: Vec<FileChoice>,
         selected: usize,
+        edit: Option<String>,
     },
     /// Connection details for the currently-running FTP server (the singleton
     /// rooted at `info.root`). Buttons: Stop server (tears it down), Close
@@ -854,6 +859,10 @@ pub enum PaletteAction {
     /// folder pops the Replace-confirm modal; on the same folder it just
     /// re-shows the FTP info modal. See [`decide_ftp_action`].
     FtpServer,
+    /// Reveal the active pane's folder in Finder (`open <path>`). Always
+    /// present as a variant so `match` arms stay exhaustive, but only listed
+    /// in [`PaletteAction::ALL`] on macOS.
+    RevealInFinder,
     KeyboardShortcuts,
     Exit,
 }
@@ -876,6 +885,7 @@ impl PaletteAction {
         PaletteAction::OpenTerminal,
         PaletteAction::OpenInEditor,
         PaletteAction::FtpServer,
+        PaletteAction::RevealInFinder,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -917,6 +927,7 @@ impl PaletteAction {
             PaletteAction::OpenTerminal => "Open Terminal in this folder",
             PaletteAction::OpenInEditor => "Open folder in editor",
             PaletteAction::FtpServer => "FTP server",
+            PaletteAction::RevealInFinder => "Open folder in Finder",
             PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
         }
@@ -3649,6 +3660,27 @@ this is not an ls line
     #[test]
     fn palette_all_excludes_launch_application_off_macos() {
         assert!(!PaletteAction::ALL.contains(&PaletteAction::LaunchApplication));
+    }
+
+    #[test]
+    fn palette_action_reveal_in_finder_label() {
+        assert_eq!(
+            PaletteAction::RevealInFinder.label(),
+            "Open folder in Finder"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn palette_all_includes_reveal_in_finder_on_macos() {
+        assert!(PaletteAction::ALL.contains(&PaletteAction::RevealInFinder));
+        assert!(available_palette_actions(false).contains(&PaletteAction::RevealInFinder));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn palette_all_excludes_reveal_in_finder_off_macos() {
+        assert!(!PaletteAction::ALL.contains(&PaletteAction::RevealInFinder));
     }
 
     fn mk_app(name: &str) -> Application {
