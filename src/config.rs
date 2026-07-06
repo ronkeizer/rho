@@ -23,24 +23,17 @@ pub const DEFAULT_ACTION_COLOR: &str = "#b48ead";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub row_height_px: f32,
-    pub row_font_size: u16,
-    pub header_font_size: u16,
-    pub size_column_px: f32,
-    pub modified_column_px: f32,
-    pub window_width: f32,
-    pub window_rows: u32,
-    pub mono_glyph_px: f32,
-    /// Optional `#rrggbb` overrides; `None` means "derive from theme".
-    pub stripe_color: Option<String>,
-    pub cursor_color: Option<String>,
-    pub mark_color: Option<String>,
-    pub folder_color: Option<String>,
-    /// Name color for files that have at least one matching `file_actions`
-    /// entry — a cue that Enter offers more than the default open. `None`
-    /// falls back to [`DEFAULT_ACTION_COLOR`].
+    /// Initial window geometry. Only read once at startup — hot reload
+    /// doesn't resize a running window.
     #[serde(default)]
-    pub action_color: Option<String>,
+    pub window: WindowConfig,
+    /// Row/column/font geometry for the pane lists. Hot-reloaded.
+    #[serde(default)]
+    pub layout: LayoutConfig,
+    /// `#rrggbb` color overrides. Any field left unset derives from the
+    /// active iced theme.
+    #[serde(default)]
+    pub theme: ThemeConfig,
     /// User-defined "open with…" actions, matched by filename glob. When Enter
     /// is pressed on a file the [`Prompt::FileActions`](crate::domain::Prompt)
     /// modal lists the default-open plus every action whose `pattern` matches.
@@ -62,22 +55,10 @@ pub struct Config {
     /// the default rather than trying to spawn `""`.
     #[serde(default)]
     pub folder_editor: Option<String>,
-    /// Dropbox app key (client id) from the Dropbox App Console. Combined
-    /// with `dropbox_refresh_token` to mint short-lived access tokens for
-    /// the `dropbox:` remote backend. `None` (the default) hides the
-    /// "Open Dropbox" palette action.
+    /// Dropbox app credentials for the `dropbox:` remote backend. Absent
+    /// (the default) hides the "Open Dropbox" palette action.
     #[serde(default)]
-    pub dropbox_app_key: Option<String>,
-    /// Dropbox app secret. Required for "full" (non-PKCE) apps; PKCE apps
-    /// can leave this unset. Only ever sent to Dropbox's `oauth2/token`
-    /// endpoint when exchanging the refresh token.
-    #[serde(default)]
-    pub dropbox_app_secret: Option<String>,
-    /// Long-lived OAuth2 refresh token (obtained once via the Dropbox
-    /// authorize flow with `token_access_type=offline`). Exchanged for a
-    /// short-lived access token on demand — see `fs_ops::dropbox_access_token`.
-    #[serde(default)]
-    pub dropbox_refresh_token: Option<String>,
+    pub dropbox: DropboxConfig,
     /// Settings for the in-app FTP server (Command Palette → "FTP server").
     /// Defaults: LAN-accessible on `0.0.0.0:2121`, generated credentials,
     /// read-only. The server is singleton — restarting it picks up changes
@@ -89,29 +70,108 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            window: WindowConfig::default(),
+            layout: LayoutConfig::default(),
+            theme: ThemeConfig::default(),
+            file_actions: Vec::new(),
+            watch_folders: vec!["~/Downloads".to_string()],
+            terminal_app: None,
+            folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
+            dropbox: DropboxConfig::default(),
+            ftp: FtpConfig::default(),
+        }
+    }
+}
+
+/// Initial window dimensions. `width` is a literal pixel width; `height` is
+/// derived from `rows` × `layout.row_height_px` (see [`Config::window_size`])
+/// so the window opens showing exactly that many rows.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WindowConfig {
+    pub width: f32,
+    pub rows: u32,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            width: 1100.0,
+            rows: 35,
+        }
+    }
+}
+
+/// Row/column/font geometry for the pane lists. See
+/// [`crate::main`]'s `ROW_STRIDE coupling` note — `row_height_px` is the
+/// single source of truth for vertical row geometry and auto-scroll math.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    pub row_height_px: f32,
+    pub row_font_size: u16,
+    pub header_font_size: u16,
+    pub size_column_px: f32,
+    pub modified_column_px: f32,
+    pub mono_glyph_px: f32,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
             row_height_px: 19.0,
             row_font_size: 13,
             header_font_size: 11,
             size_column_px: 80.0,
             modified_column_px: 140.0,
-            window_width: 1100.0,
-            window_rows: 35,
             mono_glyph_px: 7.5,
-            stripe_color: None,
-            cursor_color: None,
-            mark_color: None,
-            folder_color: Some("#6db4ff".to_string()),
-            action_color: Some(DEFAULT_ACTION_COLOR.to_string()),
-            file_actions: Vec::new(),
-            watch_folders: vec!["~/Downloads".to_string()],
-            terminal_app: None,
-            folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
-            dropbox_app_key: None,
-            dropbox_app_secret: None,
-            dropbox_refresh_token: None,
-            ftp: FtpConfig::default(),
         }
     }
+}
+
+/// `#rrggbb` color overrides for pane rows; `None` on any field means
+/// "derive from the active iced theme".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub stripe: Option<String>,
+    pub cursor: Option<String>,
+    pub mark: Option<String>,
+    pub folder: Option<String>,
+    /// Name color for files that have at least one matching `file_actions`
+    /// entry — a cue that Enter offers more than the default open. `None`
+    /// falls back to [`DEFAULT_ACTION_COLOR`].
+    pub action: Option<String>,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            stripe: None,
+            cursor: None,
+            mark: None,
+            folder: Some("#6db4ff".to_string()),
+            action: Some(DEFAULT_ACTION_COLOR.to_string()),
+        }
+    }
+}
+
+/// Dropbox app credentials for the `dropbox:` remote backend. Combined by
+/// [`Config::dropbox_auth`] into a [`DropboxAuth`] once both `app_key` and
+/// `refresh_token` are present.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DropboxConfig {
+    /// App key (client id) from the Dropbox App Console.
+    pub app_key: Option<String>,
+    /// App secret. Required for "full" (non-PKCE) apps; PKCE apps can leave
+    /// this unset. Only ever sent to Dropbox's `oauth2/token` endpoint when
+    /// exchanging the refresh token.
+    pub app_secret: Option<String>,
+    /// Long-lived OAuth2 refresh token (obtained once via the Dropbox
+    /// authorize flow with `token_access_type=offline`). Exchanged for a
+    /// short-lived access token on demand — see `fs_ops::dropbox_access_token`.
+    pub refresh_token: Option<String>,
 }
 
 /// Settings for the in-app FTP server. Surfaced under the `ftp:` key in
@@ -278,15 +338,16 @@ impl Config {
     /// set. Used to gate the "Open Dropbox" palette action and to mint
     /// access tokens in `fs_ops`.
     pub fn dropbox_auth(&self) -> Option<DropboxAuth> {
-        let app_key = self.dropbox_app_key.clone()?;
-        let refresh_token = self.dropbox_refresh_token.clone()?;
+        let app_key = self.dropbox.app_key.clone()?;
+        let refresh_token = self.dropbox.refresh_token.clone()?;
         if app_key.trim().is_empty() || refresh_token.trim().is_empty() {
             return None;
         }
         Some(DropboxAuth {
             app_key,
             app_secret: self
-                .dropbox_app_secret
+                .dropbox
+                .app_secret
                 .clone()
                 .filter(|s| !s.trim().is_empty()),
             refresh_token,
@@ -327,15 +388,15 @@ impl Config {
     }
 
     pub fn row_padding_y(&self) -> u16 {
-        let text_h = self.row_font_size as f32 * 1.3;
-        let pad = ((self.row_height_px - text_h) / 2.0).max(0.0);
+        let text_h = self.layout.row_font_size as f32 * 1.3;
+        let pad = ((self.layout.row_height_px - text_h) / 2.0).max(0.0);
         pad.round() as u16
     }
 
     pub fn window_size(&self) -> Size {
         let chrome = 90.0;
-        let height = chrome + self.window_rows as f32 * self.row_height_px;
-        Size::new(self.window_width, height)
+        let height = chrome + self.window.rows as f32 * self.layout.row_height_px;
+        Size::new(self.window.width, height)
     }
 }
 
@@ -446,19 +507,27 @@ pub fn quick_look(path: &Path) -> std::io::Result<()> {
 
 fn default_template_yaml() -> &'static str {
     "# Rho configuration file — edits are picked up live (no restart needed).\n\
-     row_height_px: 19.0\n\
-     row_font_size: 13\n\
-     header_font_size: 11\n\
-     size_column_px: 80.0\n\
-     modified_column_px: 140.0\n\
-     window_width: 1100.0\n\
-     window_rows: 35\n\
-     mono_glyph_px: 7.5\n\
-     # Optional color overrides (#rrggbb). Comment out to derive from theme.\n\
-     folder_color: \"#6db4ff\"\n\
-     # stripe_color: \"#1c1d1f\"\n\
-     # cursor_color: \"#3a80c8\"\n\
-     # mark_color: \"#2a4a6a\"\n\
+     # Initial window size. Only read at startup — hot reload won't resize an\n\
+     # already-open window.\n\
+     window:\n\
+     \x20\x20width: 1100.0\n\
+     \x20\x20rows: 35\n\
+     # Row/column/font geometry for the pane lists.\n\
+     layout:\n\
+     \x20\x20row_height_px: 19.0\n\
+     \x20\x20row_font_size: 13\n\
+     \x20\x20header_font_size: 11\n\
+     \x20\x20size_column_px: 80.0\n\
+     \x20\x20modified_column_px: 140.0\n\
+     \x20\x20mono_glyph_px: 7.5\n\
+     # Color overrides (#rrggbb). Comment out a field to derive it from theme.\n\
+     theme:\n\
+     \x20\x20folder: \"#6db4ff\"\n\
+     \x20\x20# stripe: \"#1c1d1f\"\n\
+     \x20\x20# cursor: \"#3a80c8\"\n\
+     \x20\x20# mark: \"#2a4a6a\"\n\
+     \x20\x20# Name color for files with a matching file_actions entry (below).\n\
+     \x20\x20# action: \"#b48ead\"\n\
      # Folders to watch for new files. App pops up a prompt offering to switch\n\
      # a pane to that folder. Non-recursive. Restart to apply changes.\n\
      watch_folders:\n\
@@ -469,8 +538,6 @@ fn default_template_yaml() -> &'static str {
      # Editor launched by \"Open folder in editor\" (run as `<editor> <folder>`).\n\
      # Defaults to the VS Code CLI; point it at any editor that opens a folder.\n\
      # folder_editor: \"/usr/local/bin/code\"\n\
-     # Name color for files that have a matching file_actions entry (see below).\n\
-     # action_color: \"#b48ead\"\n\
      # Custom \"open with…\" actions. Pressing Enter on a file shows a chooser:\n\
      # \"Open with default application\" plus every action whose pattern (a\n\
      # *.glob, case-insensitive) matches the file name. command placeholders:\n\
@@ -497,9 +564,10 @@ fn default_template_yaml() -> &'static str {
      # token\" button (that's a short-lived sl.* access token); after changing\n\
      # scopes you must re-authorize; after editing these, restart rho.\n\
      # app_secret is only needed for non-PKCE apps.\n\
-     # dropbox_app_key: \"xxxxxxxxxxxxxxx\"\n\
-     # dropbox_app_secret: \"xxxxxxxxxxxxxxx\"\n\
-     # dropbox_refresh_token: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n\
+     # dropbox:\n\
+     #   app_key: \"xxxxxxxxxxxxxxx\"\n\
+     #   app_secret: \"xxxxxxxxxxxxxxx\"\n\
+     #   refresh_token: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n\
      # In-app FTP server (Command Palette → \"FTP server\"). Defaults shown;\n\
      # any omitted field falls back to the default. Changes apply on next\n\
      # server start — stop the running server first via the FTP info modal.\n\
@@ -541,12 +609,13 @@ pub struct RowColors {
 
 pub fn row_colors_from(config: &Config) -> RowColors {
     RowColors {
-        cursor: config.cursor_color.as_deref().and_then(parse_hex_color),
-        mark: config.mark_color.as_deref().and_then(parse_hex_color),
-        stripe: config.stripe_color.as_deref().and_then(parse_hex_color),
-        folder: config.folder_color.as_deref().and_then(parse_hex_color),
+        cursor: config.theme.cursor.as_deref().and_then(parse_hex_color),
+        mark: config.theme.mark.as_deref().and_then(parse_hex_color),
+        stripe: config.theme.stripe.as_deref().and_then(parse_hex_color),
+        folder: config.theme.folder.as_deref().and_then(parse_hex_color),
         action: config
-            .action_color
+            .theme
+            .action
             .as_deref()
             .and_then(parse_hex_color)
             .or_else(|| parse_hex_color(DEFAULT_ACTION_COLOR)),
@@ -716,16 +785,16 @@ mod tests {
     #[test]
     fn config_default_values_are_sensible() {
         let c = Config::default();
-        assert!(c.row_height_px > 0.0);
-        assert!(c.row_font_size > 0);
-        assert!(c.size_column_px > 0.0);
-        assert!(c.modified_column_px > 0.0);
-        assert!(c.window_width > 0.0);
-        assert!(c.window_rows > 0);
-        assert!(c.mono_glyph_px > 0.0);
+        assert!(c.layout.row_height_px > 0.0);
+        assert!(c.layout.row_font_size > 0);
+        assert!(c.layout.size_column_px > 0.0);
+        assert!(c.layout.modified_column_px > 0.0);
+        assert!(c.window.width > 0.0);
+        assert!(c.window.rows > 0);
+        assert!(c.layout.mono_glyph_px > 0.0);
         // Default ships with folder color set so users see colored dirs out of
         // the box.
-        assert!(c.folder_color.is_some());
+        assert!(c.theme.folder.is_some());
     }
 
     #[test]
@@ -764,12 +833,18 @@ mod tests {
         assert_eq!(colors.action, parse_hex_color(DEFAULT_ACTION_COLOR));
         // A configured color wins; an unparseable one falls back to default.
         let custom = Config {
-            action_color: Some("#102030".to_string()),
+            theme: ThemeConfig {
+                action: Some("#102030".to_string()),
+                ..ThemeConfig::default()
+            },
             ..Config::default()
         };
         assert_eq!(row_colors_from(&custom).action, parse_hex_color("#102030"));
         let bad = Config {
-            action_color: Some("not-a-color".to_string()),
+            theme: ThemeConfig {
+                action: Some("not-a-color".to_string()),
+                ..ThemeConfig::default()
+            },
             ..Config::default()
         };
         assert_eq!(
@@ -806,8 +881,11 @@ file_actions:
     #[test]
     fn row_padding_y_is_non_negative_and_centered() {
         let c = Config {
-            row_height_px: 20.0,
-            row_font_size: 13,
+            layout: LayoutConfig {
+                row_height_px: 20.0,
+                row_font_size: 13,
+                ..LayoutConfig::default()
+            },
             ..Config::default()
         };
         // text_h = 13 * 1.3 = 16.9; padding = (20 - 16.9)/2 = 1.55 → round 2.
@@ -817,8 +895,11 @@ file_actions:
     #[test]
     fn row_padding_y_floors_at_zero_when_height_too_small() {
         let c = Config {
-            row_height_px: 5.0,
-            row_font_size: 13,
+            layout: LayoutConfig {
+                row_height_px: 5.0,
+                row_font_size: 13,
+                ..LayoutConfig::default()
+            },
             ..Config::default()
         };
         // text_h = 16.9 > row_height; pad would be negative → clamped to 0.
@@ -828,9 +909,14 @@ file_actions:
     #[test]
     fn window_size_depends_on_rows_and_height() {
         let c = Config {
-            row_height_px: 20.0,
-            window_rows: 30,
-            window_width: 1000.0,
+            layout: LayoutConfig {
+                row_height_px: 20.0,
+                ..LayoutConfig::default()
+            },
+            window: WindowConfig {
+                rows: 30,
+                width: 1000.0,
+            },
             ..Config::default()
         };
         let size = c.window_size();
@@ -841,29 +927,41 @@ file_actions:
 
     #[test]
     fn config_yaml_partial_uses_defaults_for_missing_fields() {
-        let yaml = "row_font_size: 17\n";
+        let yaml = "layout:\n  row_font_size: 17\n";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.row_font_size, 17);
+        assert_eq!(cfg.layout.row_font_size, 17);
         // Other fields fall back to defaults.
-        assert_eq!(cfg.row_height_px, Config::default().row_height_px);
-        assert_eq!(cfg.window_rows, Config::default().window_rows);
+        assert_eq!(
+            cfg.layout.row_height_px,
+            Config::default().layout.row_height_px
+        );
+        assert_eq!(cfg.window.rows, Config::default().window.rows);
     }
 
     #[test]
     fn config_yaml_empty_is_all_defaults() {
         let cfg: Config = serde_yaml::from_str("").unwrap_or_default();
         // Both fields the same as Default::default().
-        assert_eq!(cfg.row_height_px, Config::default().row_height_px);
-        assert_eq!(cfg.row_font_size, Config::default().row_font_size);
+        assert_eq!(
+            cfg.layout.row_height_px,
+            Config::default().layout.row_height_px
+        );
+        assert_eq!(
+            cfg.layout.row_font_size,
+            Config::default().layout.row_font_size
+        );
     }
 
     #[test]
     fn row_colors_parses_hex_overrides() {
         let cfg = Config {
-            stripe_color: Some("#112233".to_string()),
-            cursor_color: Some("#445566".to_string()),
-            mark_color: Some("#778899".to_string()),
-            folder_color: Some("#aabbcc".to_string()),
+            theme: ThemeConfig {
+                stripe: Some("#112233".to_string()),
+                cursor: Some("#445566".to_string()),
+                mark: Some("#778899".to_string()),
+                folder: Some("#aabbcc".to_string()),
+                ..ThemeConfig::default()
+            },
             ..Config::default()
         };
         let colors = row_colors_from(&cfg);
@@ -876,10 +974,13 @@ file_actions:
     #[test]
     fn row_colors_unset_or_invalid_resolve_to_none() {
         let cfg = Config {
-            stripe_color: None,
-            cursor_color: Some("not-a-color".to_string()),
-            mark_color: Some("#xyzxyz".to_string()),
-            folder_color: None,
+            theme: ThemeConfig {
+                stripe: None,
+                cursor: Some("not-a-color".to_string()),
+                mark: Some("#xyzxyz".to_string()),
+                folder: None,
+                ..ThemeConfig::default()
+            },
             ..Config::default()
         };
         let colors = row_colors_from(&cfg);

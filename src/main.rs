@@ -416,14 +416,14 @@ impl App {
             .pane(self.active)
             .viewport_height
             .unwrap_or_else(|| viewport_height_estimate(self.window_size.height));
-        let rows = (vh / self.config.row_height_px).floor() as i32 - 1;
+        let rows = (vh / self.config.layout.row_height_px).floor() as i32 - 1;
         rows.max(1)
     }
 
     fn ensure_active_visible(&mut self) -> Task<Message> {
         let side = self.active;
         let fallback_vh = viewport_height_estimate(self.window_size.height);
-        let stride = self.config.row_height_px;
+        let stride = self.config.layout.row_height_px;
         let pane = self.pane_mut(side);
         let vh = pane.viewport_height.unwrap_or(fallback_vh);
         let row_top = pane.selected as f32 * stride;
@@ -453,7 +453,7 @@ impl App {
     /// `pane.scroll_y` may be stale from before the navigation.
     fn scroll_to_focused(&mut self, side: Side) -> Task<Message> {
         let fallback_vh = viewport_height_estimate(self.window_size.height);
-        let stride = self.config.row_height_px;
+        let stride = self.config.layout.row_height_px;
         let pane = self.pane_mut(side);
         let vh = pane.viewport_height.unwrap_or(fallback_vh);
         let row_top = pane.selected as f32 * stride;

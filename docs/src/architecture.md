@@ -369,7 +369,7 @@ choice list is built by `domain::build_file_choices`: `FileChoice::OpenDefault`
 is always first, followed by one `FileChoice::Custom` per configured
 `file_actions` entry whose glob (`domain::glob_match`, `*`/`?`, case-
 insensitive) matched the file name. The same `glob_match` drives the listing
-highlight — `view_pane` colors a file's name with `action_color` when
+highlight — `view_pane` colors a file's name with `theme.action` when
 `file_has_custom_action` is true (suppressed inside the active selection, like
 the folder color; both go through the renamed `entry_name_color` helper).
 

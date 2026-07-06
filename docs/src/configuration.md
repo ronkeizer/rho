@@ -6,37 +6,42 @@ on save (a 1 Hz mtime check picks up changes without a restart). If the
 file is missing or fails to parse, defaults are used and a warning is
 logged to stderr.
 
-Hot-reload covers everything **except** window size, which iced sets once
-at startup — change `window_width` / `window_rows` and you need to restart
-to see it.
+Hot-reload covers everything **except** the `window` section, which iced
+sets once at startup — change `window.width` / `window.rows` and you need
+to restart to see it.
 
 `⌘,` from inside the app opens this file in your OS default editor
 (creating it from the template if it doesn't exist).
+
+Related settings are grouped into sections (`window`, `layout`, `theme`,
+`dropbox`, `ftp`); everything else stays top-level. Every section is
+optional — an absent section, or an absent field within one, falls back to
+its default.
 
 ## Fields
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `row_height_px` | float | `19.0` | Single source of truth for vertical row stride. Auto-scroll math reads this directly. |
-| `row_font_size` | int | `13` | Used for entry rows. |
-| `header_font_size` | int | `11` | Used for column headers, the git info bar, the filter bar, and the bottom status bar. |
-| `size_column_px` | float | `80.0` | Width of the Size column. |
-| `modified_column_px` | float | `140.0` | Width of the Modified column. |
-| `window_width` | float | `1100.0` | Initial window width. Restart required to apply. |
-| `window_rows` | int | `35` | Initial window height, expressed in row counts. Restart required to apply. |
-| `mono_glyph_px` | float | `7.5` | Approximate width of a monospace glyph. Used to estimate how many characters fit in the Name column before ellipsizing. |
-| `stripe_color` | string `#rrggbb` | _(theme-derived)_ | Zebra stripe color for odd rows (in the panes and the Processes list). Omit to fall back to a derived theme blend. |
-| `cursor_color` | string `#rrggbb` | _(theme-derived)_ | Selection cursor color. Omit to use the iced theme's primary-strong color. |
-| `mark_color` | string `#rrggbb` | _(theme-derived)_ | Background for marked rows (range selection). Omit to use the theme's primary-weak color. |
-| `folder_color` | string `#rrggbb` | `#6db4ff` | Name color for directory entries. |
-| `action_color` | string `#rrggbb` | `#b48ead` | Name color for files that have a matching `file_actions` entry — a cue that `Enter` offers more than the default open. |
+| `window.width` | float | `1100.0` | Initial window width. Restart required to apply. |
+| `window.rows` | int | `35` | Initial window height, expressed in row counts. Restart required to apply. |
+| `layout.row_height_px` | float | `19.0` | Single source of truth for vertical row stride. Auto-scroll math reads this directly. |
+| `layout.row_font_size` | int | `13` | Used for entry rows. |
+| `layout.header_font_size` | int | `11` | Used for column headers, the git info bar, the filter bar, and the bottom status bar. |
+| `layout.size_column_px` | float | `80.0` | Width of the Size column. |
+| `layout.modified_column_px` | float | `140.0` | Width of the Modified column. |
+| `layout.mono_glyph_px` | float | `7.5` | Approximate width of a monospace glyph. Used to estimate how many characters fit in the Name column before ellipsizing. |
+| `theme.stripe` | string `#rrggbb` | _(theme-derived)_ | Zebra stripe color for odd rows (in the panes and the Processes list). Omit to fall back to a derived theme blend. |
+| `theme.cursor` | string `#rrggbb` | _(theme-derived)_ | Selection cursor color. Omit to use the iced theme's primary-strong color. |
+| `theme.mark` | string `#rrggbb` | _(theme-derived)_ | Background for marked rows (range selection). Omit to use the theme's primary-weak color. |
+| `theme.folder` | string `#rrggbb` | `#6db4ff` | Name color for directory entries. |
+| `theme.action` | string `#rrggbb` | `#b48ead` | Name color for files that have a matching `file_actions` entry — a cue that `Enter` offers more than the default open. |
 | `file_actions` | list of actions | _(empty)_ | Custom "open with…" entries shown in the file-action chooser. See [File actions](#file-actions) below. |
 | `watch_folders` | list of strings | `["~/Downloads"]` | Folders to watch for new files. Read once at startup; restart to apply changes. |
 | `terminal_app` | string | _(auto)_ | macOS only. Which terminal app to launch for the SSH `Connect`, Docker `Shell`, `Open Claude Code in this folder`, and `Open Terminal in this folder` actions. Common values: `"iTerm"`, `"Terminal"`. Omit (or leave `None`) to auto-pick: `iTerm` when `/Applications/iTerm.app` exists, otherwise `Terminal`. Ignored on Linux / Windows. |
 | `folder_editor` | string | `/usr/local/bin/code` | Editor binary for the **Open folder in editor** action, invoked as `<folder_editor> <folder>`. Defaults to the VS Code CLI. Point it at any editor that opens a directory argument (Sublime's `subl`, a `code` under `/opt/homebrew/bin`, an editor wrapper script, etc.). A blank value falls back to the default. |
-| `dropbox_app_key` | string | _(unset)_ | Dropbox app key (client ID) from the [App Console](https://www.dropbox.com/developers/apps). Required to enable the Dropbox backend. |
-| `dropbox_app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
-| `dropbox_refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox_app_key` to unlock the **Open Dropbox** command. |
+| `dropbox.app_key` | string | _(unset)_ | Dropbox app key (client ID) from the [App Console](https://www.dropbox.com/developers/apps). Required to enable the Dropbox backend. |
+| `dropbox.app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
+| `dropbox.refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox.app_key` to unlock the **Open Dropbox** command. |
 | `ftp` | section | _(defaults)_ | Settings for the in-app FTP server (Command Palette → **FTP server**). See [FTP server](#ftp-server) below. An absent section applies the defaults; a partial section fills in missing fields per field. |
 
 ## Colors
@@ -163,7 +168,7 @@ app shows a modal asking whether to switch one of the panes to that folder.
 Pressing `Enter` on a file (other than a `.zip`, which still extracts) opens a
 small chooser. The first row is always **Open with default application**; below
 it are any `file_actions` entries whose `pattern` matched the file name. Files
-that have at least one matching action are shown in `action_color` in the
+that have at least one matching action are shown in `theme.action` in the
 listing, so you can tell at a glance that `Enter` offers more than a plain open.
 
 Each entry has these fields:
@@ -303,21 +308,24 @@ device), force passive mode explicitly in the client's options.
 
 ```yaml
 # Rho configuration file — edits are picked up live (no restart needed).
-row_height_px: 19.0
-row_font_size: 13
-header_font_size: 11
-size_column_px: 80.0
-modified_column_px: 140.0
-window_width: 1100.0
-window_rows: 35
-mono_glyph_px: 7.5
-# Optional color overrides (#rrggbb). Comment out to derive from theme.
-folder_color: "#6db4ff"
-# stripe_color: "#1c1d1f"
-# cursor_color: "#3a80c8"
-# mark_color: "#2a4a6a"
-# Name color for files that have a matching file_actions entry.
-# action_color: "#b48ead"
+window:
+  width: 1100.0
+  rows: 35
+layout:
+  row_height_px: 19.0
+  row_font_size: 13
+  header_font_size: 11
+  size_column_px: 80.0
+  modified_column_px: 140.0
+  mono_glyph_px: 7.5
+# Optional color overrides (#rrggbb). Comment out a field to derive it from theme.
+theme:
+  folder: "#6db4ff"
+  # stripe: "#1c1d1f"
+  # cursor: "#3a80c8"
+  # mark: "#2a4a6a"
+  # Name color for files that have a matching file_actions entry.
+  # action: "#b48ead"
 # Custom "open with…" actions — see the File actions section above.
 # file_actions:
 #   - pattern: "*.md"
@@ -327,9 +335,10 @@ folder_color: "#6db4ff"
 watch_folders:
   - "~/Downloads"
 # Dropbox backend (optional). See the Dropbox section above.
-# dropbox_app_key: "xxxxxxxxxxxxxxx"
-# dropbox_app_secret: "xxxxxxxxxxxxxxx"
-# dropbox_refresh_token: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# dropbox:
+#   app_key: "xxxxxxxxxxxxxxx"
+#   app_secret: "xxxxxxxxxxxxxxx"
+#   refresh_token: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # In-app FTP server. Omit to use the defaults shown.
 # ftp:
 #   port: 2121

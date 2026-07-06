@@ -30,7 +30,7 @@ pub fn view_pane<'a>(
 ) -> Element<'a, Message> {
     let path_header = text(pane.location.to_string())
         .font(Font::MONOSPACE)
-        .size(config.row_font_size)
+        .size(config.layout.row_font_size)
         .style(move |theme: &Theme| iced::widget::text::Style {
             color: if active {
                 None
@@ -42,7 +42,7 @@ pub fn view_pane<'a>(
     // Match the body row's leading git-marker gutter so the "Name" header
     // sits over the actual names rather than the marker column.
     let name_header = row![
-        Space::with_width(Length::Fixed(config.row_font_size as f32)),
+        Space::with_width(Length::Fixed(config.layout.row_font_size as f32)),
         header_cell(
             side,
             "Name",
@@ -65,7 +65,7 @@ pub fn view_pane<'a>(
                 "Size",
                 SortBy::Size,
                 pane,
-                Length::Fixed(config.size_column_px),
+                Length::Fixed(config.layout.size_column_px),
                 Horizontal::Right,
                 config,
                 active,
@@ -75,7 +75,7 @@ pub fn view_pane<'a>(
                 "Modified",
                 SortBy::Modified,
                 pane,
-                Length::Fixed(config.modified_column_px),
+                Length::Fixed(config.layout.modified_column_px),
                 Horizontal::Left,
                 config,
                 active,
@@ -98,7 +98,7 @@ pub fn view_pane<'a>(
     });
 
     let pad_y = config.row_padding_y();
-    let stride = config.row_height_px;
+    let stride = config.layout.row_height_px;
     let fallback_vh = viewport_height_estimate(window_height);
     let vh = pane.viewport_height.unwrap_or(fallback_vh);
 
@@ -196,7 +196,7 @@ pub fn view_pane<'a>(
     // first streamed chunk arrives we switch to the scrollable so the user
     // sees entries appear progressively even if more are still loading.
     let body: Element<'a, Message> = if pane.loading && pane.entries.is_empty() {
-        container(text("Loading…").size(config.row_font_size))
+        container(text("Loading…").size(config.layout.row_font_size))
             .padding(16)
             .width(Length::Fill)
             .into()
@@ -241,7 +241,7 @@ fn claude_info_bar<'a>(pane: &Pane, config: &Config, active: bool) -> Element<'a
     container(
         text(pane.claude_marker_label())
             .font(Font::MONOSPACE)
-            .size(config.header_font_size),
+            .size(config.layout.header_font_size),
     )
     .padding(Padding::from([2, 8]))
     .width(Length::Fill)
@@ -280,7 +280,7 @@ fn git_info_bar<'a>(info: &GitInfo, config: &Config, active: bool) -> Element<'a
     container(
         text(label)
             .font(Font::MONOSPACE)
-            .size(config.header_font_size),
+            .size(config.layout.header_font_size),
     )
     .padding(Padding::from([2, 8]))
     .width(Length::Fill)
@@ -310,7 +310,7 @@ fn filter_bar<'a>(pane: &Pane, config: &Config, active: bool) -> Element<'a, Mes
     container(
         text(label)
             .font(Font::MONOSPACE)
-            .size(config.header_font_size),
+            .size(config.layout.header_font_size),
     )
     .padding(Padding::from([4, 8]))
     .width(Length::Fill)
@@ -387,7 +387,7 @@ fn header_cell<'a>(
     let label_full = format!("{}{}", label, arrow);
     button(
         text(label_full)
-            .size(config.header_font_size)
+            .size(config.layout.header_font_size)
             .width(Length::Fill)
             .align_x(align),
     )
@@ -422,7 +422,7 @@ fn build_row<'a>(
     dim_row: bool,
     git_modified: bool,
 ) -> Element<'a, Message> {
-    let font_size = config.row_font_size;
+    let font_size = config.layout.row_font_size;
     // Fixed-width gutter so every row's name column aligns regardless of
     // whether a git marker is present.
     let git_marker_width = Length::Fixed(font_size as f32);
@@ -471,13 +471,13 @@ fn build_row<'a>(
         text(size)
             .font(Font::MONOSPACE)
             .size(font_size)
-            .width(Length::Fixed(config.size_column_px))
+            .width(Length::Fixed(config.layout.size_column_px))
             .align_x(Horizontal::Right)
             .wrapping(iced::widget::text::Wrapping::None),
         text(modified)
             .font(Font::MONOSPACE)
             .size(font_size)
-            .width(Length::Fixed(config.modified_column_px))
+            .width(Length::Fixed(config.layout.modified_column_px))
             .wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(8);
@@ -485,7 +485,7 @@ fn build_row<'a>(
     button(content)
         .on_press(msg)
         .width(Length::Fill)
-        .height(Length::Fixed(config.row_height_px))
+        .height(Length::Fixed(config.layout.row_height_px))
         .padding(Padding::from([pad_y, 8]))
         .clip(true)
         .style(move |theme: &Theme, status: button::Status| {
@@ -592,11 +592,11 @@ pub fn name_max_chars(window_width: f32, config: &Config) -> usize {
     let scrollbar = 16.0;
     // The name column also contains a git-modified marker (width = font_size)
     // plus 4px spacing before the name text itself.
-    let git_marker_with_gap = config.row_font_size as f32 + 4.0;
+    let git_marker_with_gap = config.layout.row_font_size as f32 + 4.0;
     // A couple of glyphs of breathing room: cosmic-text's measured glyph width
     // is rarely exactly mono_glyph_px, and we'd rather ellipsize one char too
     // early than have the name overflow into a second visual line.
-    let safety_px = config.mono_glyph_px * 2.0;
+    let safety_px = config.layout.mono_glyph_px * 2.0;
 
     let name_px = pane_width
         - pane_border_padding
@@ -604,11 +604,11 @@ pub fn name_max_chars(window_width: f32, config: &Config) -> usize {
         - row_gaps
         - git_marker_with_gap
         - safety_px
-        - config.size_column_px
-        - config.modified_column_px
+        - config.layout.size_column_px
+        - config.layout.modified_column_px
         - scrollbar;
 
-    ((name_px / config.mono_glyph_px).max(8.0)) as usize
+    ((name_px / config.layout.mono_glyph_px).max(8.0)) as usize
 }
 
 pub fn viewport_height_estimate(window_height: f32) -> f32 {
