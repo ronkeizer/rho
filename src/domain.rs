@@ -3,7 +3,7 @@
 //! selection / anchor used by the UI; mutations all go through this module
 //! so the logic can be unit-tested without an iced runtime.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -576,6 +576,24 @@ pub enum Prompt {
         choices: Vec<FileChoice>,
         selected: usize,
     },
+    /// Connection details for the currently-running FTP server (the singleton
+    /// rooted at `info.root`). Buttons: Stop server (tears it down), Close
+    /// (dismiss the modal; server keeps running). Used both for the
+    /// just-started server (right after `decide_ftp_action` → `StartFresh`)
+    /// and as a re-show when the palette action is invoked again from inside
+    /// the same root.
+    FtpInfo {
+        info: FtpServerInfo,
+        focus: FtpInfoFocus,
+    },
+    /// User invoked "FTP server" while one is already running rooted at a
+    /// *different* folder. Ask before tearing the old one down. `new_root` is
+    /// the active pane's current path that the new server would be rooted at.
+    FtpReplace {
+        current: FtpServerInfo,
+        new_root: PathBuf,
+        focus: FtpReplaceFocus,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,6 +628,153 @@ impl NewFilesFocus {
     }
 }
 
+/// Fold a freshly-detected batch of new files into the queue of pending
+/// `NewFiles` prompts. Bursts for a folder already queued extend that
+/// entry's file list instead of adding a second queued popup, so a folder
+/// that keeps receiving new files grows one modal instead of stacking many.
+pub fn merge_pending_new_files(
+    pending: &mut VecDeque<(PathBuf, Vec<String>)>,
+    folder: PathBuf,
+    files: Vec<String>,
+) {
+    if let Some(existing) = pending.iter_mut().find(|(f, _)| *f == folder) {
+        existing.1.extend(files);
+    } else {
+        pending.push_back((folder, files));
+    }
+}
+
+/// Connection details for a running in-app FTP server. Built by
+/// `fs_ops::ftp_start_task` when the server binds, then carried in
+/// [`Prompt::FtpInfo`] / [`Prompt::FtpReplace`] and on `App.ftp_server` for
+/// the status bar. `username` / `password` are `Some` for the
+/// [`FtpAuthMode::Generated`](crate::config::FtpAuthMode) mode and `None`
+/// when [`FtpAuthMode::Anonymous`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtpServerInfo {
+    /// What we actually bound — `0.0.0.0:2121`, `127.0.0.1:2121`, etc.
+    pub bind: std::net::SocketAddr,
+    /// Best-effort display hostname for the modal: the local IPv4 if `bind`
+    /// is the unspecified `0.0.0.0` and we could resolve one, otherwise the
+    /// literal IP we bound (loopback or the configured address).
+    pub display_host: String,
+    /// The pane folder the server was started on. Identity for
+    /// [`decide_ftp_action`].
+    pub root: PathBuf,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub permissions: crate::config::FtpPerms,
+    pub started_at: SystemTime,
+}
+
+impl FtpServerInfo {
+    /// `host:port` for the modal — pairs `display_host` with the bound port.
+    /// Cheap and infallible; no `&self` borrow into the formatter chain.
+    pub fn display_addr(&self) -> String {
+        format!("{}:{}", self.display_host, self.bind.port())
+    }
+}
+
+/// Severity of an [`FtpLogEntry`]. Drives the per-row color in the modal —
+/// `Info` is plain, `Warn` amber, `Error` red. `Auth` is split out from
+/// `Info` so successful logins read as a normal connection event while bad
+/// passwords surface as a warning the user can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpLogLevel {
+    Info,
+    Auth,
+    Warn,
+    Error,
+}
+
+/// One line in the streaming FTP log shown in the [`Prompt::FtpInfo`]
+/// modal. Built by the listeners in `fs_ops` and pushed onto the App's
+/// capped ring buffer via [`crate::Message::FtpLogEvent`].
+#[derive(Debug, Clone)]
+pub struct FtpLogEntry {
+    /// When the event was produced. Used to render the leading timestamp.
+    pub ts: SystemTime,
+    pub level: FtpLogLevel,
+    /// Free-form message. Format is `<verb> <subject>` where possible (e.g.
+    /// "GET /readme.md (1.2 kB)") so a scan of the log reads as a sequence
+    /// of FTP-style commands rather than as a debug log.
+    pub message: String,
+}
+
+/// Format `ts` as `HH:MM:SS` in the local timezone. Used as the leading
+/// column of every log row in the FTP info modal. Stays here in `domain`
+/// (rather than next to the renderer) so the formatting can be unit-tested
+/// without an iced runtime.
+pub fn format_log_timestamp(ts: SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = ts.into();
+    dt.format("%H:%M:%S").to_string()
+}
+
+/// Which button is currently highlighted in the [`Prompt::FtpInfo`] modal.
+/// `Close` is the default landing focus — the safe action, matches the
+/// `Delete` modal's "Cancel-is-default" convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpInfoFocus {
+    Stop,
+    Close,
+}
+
+impl FtpInfoFocus {
+    pub fn toggle(self) -> Self {
+        match self {
+            FtpInfoFocus::Stop => FtpInfoFocus::Close,
+            FtpInfoFocus::Close => FtpInfoFocus::Stop,
+        }
+    }
+}
+
+/// Which button is highlighted in the [`Prompt::FtpReplace`] modal. `Cancel`
+/// is the default landing focus — replacing a running server is destructive
+/// (drops live connections) so the safe option wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpReplaceFocus {
+    Cancel,
+    Replace,
+}
+
+impl FtpReplaceFocus {
+    pub fn toggle(self) -> Self {
+        match self {
+            FtpReplaceFocus::Cancel => FtpReplaceFocus::Replace,
+            FtpReplaceFocus::Replace => FtpReplaceFocus::Cancel,
+        }
+    }
+}
+
+/// What invoking the "FTP server" palette action should do, given the
+/// current server state and the active pane's path. Encapsulates the
+/// three-way decision (start fresh / show info / ask to replace) so it can
+/// be unit-tested without dragging the iced runtime in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FtpAction {
+    /// No server is running — start one rooted at this path.
+    StartFresh(PathBuf),
+    /// A server is already running at this exact path — just (re-)show the
+    /// info modal.
+    ShowInfo,
+    /// A server is running on some *other* path; ask the user whether to
+    /// stop it and start a new one here.
+    AskReplace(PathBuf),
+}
+
+/// Decide what should happen when the "FTP server" palette action fires.
+/// `current` is the running server's info (if any); `pane_root` is the
+/// active pane's directory at invocation time. Paths are compared
+/// literally — we don't canonicalize, since panes always store canonical
+/// paths anyway and we'd rather not block on a syscall here.
+pub fn decide_ftp_action(current: Option<&FtpServerInfo>, pane_root: &Path) -> FtpAction {
+    match current {
+        None => FtpAction::StartFresh(pane_root.to_path_buf()),
+        Some(info) if info.root == pane_root => FtpAction::ShowInfo,
+        Some(_) => FtpAction::AskReplace(pane_root.to_path_buf()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteAction {
     Copy,
@@ -639,6 +804,11 @@ pub enum PaletteAction {
     /// from the `folder_editor` setting in `~/.rho.yaml` (defaults to the VS
     /// Code CLI).
     OpenInEditor,
+    /// Start (or manage) the in-app FTP server rooted at the active pane.
+    /// Singleton — invoking with a server already running on a different
+    /// folder pops the Replace-confirm modal; on the same folder it just
+    /// re-shows the FTP info modal. See [`decide_ftp_action`].
+    FtpServer,
     KeyboardShortcuts,
     Exit,
 }
@@ -660,6 +830,7 @@ impl PaletteAction {
         PaletteAction::OpenClaudeCode,
         PaletteAction::OpenTerminal,
         PaletteAction::OpenInEditor,
+        PaletteAction::FtpServer,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -679,6 +850,7 @@ impl PaletteAction {
         PaletteAction::OpenClaudeCode,
         PaletteAction::OpenTerminal,
         PaletteAction::OpenInEditor,
+        PaletteAction::FtpServer,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -699,6 +871,7 @@ impl PaletteAction {
             PaletteAction::OpenClaudeCode => "Open Claude Code in this folder",
             PaletteAction::OpenTerminal => "Open Terminal in this folder",
             PaletteAction::OpenInEditor => "Open folder in editor",
+            PaletteAction::FtpServer => "FTP server",
             PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
         }
@@ -1914,6 +2087,111 @@ mod tests {
     fn delete_focus_toggle() {
         assert_eq!(DeleteFocus::Cancel.toggle(), DeleteFocus::Confirm);
         assert_eq!(DeleteFocus::Confirm.toggle(), DeleteFocus::Cancel);
+    }
+
+    #[test]
+    fn merge_pending_new_files_extends_same_folder() {
+        let mut pending = VecDeque::new();
+        merge_pending_new_files(
+            &mut pending,
+            PathBuf::from("/tmp/downloads"),
+            vec!["a.zip".to_string()],
+        );
+        merge_pending_new_files(
+            &mut pending,
+            PathBuf::from("/tmp/downloads"),
+            vec!["b.zip".to_string()],
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, vec!["a.zip".to_string(), "b.zip".to_string()]);
+    }
+
+    #[test]
+    fn merge_pending_new_files_queues_distinct_folders() {
+        let mut pending = VecDeque::new();
+        merge_pending_new_files(
+            &mut pending,
+            PathBuf::from("/tmp/downloads"),
+            vec!["a.zip".to_string()],
+        );
+        merge_pending_new_files(
+            &mut pending,
+            PathBuf::from("/tmp/other"),
+            vec!["c.zip".to_string()],
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].0, PathBuf::from("/tmp/downloads"));
+        assert_eq!(pending[1].0, PathBuf::from("/tmp/other"));
+    }
+
+    #[test]
+    fn format_log_timestamp_matches_hms() {
+        let ts = format_log_timestamp(SystemTime::UNIX_EPOCH);
+        // We don't pin the exact value (local timezone may shift midnight),
+        // but the shape is always `HH:MM:SS` — eight chars, two colons,
+        // each segment two digits.
+        assert_eq!(ts.len(), 8);
+        let bytes = ts.as_bytes();
+        assert_eq!(bytes[2], b':');
+        assert_eq!(bytes[5], b':');
+        assert!(ts.chars().filter(|c| c.is_ascii_digit()).count() == 6);
+    }
+
+    #[test]
+    fn ftp_focus_toggles_round_trip() {
+        assert_eq!(FtpInfoFocus::Close.toggle(), FtpInfoFocus::Stop);
+        assert_eq!(FtpInfoFocus::Stop.toggle(), FtpInfoFocus::Close);
+        assert_eq!(FtpReplaceFocus::Cancel.toggle(), FtpReplaceFocus::Replace);
+        assert_eq!(FtpReplaceFocus::Replace.toggle(), FtpReplaceFocus::Cancel);
+    }
+
+    fn ftp_info_for(root: &str) -> FtpServerInfo {
+        FtpServerInfo {
+            bind: "0.0.0.0:2121".parse().unwrap(),
+            display_host: "192.168.1.10".to_string(),
+            root: PathBuf::from(root),
+            username: Some("rho".to_string()),
+            password: Some("abcDEF123456".to_string()),
+            permissions: crate::config::FtpPerms::ReadOnly,
+            started_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn decide_ftp_action_starts_fresh_when_no_server() {
+        let act = decide_ftp_action(None, Path::new("/tmp"));
+        assert_eq!(act, FtpAction::StartFresh(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn decide_ftp_action_shows_info_when_same_path() {
+        let info = ftp_info_for("/tmp");
+        let act = decide_ftp_action(Some(&info), Path::new("/tmp"));
+        assert_eq!(act, FtpAction::ShowInfo);
+    }
+
+    #[test]
+    fn decide_ftp_action_asks_replace_when_paths_differ() {
+        let info = ftp_info_for("/tmp");
+        let act = decide_ftp_action(Some(&info), Path::new("/var/log"));
+        assert_eq!(act, FtpAction::AskReplace(PathBuf::from("/var/log")));
+    }
+
+    #[test]
+    fn ftp_server_info_display_addr_combines_host_and_port() {
+        let info = ftp_info_for("/tmp");
+        assert_eq!(info.display_addr(), "192.168.1.10:2121");
+    }
+
+    #[test]
+    fn ftp_server_palette_action_is_listed_and_filterable() {
+        // Always listed in ALL.
+        assert!(PaletteAction::ALL.contains(&PaletteAction::FtpServer));
+        // Always enabled (no Dropbox gating).
+        assert!(palette_action_enabled(PaletteAction::FtpServer, false));
+        // Surfaces under "ftp" in the palette filter.
+        let out = filtered_actions(PaletteAction::ALL, "ftp");
+        assert_eq!(out, vec![PaletteAction::FtpServer]);
     }
 
     #[test]

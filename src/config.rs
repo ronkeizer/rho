@@ -78,6 +78,12 @@ pub struct Config {
     /// short-lived access token on demand — see `fs_ops::dropbox_access_token`.
     #[serde(default)]
     pub dropbox_refresh_token: Option<String>,
+    /// Settings for the in-app FTP server (Command Palette → "FTP server").
+    /// Defaults: LAN-accessible on `0.0.0.0:2121`, generated credentials,
+    /// read-only. The server is singleton — restarting it picks up changes
+    /// here.
+    #[serde(default)]
+    pub ftp: FtpConfig,
 }
 
 impl Default for Config {
@@ -103,6 +109,156 @@ impl Default for Config {
             dropbox_app_key: None,
             dropbox_app_secret: None,
             dropbox_refresh_token: None,
+            ftp: FtpConfig::default(),
+        }
+    }
+}
+
+/// Settings for the in-app FTP server. Surfaced under the `ftp:` key in
+/// `~/.rho.yaml`; an absent section uses the defaults below. Changes are not
+/// hot-reloaded into a running server — restart via "Stop server" + invoking
+/// the palette action again.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FtpConfig {
+    /// TCP port the control channel listens on. Defaults to 2121 (the
+    /// conventional unprivileged FTP port — 21 needs root).
+    pub port: u16,
+    /// Bind address. `"0.0.0.0"` exposes the server on every interface (i.e.
+    /// reachable from other devices on the LAN). Use `"127.0.0.1"` to restrict
+    /// to the loopback interface for local-only testing.
+    pub bind: String,
+    /// How clients authenticate. `Generated` (default) shows a username +
+    /// password in the FTP info modal — either the values pinned in
+    /// [`Self::username`] / [`Self::password`], or, when those are unset,
+    /// the fallback username `"rho"` plus a random 12-char password
+    /// generated at startup. `Anonymous` lets any client log in and ignores
+    /// the credential fields.
+    pub auth: FtpAuthMode,
+    /// Whether clients can mutate the served directory. `ReadWrite`
+    /// (default) allows uploads / deletes / renames / directory creation.
+    /// `ReadOnly` rejects all of those with 550 — pick it when you're
+    /// sharing files with someone you don't fully trust.
+    pub permissions: FtpPerms,
+    /// Username for `auth: generated`. Unset → defaults to `"rho"`. Ignored
+    /// for `auth: anonymous`. Setting this pins the username across
+    /// restarts (handy for saving server bookmarks in an FTP client).
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password for `auth: generated`. Unset → a fresh random 12-char
+    /// password is generated on every server start. Ignored for
+    /// `auth: anonymous`. Setting this trades the rotating password for a
+    /// fixed one — note that `~/.rho.yaml` is plain-text, so anyone with
+    /// read access to your home directory can see it.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Low end of the passive-mode data-channel port range. FTP uses two
+    /// ports per session — the control channel (`port` above) and a
+    /// passive data port chosen from this range. Narrow ranges are
+    /// dramatically easier to whitelist on a firewall; libunftp's
+    /// own default of `49152..=65535` is large enough that nothing short
+    /// of a wide-open NAT policy reliably allows transfers through. Default
+    /// is `50000`.
+    #[serde(default = "default_passive_port_min")]
+    pub passive_port_min: u16,
+    /// High end of the passive-mode port range (inclusive). Default is
+    /// `50050` — 51 ports, plenty for a personal share.
+    #[serde(default = "default_passive_port_max")]
+    pub passive_port_max: u16,
+    /// What hostname/IP the server advertises in PASV / EPSV responses for
+    /// the data-channel connect-back. Unset → libunftp's default
+    /// `FromConnection`, which echoes whichever interface IP the client's
+    /// control connection arrived on. Set to a literal IPv4 address (e.g.
+    /// `"192.168.1.42"`) or a DNS name (e.g. `"laptop.local"`) when the
+    /// auto-pick is wrong — typically only relevant on multi-homed boxes
+    /// or behind NAT.
+    #[serde(default)]
+    pub passive_host: Option<String>,
+}
+
+fn default_passive_port_min() -> u16 {
+    50_000
+}
+
+fn default_passive_port_max() -> u16 {
+    50_050
+}
+
+/// Authentication mode for the in-app FTP server. Serialized as `generated`
+/// or `anonymous`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FtpAuthMode {
+    /// Random username + 12-char password generated at server start.
+    Generated,
+    /// No authentication — any username/password is accepted.
+    Anonymous,
+}
+
+/// Filesystem permissions for the in-app FTP server. Serialized as
+/// `read-only` or `read-write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FtpPerms {
+    /// Read-only — STOR/DELE/MKD/RMD/RNFR return 550 Permission denied.
+    ReadOnly,
+    /// Full access — uploads, deletes, renames, and directory creation are
+    /// permitted.
+    ReadWrite,
+}
+
+impl Default for FtpConfig {
+    fn default() -> Self {
+        Self {
+            port: 2121,
+            bind: "0.0.0.0".to_string(),
+            auth: FtpAuthMode::Generated,
+            permissions: FtpPerms::ReadWrite,
+            username: None,
+            password: None,
+            passive_port_min: default_passive_port_min(),
+            passive_port_max: default_passive_port_max(),
+            passive_host: None,
+        }
+    }
+}
+
+impl FtpConfig {
+    /// Resolved username for `auth: generated`. Returns the configured
+    /// value when non-empty, otherwise the built-in default (`"rho"`).
+    /// Empty / whitespace-only configured values are treated as unset so
+    /// a typo doesn't lock the user out of their own server.
+    pub fn resolved_username(&self) -> String {
+        self.username
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("rho")
+            .to_string()
+    }
+
+    /// Resolved password for `auth: generated` — `Some(value)` when the
+    /// user has pinned one in config, `None` when the caller should
+    /// generate a fresh random one. Whitespace-only configured values are
+    /// treated as unset (same reasoning as [`Self::resolved_username`]).
+    pub fn resolved_password(&self) -> Option<String> {
+        self.password
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    /// Normalize the passive-mode port range to a strictly-non-empty
+    /// `min..=max` tuple. Falls back to the defaults when the configured
+    /// pair is inverted, both zero, or otherwise unusable — a typo
+    /// shouldn't silently disable data transfers.
+    pub fn resolved_passive_ports(&self) -> (u16, u16) {
+        let (lo, hi) = (self.passive_port_min, self.passive_port_max);
+        if lo == 0 || hi == 0 || lo > hi {
+            (default_passive_port_min(), default_passive_port_max())
+        } else {
+            (lo, hi)
         }
     }
 }
@@ -343,7 +499,33 @@ fn default_template_yaml() -> &'static str {
      # app_secret is only needed for non-PKCE apps.\n\
      # dropbox_app_key: \"xxxxxxxxxxxxxxx\"\n\
      # dropbox_app_secret: \"xxxxxxxxxxxxxxx\"\n\
-     # dropbox_refresh_token: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"
+     # dropbox_refresh_token: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n\
+     # In-app FTP server (Command Palette → \"FTP server\"). Defaults shown;\n\
+     # any omitted field falls back to the default. Changes apply on next\n\
+     # server start — stop the running server first via the FTP info modal.\n\
+     # Leave username / password unset to use the built-in default user\n\
+     # (\"rho\") plus a fresh random password on every start. Setting them\n\
+     # pins the credentials; rho.yaml is plain text, so treat the file as\n\
+     # readable to anyone with access to your home directory.\n\
+     # ftp:\n\
+     #   port: 2121\n\
+     #   bind: \"0.0.0.0\"            # \"127.0.0.1\" for loopback-only\n\
+     #   auth: generated             # generated | anonymous\n\
+     #   permissions: read-write     # read-write | read-only\n\
+     #   username: \"ron\"\n\
+     #   password: \"hunter2\"\n\
+     #   # Passive-mode data-channel ports. Narrow + predictable so you\n\
+     #   # can whitelist them on a router / firewall once. Open these in\n\
+     #   # your firewall along with the control port (2121 above) — most\n\
+     #   # \"control connects but transfer hangs\" symptoms come from a\n\
+     #   # filtered passive range. macOS users: also tell the Application\n\
+     #   # Firewall to allow rho (System Settings → Network → Firewall).\n\
+     #   passive_port_min: 50000\n\
+     #   passive_port_max: 50050\n\
+     #   # Hostname / IPv4 the server advertises in PASV responses. Unset\n\
+     #   # means \"echo whichever interface the client connected to\" —\n\
+     #   # set this when you're behind NAT or on a multi-homed box.\n\
+     #   passive_host: \"192.168.1.42\"\n"
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -760,6 +942,137 @@ file_actions:
         let parsed: SavedState = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(parsed.left, Location::Local(PathBuf::from("/Users/ron")));
         assert_eq!(parsed.right, Location::Local(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn ftp_config_defaults_are_lan_readwrite_generated() {
+        let c = FtpConfig::default();
+        assert_eq!(c.port, 2121);
+        assert_eq!(c.bind, "0.0.0.0");
+        assert_eq!(c.auth, FtpAuthMode::Generated);
+        assert_eq!(c.permissions, FtpPerms::ReadWrite);
+        // Narrow predictable passive range — easy to whitelist on a LAN
+        // firewall. The defaults should be 51 ports.
+        assert_eq!(c.passive_port_min, 50_000);
+        assert_eq!(c.passive_port_max, 50_050);
+        assert!(c.passive_host.is_none());
+    }
+
+    #[test]
+    fn ftp_config_passive_range_resolves_normally() {
+        let c = FtpConfig::default();
+        assert_eq!(c.resolved_passive_ports(), (50_000, 50_050));
+    }
+
+    #[test]
+    fn ftp_config_passive_range_falls_back_when_inverted() {
+        let c = FtpConfig {
+            passive_port_min: 60_000,
+            passive_port_max: 50_000,
+            ..FtpConfig::default()
+        };
+        assert_eq!(c.resolved_passive_ports(), (50_000, 50_050));
+    }
+
+    #[test]
+    fn ftp_config_passive_range_falls_back_when_zero() {
+        let c = FtpConfig {
+            passive_port_min: 0,
+            passive_port_max: 0,
+            ..FtpConfig::default()
+        };
+        assert_eq!(c.resolved_passive_ports(), (50_000, 50_050));
+    }
+
+    #[test]
+    fn ftp_config_passive_range_honors_explicit_pair() {
+        let c = FtpConfig {
+            passive_port_min: 30_000,
+            passive_port_max: 30_010,
+            ..FtpConfig::default()
+        };
+        assert_eq!(c.resolved_passive_ports(), (30_000, 30_010));
+    }
+
+    #[test]
+    fn ftp_config_absent_section_uses_defaults() {
+        let cfg: Config = serde_yaml::from_str("row_font_size: 14\n").unwrap();
+        let d = FtpConfig::default();
+        assert_eq!(cfg.ftp.port, d.port);
+        assert_eq!(cfg.ftp.bind, d.bind);
+        assert_eq!(cfg.ftp.auth, d.auth);
+        assert_eq!(cfg.ftp.permissions, d.permissions);
+    }
+
+    #[test]
+    fn ftp_config_partial_section_fills_in_defaults_per_field() {
+        // Only `port` provided — the other three fall back to defaults.
+        let yaml = "ftp:\n  port: 9999\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.ftp.port, 9999);
+        assert_eq!(cfg.ftp.bind, FtpConfig::default().bind);
+        assert_eq!(cfg.ftp.auth, FtpAuthMode::Generated);
+        assert_eq!(cfg.ftp.permissions, FtpPerms::ReadWrite);
+    }
+
+    #[test]
+    fn ftp_config_parses_all_fields_and_enum_renames() {
+        let yaml = "\
+ftp:
+  port: 2100
+  bind: \"127.0.0.1\"
+  auth: anonymous
+  permissions: read-write
+";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.ftp.port, 2100);
+        assert_eq!(cfg.ftp.bind, "127.0.0.1");
+        assert_eq!(cfg.ftp.auth, FtpAuthMode::Anonymous);
+        assert_eq!(cfg.ftp.permissions, FtpPerms::ReadWrite);
+    }
+
+    #[test]
+    fn ftp_config_username_pinned_via_yaml() {
+        let yaml = "ftp:\n  username: ron\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.ftp.resolved_username(), "ron");
+        // No password pinned — caller generates one.
+        assert!(cfg.ftp.resolved_password().is_none());
+    }
+
+    #[test]
+    fn ftp_config_password_pinned_via_yaml() {
+        let yaml = "ftp:\n  password: hunter2\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        // Username falls back to the built-in default.
+        assert_eq!(cfg.ftp.resolved_username(), "rho");
+        assert_eq!(cfg.ftp.resolved_password().as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn ftp_config_blank_credentials_fall_back_to_defaults() {
+        // Whitespace-only values are treated as unset — a stray space
+        // shouldn't silently lock the user out of their own server.
+        let yaml = "ftp:\n  username: \"   \"\n  password: \"\"\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.ftp.resolved_username(), "rho");
+        assert!(cfg.ftp.resolved_password().is_none());
+    }
+
+    #[test]
+    fn ftp_config_resolution_preserves_pinned_pair() {
+        let yaml = "ftp:\n  username: ron\n  password: hunter2\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.ftp.resolved_username(), "ron");
+        assert_eq!(cfg.ftp.resolved_password().as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn ftp_config_unknown_enum_value_fails_parse() {
+        // A typo on the perms enum should be a hard error rather than a
+        // silent fallback — a misconfigured server is something to notice.
+        let yaml = "ftp:\n  permissions: read-only-ish\n";
+        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
     }
 
     #[test]

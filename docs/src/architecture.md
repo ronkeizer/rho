@@ -391,3 +391,80 @@ arrives as `ActivateSelection`. A dedicated redirect arm rewrites it to
 `.zip` files keep their existing extract-and-browse flow (with the large-
 archive confirm) — they're handled before the chooser, so they don't go
 through `FileActions`.
+
+## FTP server
+
+The **FTP server** palette action runs a libunftp server in-process. State
+lives on `App.ftp_server: Option<FtpRuntime>` — singleton by construction.
+`FtpRuntime` holds the connection details (`FtpServerInfo`) plus a
+`tokio::task::AbortHandle` for the listen task; its `Drop` impl aborts the
+handle, so dropping the runtime (when the user clicks Stop, when the
+Replace flow swaps it for a new one, or when `App` itself is dropped on
+quit) cleanly tears the listener down.
+
+`fs_ops::ftp_start_task` builds the server: it pre-binds the chosen port
+with `std::net::TcpListener` and drops it immediately so "address already
+in use" / permission errors surface synchronously, then constructs a
+`libunftp::ServerBuilder` whose storage backend is `fs_ops::RhoFs` — a
+thin wrapper around `unftp_sbe_fs::Filesystem` that returns
+`ErrorKind::PermissionDenied` from the write methods (`put`/`del`/`mkd`/
+`rename`/`rmd`) when `FtpPerms::ReadOnly` is set. Auth is one of two
+pre-built `Authenticator`s: libunftp's `AnonymousAuthenticator`, or a
+local `StaticAuth` with a constant-time username + password compare for
+the generated-credentials path. The server is then `tokio::spawn`ed, and
+its `JoinHandle::abort_handle()` is what the App holds onto. Errors from
+the listen future after startup are logged to stderr; we don't try to
+react to them.
+
+The palette action's three-way dispatch — start fresh / show info / ask
+to replace — is encoded in the pure helper `domain::decide_ftp_action`,
+which the `update` handler calls when `PaletteAction::FtpServer` fires.
+The two new prompt variants (`Prompt::FtpInfo` for "running here, what
+now?" and `Prompt::FtpReplace` for "running somewhere else, replace?")
+get the same focus-aware Enter / Tab / `←`/`→` redirect as the existing
+no-text-input modals (`Delete`, `ConfirmLargeExtract`): Enter on the
+focused button emits either `FtpServerStopRequest` /
+`FtpServerReplaceConfirmed(path)` or falls back to `PromptCancel`. Stop is
+synchronous (just abort the handle via `take()` + Drop), so there's no
+round-trip `Message::FtpServerStopped` — the handler clears state in one
+pass.
+
+Hot reload is **not** wired up for the `ftp` config block. Restarting the
+server with new settings would yank existing connections, so picking up
+config changes requires an explicit Stop + invoke. The status bar shows
+`FTP server on HOST:PORT → ROOT` whenever a server is running.
+
+### FTP event log
+
+Client activity surfaces in the FtpInfo modal via a process-global
+`tokio::sync::broadcast` channel — `fs_ops::FTP_LOG_BUS`. Producers push
+`FtpLogEntry { ts, level, message }` onto the bus from four spots:
+
+- `FtpEventListener` implements libunftp's `DataListener` +
+  `PresenceListener` for the happy-path events (logins, file ops).
+  Registered via `notify_data` + `notify_presence` on the
+  `ServerBuilder`.
+- `StaticAuth::authenticate` pushes a Warn entry on bad-user / bad-pass
+  rejections. (Successful logins are intentionally **not** logged here —
+  libunftp already emits `PresenceEvent::LoggedIn` for both
+  authenticators, so logging from auth would double-log.)
+- `RhoFs::check_writable` pushes a Warn entry whenever the read-only
+  gate rejects a write operation, so the user watching the modal sees
+  *why* a client just got 550.
+- `ftp_start` itself pushes an Info "listening on … → …" entry on
+  successful bind, and an Error entry from the `tokio::spawn`ed listen
+  closure if the future returns Err.
+
+Consumers are managed by `fs_ops::ftp_log_subscription`, an iced
+`Subscription::run_with_id("ftp-log-bus", …)` always included in
+`App::subscription`. Its closure calls `FTP_LOG_BUS.subscribe()` once and
+forwards every entry as `Message::FtpLogEvent(entry)`. A
+`broadcast::error::RecvError::Lagged(n)` (subscriber fell behind a
+512-entry burst) surfaces as a single Warn "log bus lagged — dropped N
+entries" entry rather than panicking.
+
+`FtpRuntime` (on `App.ftp_server`) holds a `VecDeque<FtpLogEntry>` capped
+at 200 entries — `Message::FtpLogEvent` pushes onto the back and trims
+from the front when full. Entries arriving with no server running are
+dropped on the floor (e.g. in-flight events queued just before
+`FtpServerStopRequest`).

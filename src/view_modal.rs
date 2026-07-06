@@ -10,20 +10,28 @@ use iced::widget::{
 use iced::{Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector};
 
 use crate::config::{blend, dim, RowColors};
+use crate::config::FtpPerms;
 use crate::domain::{
     filtered_actions, filtered_apps, filtered_branches, filtered_containers, filtered_processes,
-    filtered_recents, filtered_servers, keyboard_shortcuts, palette_action_enabled, AppsState,
+    filtered_recents, filtered_servers, format_log_timestamp, keyboard_shortcuts,
+    palette_action_enabled, AppsState,
     DeleteFocus, DockerSortBy,
-    DockerState, FileChoice, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
+    DockerState, FileChoice, FtpInfoFocus, FtpLogEntry, FtpLogLevel, FtpReplaceFocus,
+    FtpServerInfo, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
     Prompt, Side, SortDir, SshServersState,
 };
 use crate::view_pane::format_size;
 use crate::{Message, MODAL_LIST_ID, PROMPT_ID};
 
-pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
+pub fn view_modal<'a>(
+    prompt: &'a Prompt,
+    colors: RowColors,
+    ftp_log: &'a std::collections::VecDeque<FtpLogEntry>,
+) -> Element<'a, Message> {
     // Docker / Processes / Apps / GitBranches are wider so the list rows
     // have room. KeyboardShortcuts is two-column text — wider than the
-    // single-column modals but narrower than the table-shaped ones.
+    // single-column modals but narrower than the table-shaped ones. FtpInfo
+    // hosts a wide log table, so it grows similarly.
     let modal_width = match prompt {
         Prompt::Docker { .. }
         | Prompt::Processes { .. }
@@ -31,6 +39,7 @@ pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
         | Prompt::GitBranches { .. }
         | Prompt::SshServers { .. } => 720.0,
         Prompt::KeyboardShortcuts => 600.0,
+        Prompt::FtpInfo { .. } => 640.0,
         Prompt::FileActions { .. } => 520.0,
         _ => 440.0,
     };
@@ -1167,7 +1176,7 @@ pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
                         } => (command.clone(), *terminal),
                     };
                     let label_line = if terminal {
-                        format!("{}  ⧉ terminal", choice.label())
+                        format!("{}  ▶ terminal", choice.label())
                     } else {
                         choice.label().to_string()
                     };
@@ -1212,6 +1221,93 @@ pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
             ]
             .spacing(8)
         }
+        Prompt::FtpInfo { info, focus } => {
+            let focus = *focus;
+            let stop_style: fn(&Theme, button::Status) -> button::Style =
+                if focus == FtpInfoFocus::Stop {
+                    button::danger
+                } else {
+                    button::secondary
+                };
+            let close_style: fn(&Theme, button::Status) -> button::Style =
+                if focus == FtpInfoFocus::Close {
+                    button::primary
+                } else {
+                    button::secondary
+                };
+
+            let actions = row![
+                button(text("Stop server"))
+                    .on_press(Message::FtpServerStopRequest)
+                    .padding(Padding::from([6, 16]))
+                    .style(stop_style),
+                button(text("Close"))
+                    .on_press(Message::PromptCancel)
+                    .padding(Padding::from([6, 16]))
+                    .style(close_style),
+            ]
+            .spacing(10);
+
+            column![
+                text("FTP server running").size(15),
+                ftp_detail_rows(info),
+                ftp_log_panel(ftp_log),
+                actions,
+                text("Tab or ←/→ switch  ·  Enter activate  ·  Esc closes (server keeps running)")
+                    .size(11),
+            ]
+            .spacing(10)
+        }
+        Prompt::FtpReplace {
+            current,
+            new_root,
+            focus,
+        } => {
+            let focus = *focus;
+            let cancel_style: fn(&Theme, button::Status) -> button::Style =
+                if focus == FtpReplaceFocus::Cancel {
+                    button::primary
+                } else {
+                    button::secondary
+                };
+            let replace_style: fn(&Theme, button::Status) -> button::Style =
+                if focus == FtpReplaceFocus::Replace {
+                    button::danger
+                } else {
+                    button::secondary
+                };
+
+            let actions = row![
+                button(text("Cancel"))
+                    .on_press(Message::PromptCancel)
+                    .padding(Padding::from([6, 16]))
+                    .style(cancel_style),
+                button(text("Stop and restart here"))
+                    .on_press(Message::FtpServerReplaceConfirmed(new_root.clone()))
+                    .padding(Padding::from([6, 16]))
+                    .style(replace_style),
+            ]
+            .spacing(10);
+
+            let body = column![
+                text(format!(
+                    "An FTP server is already running on {}.",
+                    current.display_addr()
+                )),
+                text(format!("Currently serving: {}", current.root.display())),
+                text(format!("New root would be:  {}", new_root.display())),
+                text("Stop the running server and restart it on the new folder?"),
+            ]
+            .spacing(4);
+
+            column![
+                text("Replace running FTP server?").size(15),
+                body,
+                actions,
+                text("Tab or ←/→ switch  ·  Enter activate  ·  Esc cancels").size(11),
+            ]
+            .spacing(10)
+        }
     })
     .padding(16)
     .width(Length::Fixed(modal_width))
@@ -1241,6 +1337,110 @@ pub fn view_modal(prompt: &Prompt, colors: RowColors) -> Element<'_, Message> {
 /// below — monospace, size 11, zero horizontal button-padding — so the
 /// column-left of every header sits at the same x as the column-left of
 /// every cell.
+/// Build the labeled detail rows for the FTP info modal. Each row is a
+/// label + monospace value pair; the credentials need to be typed verbatim
+/// into an FTP client, so the value font matters more than the label one.
+/// Returns `Element` rather than a concrete `Column` so the caller can drop
+/// it into a `column!` macro without thinking about type coercion.
+fn ftp_detail_rows<'a>(info: &FtpServerInfo) -> Element<'a, Message> {
+    let perms = match info.permissions {
+        FtpPerms::ReadOnly => "read-only",
+        FtpPerms::ReadWrite => "read-write",
+    };
+    let cred_line = |label: &'static str, value: String| -> iced::widget::Row<'a, Message> {
+        row![
+            text(label).size(12).width(Length::Fixed(95.0)),
+            text(value).font(Font::MONOSPACE).size(12),
+        ]
+        .spacing(8)
+    };
+    let mut col = column![
+        cred_line("Address", info.display_addr()),
+        cred_line("Root", info.root.display().to_string()),
+        cred_line("Permissions", perms.to_string()),
+    ]
+    .spacing(4);
+    if let Some(user) = &info.username {
+        col = col.push(cred_line("Username", user.clone()));
+    }
+    if let Some(pass) = &info.password {
+        col = col.push(cred_line("Password", pass.clone()));
+    }
+    if info.username.is_none() && info.password.is_none() {
+        col = col.push(cred_line("Auth", "anonymous (no credentials)".to_string()));
+    }
+    col.into()
+}
+
+/// Streaming log panel for the FTP info modal. Renders newest entries at
+/// the top (no need to fight scroll position to follow new events) inside
+/// a fixed-height scrollable, so the modal itself doesn't grow unbounded
+/// as activity accumulates. Each row is `HH:MM:SS <tag> <message>` in a
+/// monospace font; the tag + message inherit a per-level color.
+fn ftp_log_panel<'a>(entries: &'a std::collections::VecDeque<FtpLogEntry>) -> Element<'a, Message> {
+    if entries.is_empty() {
+        return container(text("waiting for client activity…").size(11).style(
+            |theme: &Theme| iced::widget::text::Style {
+                color: Some(dim(theme.extended_palette().background.base.text)),
+            },
+        ))
+        .padding(Padding::from([6, 8]))
+        .width(Length::Fill)
+        .into();
+    }
+
+    // Build a column of rows, newest first. The deque can be split across
+    // its ring buffer, so iter().rev() goes through both halves correctly.
+    let mut rows = column![].spacing(2);
+    for entry in entries.iter().rev() {
+        rows = rows.push(ftp_log_row(entry));
+    }
+
+    scrollable(rows)
+        .height(Length::Fixed(160.0))
+        .width(Length::Fill)
+        .into()
+}
+
+/// One log line. The `style` closure picks a color from the iced palette
+/// per [`FtpLogLevel`] — Auth dims slightly (less noisy than every other
+/// entry), Warn goes amber, Error red. Plain Info keeps the default
+/// text color so it doesn't compete with the brackets.
+fn ftp_log_row<'a>(entry: &'a FtpLogEntry) -> Element<'a, Message> {
+    let tag = match entry.level {
+        FtpLogLevel::Info => " · ",
+        FtpLogLevel::Auth => " ↪ ",
+        FtpLogLevel::Warn => " ! ",
+        FtpLogLevel::Error => " ✗ ",
+    };
+    let level = entry.level;
+    let line_style = move |theme: &Theme| {
+        let palette = theme.extended_palette();
+        let color = match level {
+            FtpLogLevel::Info => palette.background.base.text,
+            FtpLogLevel::Auth => dim(palette.background.base.text),
+            FtpLogLevel::Warn => Color::from_rgb(0.95, 0.75, 0.30),
+            FtpLogLevel::Error => Color::from_rgb(1.0, 0.45, 0.45),
+        };
+        iced::widget::text::Style { color: Some(color) }
+    };
+    row![
+        text(format_log_timestamp(entry.ts))
+            .font(Font::MONOSPACE)
+            .size(11)
+            .style(move |theme: &Theme| iced::widget::text::Style {
+                color: Some(dim(theme.extended_palette().background.base.text)),
+            }),
+        text(tag).font(Font::MONOSPACE).size(11).style(line_style),
+        text(&entry.message)
+            .font(Font::MONOSPACE)
+            .size(11)
+            .style(line_style),
+    ]
+    .spacing(2)
+    .into()
+}
+
 fn docker_header<'a>(
     column: DockerSortBy,
     active: DockerSortBy,

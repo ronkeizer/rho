@@ -79,7 +79,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / FTP server / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -94,6 +94,8 @@ Inside a modal, the navigation keys behave differently:
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
 | Large-archive extract confirm | Shown when `Enter` is pressed on a `.zip` over 100 MiB. `Tab` / `←` / `→` toggle Cancel ↔ Extract focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel. |
+| FTP info | Shown right after starting the FTP server, or when the action is invoked while a server is already running on the active pane's folder. Lists address, root, permissions, (for `auth: generated`) the username + password, and a streaming log of incoming client activity — logins, `GET` / `PUT` / `DEL` / `MKD` / `RMD` / `RENAME`, failed auth attempts, and read-only rejections. `Tab` / `←` / `→` toggle Stop ↔ Close focus, `Enter` activates focused button, `Esc` closes the modal but leaves the server running. Default focus is Close. |
+| FTP replace confirm | Shown when the FTP-server action fires while a server is already running on a **different** folder. Lists both roots. `Tab` / `←` / `→` toggle Cancel ↔ Stop-and-restart focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel (tearing down a live server drops connections). |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
 | Processes | Type to filter (substring against name). `↑`/`↓` move the highlighted row; `Enter` kills it (SIGTERM). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (also sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
@@ -362,3 +364,58 @@ PATH*, which opens the folder as a workspace. Point it at any editor that
 accepts a directory argument (e.g. `/opt/homebrew/bin/code`, a `subl`
 path, or a wrapper script). If the binary doesn't exist the action fails
 silently (the error is logged to stderr).
+
+### FTP server
+
+Picking **FTP server** from the command palette starts an in-process FTP
+server rooted at the active pane's folder and pops the **FTP info** modal
+with the connection details — address, root, permissions, and a username
++ password (for `auth: generated`, the default). The password is a fresh
+12-character random string on every start unless you pin one in
+`~/.rho.yaml`; the username defaults to `rho` and can be pinned the same
+way. Defaults are LAN-accessible (`0.0.0.0:2121`) and read-write; see
+[Configuration → FTP server](./configuration.md#ftp-server) for the knobs
+(including how to switch to read-only).
+
+Only one server runs at a time. Re-invoking the action with the server
+already up on the *same* folder just re-shows the info modal. Invoking on
+a *different* folder pops the **FTP replace confirm** modal — pick
+*Cancel* to leave the running server alone, or *Stop and restart here* to
+tear it down (dropping any live FTP connections) and start a fresh one
+rooted at the new folder. Default focus is *Cancel*.
+
+Dismissing the FTP info modal (Close button, Esc, click on the backdrop)
+leaves the server running; the status bar shows `FTP server on
+HOST:PORT → ROOT` until you explicitly stop it. Stopping happens from
+the FTP info modal's *Stop server* button — quitting the app also tears
+the server down via the runtime's `Drop` impl.
+
+The modal also shows a **streaming log** of client activity below the
+connection details: a row per event, newest at the top. Coverage:
+
+- `username: logged in` / `logged out` — connections accepted / closed
+  (libunftp `PresenceEvent`).
+- `username: GET path (size)` / `PUT` / `DEL` / `MKD` / `RMD` /
+  `RENAME from → to` — successful file operations (libunftp
+  `DataEvent`).
+- `auth failed: bad password for "name"` / `unknown user "name"` —
+  rejected authentication attempts (amber).
+- `denied write attempt (server is read-only)` — STOR / DELE / MKD /
+  RMD / RENAME blocked because `permissions: read-only` is set (amber).
+- `listen exited: …` — the listen task crashed mid-flight (red).
+
+The log buffer keeps the most recent 200 entries; older ones drop off
+the bottom. Closing the modal pauses rendering but doesn't pause
+collection — re-opening shows everything that arrived while it was
+closed. Stopping the server clears the buffer.
+
+The server is local-only: starting from a remote (SSH / Dropbox) pane
+surfaces an error rather than trying to serve files over libunftp's local
+filesystem backend. Read-write mode (the default) forwards `STOR` /
+`DELE` / `MKD` / `RMD` / `RNFR` through to the underlying filesystem;
+read-only rejects all of those with 550.
+
+Can't connect from another device on the LAN? See
+[Troubleshooting LAN connections](./configuration.md#troubleshooting-lan-connections)
+— almost always a firewall blocking either the control port or the
+passive data ports (defaults: `2121` and `50000-50050`).

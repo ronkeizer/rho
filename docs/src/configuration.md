@@ -37,6 +37,7 @@ to see it.
 | `dropbox_app_key` | string | _(unset)_ | Dropbox app key (client ID) from the [App Console](https://www.dropbox.com/developers/apps). Required to enable the Dropbox backend. |
 | `dropbox_app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
 | `dropbox_refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox_app_key` to unlock the **Open Dropbox** command. |
+| `ftp` | section | _(defaults)_ | Settings for the in-app FTP server (Command Palette → **FTP server**). See [FTP server](#ftp-server) below. An absent section applies the defaults; a partial section fills in missing fields per field. |
 
 ## Colors
 
@@ -207,6 +208,97 @@ file_actions:
     terminal: true
 ```
 
+## FTP server
+
+Settings for the in-app FTP server (Command Palette → **FTP server**).
+Defaults are LAN-accessible and read-write — out of the box, picking the
+action shares the active pane's folder on `0.0.0.0:2121` with a generated
+username + password and accepts uploads, deletes, and renames. Tune via
+the `ftp:` block:
+
+```yaml
+ftp:
+  port: 2121
+  bind: "0.0.0.0"          # "127.0.0.1" for loopback only
+  auth: generated          # generated | anonymous
+  permissions: read-write  # read-write | read-only
+  # username: ron          # optional — pins username (generated mode only)
+  # password: hunter2      # optional — pins password (generated mode only)
+  passive_port_min: 50000
+  passive_port_max: 50050
+  # passive_host: "192.168.1.42"   # optional — IP/DNS server announces in PASV
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `port` | `2121` | TCP port for the FTP control channel. 2121 is the conventional unprivileged port; binding 21 requires root. |
+| `bind` | `0.0.0.0` | Bind address. `0.0.0.0` exposes the server on every interface (LAN-accessible); `127.0.0.1` restricts to loopback for local-only testing. |
+| `auth` | `generated` | `generated` mints a random 12-character password every time the server starts (and a fixed `rho` username, unless overridden — see below) and shows them in the FTP info modal. `anonymous` lets any client log in with any credentials, and the `username` / `password` fields are ignored. |
+| `permissions` | `read-write` | `read-write` forwards `STOR` / `DELE` / `MKD` / `RMD` / `RNFR` through to the underlying filesystem. `read-only` rejects all of those with `550 Permission denied` — pick it when you're sharing files with someone you don't fully trust. |
+| `username` | _(unset)_ | For `auth: generated`. When set, the server uses this name verbatim instead of the built-in `"rho"` default. Whitespace-only values are treated as unset. |
+| `password` | _(unset)_ | For `auth: generated`. When set, the server uses this password verbatim instead of generating a fresh 12-char random one on every start. Pin this if you want the credentials to survive a restart (e.g. so a saved bookmark in your FTP client keeps working). Whitespace-only values are treated as unset. |
+| `passive_port_min` | `50000` | Low end (inclusive) of the passive-mode data-channel port range. FTP uses two ports per session — `port` above for control, and one chosen from this range per file transfer. A narrow range is dramatically easier to whitelist on a router or host firewall. |
+| `passive_port_max` | `50050` | High end (inclusive). 51 ports is plenty for a personal share. An inverted or zero pair falls back to the defaults — a typo shouldn't silently disable transfers. |
+| `passive_host` | _(unset)_ | What the server advertises in `PASV` responses as the IP for the data-channel connect-back. Unset → libunftp echoes whichever interface IP the client's control connection arrived on, which is usually right. Set to a literal IPv4 (e.g. `"192.168.1.42"`) or a DNS name (e.g. `"laptop.local"`) when the auto-pick is wrong — typically only relevant on multi-homed boxes or behind NAT. |
+
+Note that `~/.rho.yaml` is **plain text** and lives in your home
+directory. Anyone with read access to that file can see a pinned
+password — don't pin one if that's a concern, or `chmod 600 ~/.rho.yaml`
+to restrict it to your user.
+
+Changes are **not hot-reloaded** into a running server — that would yank
+existing connections. To pick up new settings: open the FTP info modal,
+click **Stop server**, then invoke **FTP server** again. The status bar
+shows `FTP server on HOST:PORT → ROOT` while one is running.
+
+### Troubleshooting LAN connections
+
+If the FTP server works from `127.0.0.1` but not from another device on
+your WiFi, the cause is almost always a firewall. Walk through this list:
+
+**1. Did the control channel even connect?** Try `lftp -p 2121 -u rho,PASSWORD HOST` from the other machine and watch the modal log:
+- If you see `rho: logged in`, the control channel is open — skip to step 3.
+- If you see `auth failed: bad password for "rho"`, double-check
+  the password against the modal (passwords are random per start by
+  default — see [`password`](#ftp-server)).
+- If the connection times out with no log entry, it's a firewall on the
+  control port — go to step 2.
+
+**2. macOS Application Firewall.** If you're running rho via `cargo run`,
+macOS asks Terminal (not rho) for incoming-connection permission, which
+is the wrong granularity. Either:
+- Run a release build (`cargo build --release && ./target/release/rho`)
+  so the firewall prompt names *rho* specifically and clicking *Allow*
+  whitelists the binary, or
+- Open *System Settings → Network → Firewall → Options…* and add the
+  rho binary explicitly with *Allow incoming connections*.
+
+The Application Firewall is per-binary, so once rho is allowed all of
+its ports (control + passive) are reachable.
+
+**3. Control channel works, transfers hang.** Almost always a blocked
+passive port range. FTP uses two TCP connections per session — the
+control port (`2121` by default) and a separate data port chosen from
+`passive_port_min..=passive_port_max` (`50000-50050` by default). The
+modal logs the actual range on startup.
+- On a home router with NAT, the data ports usually only need to be
+  open on the host firewall, not forwarded. Add the range to whatever
+  blocks them.
+- On a Linux box with `ufw`: `sudo ufw allow 50000:50050/tcp` plus
+  `sudo ufw allow 2121/tcp`.
+- On macOS with the built-in Application Firewall, step 2 is sufficient.
+
+**4. PASV reports the wrong IP.** Rare, but happens behind NAT or on
+multi-homed machines. The modal log shows what the server is advertising
+(`PASV will advertise host: …` or `PASV will advertise whichever
+interface the client connected to`). When the auto-pick (`FromConnection`)
+is wrong, set [`passive_host`](#ftp-server) to a literal IP or DNS name.
+
+**5. Some clients only speak EPSV / EPRT.** Modern clients (`lftp`,
+Cyberduck, FileZilla) use `EPSV` by default, which avoids the PASV-host
+issue entirely. If you're using something exotic (e.g. an old IoT
+device), force passive mode explicitly in the client's options.
+
 ## Example
 
 ```yaml
@@ -238,4 +330,15 @@ watch_folders:
 # dropbox_app_key: "xxxxxxxxxxxxxxx"
 # dropbox_app_secret: "xxxxxxxxxxxxxxx"
 # dropbox_refresh_token: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# In-app FTP server. Omit to use the defaults shown.
+# ftp:
+#   port: 2121
+#   bind: "0.0.0.0"
+#   auth: generated
+#   permissions: read-write
+#   username: "ron"        # optional — pins username across restarts
+#   password: "hunter2"    # optional — pins password across restarts
+#   passive_port_min: 50000
+#   passive_port_max: 50050
+#   # passive_host: "192.168.1.42"   # optional — override PASV-advertised host
 ```

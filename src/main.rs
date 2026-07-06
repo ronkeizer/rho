@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, stack, text, text_input};
 use iced::{time, window, Color, Element, Length, Padding, Size, Subscription, Task, Theme};
+use tokio::task::AbortHandle;
 
 mod config;
 mod domain;
@@ -16,20 +17,22 @@ use config::{
     quick_look, row_colors_from, save_state_to_disk, settings_path, Config, SavedState,
 };
 use domain::{
-    add_recent, available_palette_actions, build_file_choices, default_zip_filename,
-    filtered_actions, filtered_apps,
+    add_recent, available_palette_actions, build_file_choices, decide_ftp_action,
+    default_zip_filename, filtered_actions, filtered_apps,
     filtered_branches, filtered_processes, filtered_recents, filtered_servers, modal_scroll_target,
     sort_apps,
     sort_containers, sort_entries, sort_processes, substitute_command, Application, AppsState,
     BackendId, DeleteFocus,
-    DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, GitBranch, GitBranchesState,
+    DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, FtpAction, FtpInfoFocus,
+    FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch, GitBranchesState,
     GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
     ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState,
 };
 use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
-    docker_shell, extract_to_temp_task, file_watch_subscription, git_branches_task,
+    docker_shell, extract_to_temp_task, file_watch_subscription, ftp_log_subscription,
+    ftp_start_task, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task,
     open_claude_code, open_folder_in_editor, open_terminal,
     pane_watch_subscription, ps_task, run_file_action_in_terminal, run_file_action_task,
@@ -183,6 +186,20 @@ pub(crate) enum Message {
     /// A background custom file action finished. On success the panes reload
     /// so any produced file appears; on failure the error goes to the status bar.
     FileActionFinished(Result<(), String>),
+    /// FTP server start completed. On `Ok((info, handle))` the App stores the
+    /// AbortHandle and opens the FtpInfo modal with the connection details.
+    /// On `Err` the message goes to the status bar.
+    FtpServerStarted(Result<(FtpServerInfo, AbortHandle), String>),
+    /// A log entry arrived on the FTP bus (`fs_ops::ftp_log_subscription`).
+    /// Appended onto `FtpRuntime.log` for the streaming view in the modal.
+    FtpLogEvent(FtpLogEntry),
+    /// User clicked "Stop server" in the FtpInfo modal — abort the listen
+    /// task (the App's `FtpRuntime` Drop impl does the actual abort).
+    FtpServerStopRequest,
+    /// User confirmed "Stop and restart here" in the FtpReplace modal — tear
+    /// down the current server, then start a fresh one rooted at the supplied
+    /// pane folder.
+    FtpServerReplaceConfirmed(PathBuf),
     /// Global "quit the app" — currently bound to F10.
     ExitApp,
     NoOp,
@@ -191,6 +208,35 @@ pub(crate) enum Message {
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
+
+/// Currently-running FTP server. Stored in `App.ftp_server`. The `Drop`
+/// impl aborts the listen task, so dropping (e.g. when `App` itself is
+/// dropped on quit, or when we `.take()` to replace the server with a new
+/// one) tears the listener down. Don't construct multiple of these — the
+/// app enforces a singleton via `Option<FtpRuntime>`.
+struct FtpRuntime {
+    info: FtpServerInfo,
+    handle: AbortHandle,
+    /// Ring buffer of log entries fed by `fs_ops::ftp_log_subscription`.
+    /// Capped to [`FTP_LOG_BUFFER_CAP`] entries; oldest are dropped from
+    /// the front when full so a chatty client doesn't grow the buffer
+    /// without bound while the modal is closed.
+    log: std::collections::VecDeque<FtpLogEntry>,
+}
+
+/// Maximum number of log entries kept on `FtpRuntime`. Large enough to
+/// cover a few minutes of normal activity, small enough that rendering
+/// every entry in the modal stays cheap. The bus capacity
+/// (`fs_ops::FTP_LOG_BUS_CAPACITY`) is independently sized to handle a
+/// burst before the App drains it.
+const FTP_LOG_BUFFER_CAP: usize = 200;
+
+impl Drop for FtpRuntime {
+    fn drop(&mut self) {
+        // Idempotent — aborting an already-finished task is a no-op.
+        self.handle.abort();
+    }
+}
 
 struct App {
     config: Config,
@@ -220,6 +266,11 @@ struct App {
     /// extract task, shown in red in the status bar until the next such
     /// action starts. `None` once an operation completes cleanly.
     last_error: Option<String>,
+    /// The currently-running in-app FTP server, if any. Singleton — set by
+    /// `FtpServerStarted(Ok(..))`, cleared by `FtpServerStopped`. The
+    /// `FtpRuntime` Drop impl aborts the listen task, so quitting the app
+    /// or replacing this field cleanly tears the server down.
+    ftp_server: Option<FtpRuntime>,
     /// New-file detections that arrived while another modal was open. Drained
     /// FIFO when the current modal closes.
     pending_new_files: std::collections::VecDeque<(PathBuf, Vec<String>)>,
@@ -286,6 +337,7 @@ impl App {
             extract_in_progress: None,
             file_action_in_progress: None,
             last_error: None,
+            ftp_server: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
             modal_scroll_y: 0.0,
@@ -588,6 +640,39 @@ impl App {
                     other => other,
                 }
             }
+            // FTP info: Enter activates the focused button (Stop tears the
+            // server down; Close dismisses without touching it). Tab/←/→
+            // toggle focus.
+            (Some(Prompt::FtpInfo { focus, .. }), m) => {
+                let focus = *focus;
+                match m {
+                    Message::ActivateSelection => match focus {
+                        FtpInfoFocus::Stop => Message::FtpServerStopRequest,
+                        FtpInfoFocus::Close => Message::PromptCancel,
+                    },
+                    Message::SwitchSide => Message::SwitchPromptFocus,
+                    other => other,
+                }
+            }
+            // FTP replace: Enter on Replace stops + starts at the new root;
+            // Cancel leaves the running server alone and closes the modal.
+            (
+                Some(Prompt::FtpReplace {
+                    focus, new_root, ..
+                }),
+                m,
+            ) => {
+                let focus = *focus;
+                let new_root = new_root.clone();
+                match m {
+                    Message::ActivateSelection => match focus {
+                        FtpReplaceFocus::Cancel => Message::PromptCancel,
+                        FtpReplaceFocus::Replace => Message::FtpServerReplaceConfirmed(new_root),
+                    },
+                    Message::SwitchSide => Message::SwitchPromptFocus,
+                    other => other,
+                }
+            }
             // FileActions has no text_input, so Enter reaches us as
             // ActivateSelection (rewritten to PromptSubmit, which runs the
             // highlighted choice) and ↑/↓/Tab move the highlight.
@@ -825,6 +910,8 @@ impl App {
                 Some(Prompt::Delete { focus, .. })
                 | Some(Prompt::ConfirmLargeExtract { focus, .. }) => *focus = focus.toggle(),
                 Some(Prompt::NewFiles { focus, .. }) => *focus = focus.next(),
+                Some(Prompt::FtpInfo { focus, .. }) => *focus = focus.toggle(),
+                Some(Prompt::FtpReplace { focus, .. }) => *focus = focus.toggle(),
                 _ => {}
             },
             Message::OpenSettingsFile => {
@@ -927,6 +1014,8 @@ impl App {
                         | Prompt::ConfirmLargeExtract { .. }
                         | Prompt::NewFiles { .. }
                         | Prompt::FileActions { .. }
+                        | Prompt::FtpInfo { .. }
+                        | Prompt::FtpReplace { .. }
                         | Prompt::KeyboardShortcuts => {}
                     }
                     // Filtering shifts which row the (clamped) cursor points at,
@@ -1222,6 +1311,28 @@ impl App {
                         } => choices
                             .get(selected)
                             .map(|choice| self.run_file_choice(&path, choice)),
+                        // FTP modals: Enter is rewritten by the top-of-update
+                        // redirect into FtpServerStopRequest / FtpServerStart…
+                        // / PromptCancel based on the focused button. If we
+                        // somehow reach the Submit arm (e.g. the redirect
+                        // misses), keep the modal open so the user doesn't
+                        // lose the connection details.
+                        Prompt::FtpInfo { info, focus } => {
+                            self.prompt = Some(Prompt::FtpInfo { info, focus });
+                            None
+                        }
+                        Prompt::FtpReplace {
+                            current,
+                            new_root,
+                            focus,
+                        } => {
+                            self.prompt = Some(Prompt::FtpReplace {
+                                current,
+                                new_root,
+                                focus,
+                            });
+                            None
+                        }
                     }
                 } else {
                     None
@@ -1411,6 +1522,23 @@ impl App {
                     // Shouldn't happen — the watcher only emits non-empty
                     // batches — but guard so a stray empty event doesn't pop
                     // an empty modal.
+                } else if let Some(Prompt::NewFiles {
+                    folder: open_folder,
+                    files: open_files,
+                    ..
+                }) = &mut self.prompt
+                {
+                    // Modal already open for this same folder: grow its list
+                    // instead of queuing a second popup behind it.
+                    if *open_folder == folder {
+                        open_files.extend(files);
+                    } else {
+                        domain::merge_pending_new_files(
+                            &mut self.pending_new_files,
+                            folder,
+                            files,
+                        );
+                    }
                 } else if self.prompt.is_none() {
                     self.prompt = Some(Prompt::NewFiles {
                         folder,
@@ -1418,7 +1546,7 @@ impl App {
                         focus: NewFilesFocus::No,
                     });
                 } else {
-                    self.pending_new_files.push_back((folder, files));
+                    domain::merge_pending_new_files(&mut self.pending_new_files, folder, files);
                 }
             }
             Message::NewFilesPickSide(side) => {
@@ -1767,6 +1895,53 @@ impl App {
                     }
                 }
             }
+            Message::FtpServerStarted(result) => match result {
+                Ok((info, handle)) => {
+                    self.last_error = None;
+                    let info_for_modal = info.clone();
+                    self.ftp_server = Some(FtpRuntime {
+                        info,
+                        handle,
+                        log: std::collections::VecDeque::with_capacity(FTP_LOG_BUFFER_CAP),
+                    });
+                    self.prompt = Some(Prompt::FtpInfo {
+                        info: info_for_modal,
+                        focus: FtpInfoFocus::Close,
+                    });
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("FTP server: {}", e));
+                }
+            },
+            Message::FtpLogEvent(entry) => {
+                if let Some(rt) = self.ftp_server.as_mut() {
+                    if rt.log.len() >= FTP_LOG_BUFFER_CAP {
+                        rt.log.pop_front();
+                    }
+                    rt.log.push_back(entry);
+                }
+                // No server running → entry is dropped on the floor.
+                // That happens, for example, right after `FtpServerStopRequest`
+                // for any event already in-flight on the bus.
+            }
+            Message::FtpServerStopRequest => {
+                // Take the runtime — its Drop impl aborts the listen task
+                // synchronously. Aborting is local and infallible, so no
+                // round-trip Task::perform is needed.
+                if self.ftp_server.take().is_some() {
+                    if matches!(self.prompt, Some(Prompt::FtpInfo { .. })) {
+                        self.prompt = None;
+                    }
+                    self.last_error = None;
+                }
+            }
+            Message::FtpServerReplaceConfirmed(new_root) => {
+                // Drop the existing runtime — its Drop impl aborts the
+                // listen task — and start a fresh server at the new root.
+                self.ftp_server = None;
+                self.prompt = None;
+                return ftp_start_task(new_root, self.config.ftp.clone());
+            }
             Message::ExitApp => {
                 return window::get_oldest().and_then(window::close);
             }
@@ -1971,7 +2146,48 @@ impl App {
                 }
                 Task::none()
             }
+            PaletteAction::FtpServer => self.invoke_ftp_server(),
             PaletteAction::Exit => window::get_oldest().and_then(window::close),
+        }
+    }
+
+    /// "FTP server" palette action. Singleton invariant + three-way
+    /// dispatch via [`decide_ftp_action`]:
+    ///
+    /// - No server running → start one rooted at the active pane.
+    /// - One running on this same path → re-open the info modal.
+    /// - One running elsewhere → ask the user before tearing it down.
+    ///
+    /// Remote panes can't host the server (the libunftp backend reads
+    /// the local filesystem), so this surfaces a status-bar error.
+    fn invoke_ftp_server(&mut self) -> Task<Message> {
+        if !self.pane(self.active).location.is_local() {
+            self.last_error =
+                Some("Can't start an FTP server from a remote pane".to_string());
+            return Task::none();
+        }
+        let pane_root = self.pane(self.active).path().to_path_buf();
+        let current = self.ftp_server.as_ref().map(|rt| &rt.info);
+        match decide_ftp_action(current, &pane_root) {
+            FtpAction::StartFresh(root) => ftp_start_task(root, self.config.ftp.clone()),
+            FtpAction::ShowInfo => {
+                // Safe to unwrap — `current` was Some in the matched arm.
+                let info = self.ftp_server.as_ref().unwrap().info.clone();
+                self.prompt = Some(Prompt::FtpInfo {
+                    info,
+                    focus: FtpInfoFocus::Close,
+                });
+                Task::none()
+            }
+            FtpAction::AskReplace(new_root) => {
+                let current = self.ftp_server.as_ref().unwrap().info.clone();
+                self.prompt = Some(Prompt::FtpReplace {
+                    current,
+                    new_root,
+                    focus: FtpReplaceFocus::Cancel,
+                });
+                Task::none()
+            }
         }
     }
 
@@ -2091,6 +2307,15 @@ impl App {
             let p = self.pane(loading_side);
             return Some(format!("Loading {}…", p.location));
         }
+        // FTP server status — placed after the transient in-progress lines
+        // so a Copy / Move indicator wins while it's running.
+        if let Some(rt) = &self.ftp_server {
+            return Some(format!(
+                "FTP server on {} → {}",
+                rt.info.display_addr(),
+                rt.info.root.display()
+            ));
+        }
         None
     }
 
@@ -2151,7 +2376,17 @@ impl App {
             .into();
 
         if let Some(prompt) = &self.prompt {
-            stack![base, view_modal(prompt, colors)].into()
+            // Only FtpInfo reads the log; every other prompt sees an
+            // empty deque so the view_modal signature stays uniform.
+            // `EMPTY_LOG` is a `'static` so its borrow lifetime fits.
+            static EMPTY_LOG: std::sync::OnceLock<std::collections::VecDeque<FtpLogEntry>> =
+                std::sync::OnceLock::new();
+            let empty = EMPTY_LOG.get_or_init(std::collections::VecDeque::new);
+            let ftp_log = match (prompt, &self.ftp_server) {
+                (Prompt::FtpInfo { .. }, Some(rt)) => &rt.log,
+                _ => empty,
+            };
+            stack![base, view_modal(prompt, colors, ftp_log)].into()
         } else {
             base
         }
@@ -2279,6 +2514,11 @@ impl App {
         if !pane_dirs.is_empty() {
             subs.push(pane_watch_subscription(pane_dirs));
         }
+
+        // FTP log bus — always-on, lightweight (just a broadcast receiver).
+        // The subscription survives even when no server is running so the
+        // first event after a start lands without a race.
+        subs.push(ftp_log_subscription());
 
         Subscription::batch(subs)
     }

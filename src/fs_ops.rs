@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use iced::{Subscription, Task};
 
-use crate::config::{Config, DropboxAuth};
+use crate::config::{Config, DropboxAuth, FtpAuthMode, FtpConfig, FtpPerms};
 use crate::domain::{
     detect_archive_format, dropbox_api_path, parse_docker_ps, parse_dropbox_list,
     parse_dropbox_token, parse_git_branches, parse_ls_la, parse_ps_output, parse_ssh_config,
     posix_quote, Application, ArchiveFormat,
-    BackendId, DockerContainer, Entry, GitBranch, GitInfo, Location, Process, Side, SshServer,
+    BackendId, DockerContainer, Entry, FtpLogEntry, FtpLogLevel, FtpServerInfo, GitBranch,
+    GitInfo, Location, Process, Side, SshServer,
 };
 use crate::Message;
 
@@ -2482,6 +2483,627 @@ fn macos_terminal_run_apple_script(app: &str, cwd: &str, command: &str) -> Strin
         let shell_cmd = format!("cd {} && {}", posix_quote(cwd), command);
         let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
         format!("tell application \"{app}\" to do script \"{escaped}\"")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-app FTP server (Command Palette → "FTP server")
+// ---------------------------------------------------------------------------
+//
+// One libunftp server runs at most. `ftp_start_task` builds it, pre-binds the
+// port to surface "address in use" synchronously, then `tokio::spawn`s the
+// listen future and hands the resulting `AbortHandle` back to the App via
+// `Message::FtpServerStarted`. `ftp_stop_task` aborts that handle, which
+// causes libunftp's listen future to drop and the OS socket to close.
+//
+// Filesystem access goes through `RhoFs` — a thin wrapper around
+// `unftp_sbe_fs::Filesystem` that returns 550/PermissionDenied from the
+// write operations when `FtpPerms::ReadOnly` is configured. We wrap instead
+// of swapping backends so the server's `Storage` type stays monomorphic at
+// build time.
+//
+// Auth is one of two pre-built `Authenticator`s: libunftp's
+// `AnonymousAuthenticator` for `FtpAuthMode::Anonymous`, or our local
+// `StaticAuth` (a constant-time compare on a fixed user + password
+// generated at start) for `FtpAuthMode::Generated`.
+
+use std::fmt::Debug as FmtDebug;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use libunftp::auth::AnonymousAuthenticator;
+use libunftp::notification::{DataEvent, DataListener, EventMeta, PresenceEvent, PresenceListener};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
+use tokio::io::AsyncRead;
+use tokio::sync::broadcast;
+use tokio::task::AbortHandle;
+use unftp_core::auth::{AuthenticationError, Authenticator, Credentials, Principal, UserDetail};
+use unftp_core::storage::{Error, ErrorKind, Fileinfo, Result as SbeResult, StorageBackend};
+
+/// Process-global broadcast bus for FTP log events. Listeners push entries
+/// via [`ftp_log_send`]; the iced [`ftp_log_subscription`] subscribes a
+/// fresh receiver each time the App's subscription stream is built and
+/// forwards entries as `Message::FtpLogEvent`. Survives across server
+/// restarts so the subscription stays valid even when no server is
+/// running — pushes go nowhere quietly when there are no subscribers.
+static FTP_LOG_BUS: OnceLock<broadcast::Sender<FtpLogEntry>> = OnceLock::new();
+
+/// Maximum number of buffered log entries between subscriber polls before
+/// the broadcast channel starts dropping oldest. Generous — even a
+/// hammered server only produces a few events per second, and the iced
+/// runtime drains the channel every tick.
+const FTP_LOG_BUS_CAPACITY: usize = 512;
+
+fn ftp_log_sender() -> &'static broadcast::Sender<FtpLogEntry> {
+    FTP_LOG_BUS.get_or_init(|| {
+        let (tx, _rx) = broadcast::channel(FTP_LOG_BUS_CAPACITY);
+        tx
+    })
+}
+
+/// Push a single log entry onto the bus. Fails silently when there are no
+/// subscribers — the server runs whether the modal is up or not, and the
+/// modal opens with the most recent entries the App buffered while it was
+/// closed (no entry vanishes that ever made it to a subscriber).
+fn ftp_log_send(level: FtpLogLevel, message: impl Into<String>) {
+    let entry = FtpLogEntry {
+        ts: SystemTime::now(),
+        level,
+        message: message.into(),
+    };
+    // `send` returns Err when there are no subscribers — that's fine, we
+    // don't gate logging on the modal being open.
+    let _ = ftp_log_sender().send(entry);
+}
+
+/// iced subscription that forwards every entry pushed onto [`FTP_LOG_BUS`]
+/// as a `Message::FtpLogEvent`. Stable id keeps it alive across re-renders.
+/// When the channel falls behind (a 512-entry burst with the subscriber
+/// stalled), we surface a single Warn entry rather than silently dropping —
+/// matches `tokio::sync::broadcast::error::RecvError::Lagged` semantics.
+pub fn ftp_log_subscription() -> Subscription<Message> {
+    use iced::futures::SinkExt;
+    use iced::stream;
+
+    Subscription::run_with_id(
+        "ftp-log-bus",
+        stream::channel(64, |mut output| async move {
+            let mut rx = ftp_log_sender().subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        let _ = output.send(Message::FtpLogEvent(entry)).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let entry = FtpLogEntry {
+                            ts: SystemTime::now(),
+                            level: FtpLogLevel::Warn,
+                            message: format!(
+                                "log bus lagged — dropped {} entr{}",
+                                skipped,
+                                if skipped == 1 { "y" } else { "ies" }
+                            ),
+                        };
+                        let _ = output.send(Message::FtpLogEvent(entry)).await;
+                    }
+                    // The static Sender never drops, so Closed shouldn't
+                    // be reachable. If it ever is, end the subscription
+                    // cleanly rather than spin.
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }),
+    )
+}
+
+/// libunftp [`DataListener`] + [`PresenceListener`] that forwards every
+/// event into the FTP log bus. One instance is shared via `Arc` between
+/// the two listener slots on `ServerBuilder`.
+#[derive(Debug)]
+struct FtpEventListener;
+
+#[async_trait]
+impl DataListener for FtpEventListener {
+    async fn receive_data_event(&self, e: DataEvent, m: EventMeta) {
+        let msg = match e {
+            DataEvent::Got { path, bytes } => {
+                format!("{}: GET {} ({})", m.username, path, format_byte_count(bytes))
+            }
+            DataEvent::Put { path, bytes } => {
+                format!("{}: PUT {} ({})", m.username, path, format_byte_count(bytes))
+            }
+            DataEvent::Deleted { path } => format!("{}: DEL {}", m.username, path),
+            DataEvent::MadeDir { path } => format!("{}: MKD {}", m.username, path),
+            DataEvent::RemovedDir { path } => format!("{}: RMD {}", m.username, path),
+            DataEvent::Renamed { from, to } => {
+                format!("{}: RENAME {} → {}", m.username, from, to)
+            }
+        };
+        ftp_log_send(FtpLogLevel::Info, msg);
+    }
+}
+
+#[async_trait]
+impl PresenceListener for FtpEventListener {
+    async fn receive_presence_event(&self, e: PresenceEvent, m: EventMeta) {
+        match e {
+            PresenceEvent::LoggedIn => {
+                ftp_log_send(FtpLogLevel::Auth, format!("{}: logged in", m.username));
+            }
+            PresenceEvent::LoggedOut => {
+                ftp_log_send(FtpLogLevel::Auth, format!("{}: logged out", m.username));
+            }
+        }
+    }
+}
+
+/// Compact human byte count for the log lines. Mirrors view_pane's
+/// `format_size` but lives here because the log code path is in fs_ops.
+/// Keeps to three digits + suffix (`812 B`, `1.4 kB`, `42 MB`, `3.1 GB`).
+fn format_byte_count(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} kB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Filesystem backend used by the in-app FTP server. Wraps
+/// `unftp_sbe_fs::Filesystem` and enforces the configured permissions —
+/// `ReadOnly` returns `550 Permission denied` from `put` / `del` / `mkd` /
+/// `rmd` / `rename`; `ReadWrite` forwards everything through.
+#[derive(Debug)]
+pub struct RhoFs {
+    inner: unftp_sbe_fs::Filesystem,
+    perms: FtpPerms,
+}
+
+impl RhoFs {
+    fn new(root: PathBuf, perms: FtpPerms) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: unftp_sbe_fs::Filesystem::new(root)?,
+            perms,
+        })
+    }
+
+    fn check_writable(&self) -> SbeResult<()> {
+        match self.perms {
+            FtpPerms::ReadWrite => Ok(()),
+            FtpPerms::ReadOnly => {
+                // Surface the rejection so the user watching the modal
+                // sees *why* a client just got 550 — they're staring at
+                // a server they configured read-only.
+                ftp_log_send(
+                    FtpLogLevel::Warn,
+                    "denied write attempt (server is read-only)",
+                );
+                Err(Error::from(ErrorKind::PermissionDenied))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl<User: UserDetail> StorageBackend<User> for RhoFs {
+    type Metadata = unftp_sbe_fs::Meta;
+
+    fn supported_features(&self) -> u32 {
+        <unftp_sbe_fs::Filesystem as StorageBackend<User>>::supported_features(&self.inner)
+    }
+
+    async fn metadata<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+    ) -> SbeResult<Self::Metadata> {
+        self.inner.metadata(user, path).await
+    }
+
+    async fn list<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+    ) -> SbeResult<Vec<Fileinfo<PathBuf, Self::Metadata>>> {
+        self.inner.list(user, path).await
+    }
+
+    async fn get<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+        start_pos: u64,
+    ) -> SbeResult<Box<dyn AsyncRead + Send + Sync + Unpin>> {
+        self.inner.get(user, path, start_pos).await
+    }
+
+    async fn put<
+        P: AsRef<Path> + Send + FmtDebug,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    >(
+        &self,
+        user: &User,
+        input: R,
+        path: P,
+        start_pos: u64,
+    ) -> SbeResult<u64> {
+        self.check_writable()?;
+        self.inner.put(user, input, path, start_pos).await
+    }
+
+    async fn del<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+    ) -> SbeResult<()> {
+        self.check_writable()?;
+        self.inner.del(user, path).await
+    }
+
+    async fn mkd<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+    ) -> SbeResult<()> {
+        self.check_writable()?;
+        self.inner.mkd(user, path).await
+    }
+
+    async fn rename<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        from: P,
+        to: P,
+    ) -> SbeResult<()> {
+        self.check_writable()?;
+        self.inner.rename(user, from, to).await
+    }
+
+    async fn rmd<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+    ) -> SbeResult<()> {
+        self.check_writable()?;
+        self.inner.rmd(user, path).await
+    }
+
+    async fn cwd<P: AsRef<Path> + Send + FmtDebug>(
+        &self,
+        user: &User,
+        path: P,
+    ) -> SbeResult<()> {
+        self.inner.cwd(user, path).await
+    }
+}
+
+/// Static-credentials [`Authenticator`] for the in-app FTP server. The
+/// expected username and password are set at start time. Comparison uses a
+/// byte-by-byte constant-time loop so the failure path doesn't leak the
+/// correct length / prefix via timing.
+#[derive(Debug)]
+pub struct StaticAuth {
+    user: String,
+    pass: String,
+}
+
+impl StaticAuth {
+    pub fn new(user: String, pass: String) -> Self {
+        Self { user, pass }
+    }
+}
+
+/// Constant-time equality on two byte slices. Always walks the full length
+/// of the longer slice, so a mismatching length doesn't shortcut the
+/// comparison early.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let av = *a.get(i).unwrap_or(&0);
+        let bv = *b.get(i).unwrap_or(&0);
+        diff |= av ^ bv;
+    }
+    diff == 0
+}
+
+#[async_trait]
+impl Authenticator for StaticAuth {
+    async fn authenticate(
+        &self,
+        username: &str,
+        creds: &Credentials,
+    ) -> std::result::Result<Principal, AuthenticationError> {
+        let pass = creds.password.as_deref().unwrap_or("");
+        let user_ok = ct_eq(username.as_bytes(), self.user.as_bytes());
+        let pass_ok = ct_eq(pass.as_bytes(), self.pass.as_bytes());
+        if user_ok && pass_ok {
+            // Don't log the successful auth here — libunftp emits its
+            // own `PresenceEvent::LoggedIn` which already covers it,
+            // including for AnonymousAuthenticator. Logging here too
+            // would double-log every login.
+            Ok(Principal {
+                username: username.to_string(),
+            })
+        } else if !user_ok {
+            ftp_log_send(
+                FtpLogLevel::Warn,
+                format!("auth failed: unknown user {:?}", username),
+            );
+            Err(AuthenticationError::BadUser)
+        } else {
+            ftp_log_send(
+                FtpLogLevel::Warn,
+                format!("auth failed: bad password for {:?}", username),
+            );
+            Err(AuthenticationError::BadPassword)
+        }
+    }
+}
+
+/// Best-effort discovery of a LAN-routable IPv4 address. Opens a UDP socket
+/// bound to the wildcard, "connects" it to a non-routable remote (no actual
+/// packets sent — UDP `connect` only sets the kernel's default route lookup
+/// for the socket) and reads back the local address the kernel picked.
+/// Returns `None` when offline / no default route — the caller falls back
+/// to the bind IP string ("0.0.0.0", "127.0.0.1", …).
+fn resolve_local_v4() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Pick a known-routable destination — 1.1.1.1 (Cloudflare DNS) tends to
+    // be reachable even on captive-portal LANs where 8.8.8.8 is filtered.
+    sock.connect("1.1.1.1:80").ok()?;
+    let addr = sock.local_addr().ok()?;
+    let ip = addr.ip();
+    if ip.is_unspecified() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+/// 12-char alphanumeric password. Cryptographic strength isn't the goal
+/// here (this is a LAN-share password the user reads off the screen), but
+/// it should be opaque enough that a casual onlooker can't memorize it.
+fn generate_password() -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect()
+}
+
+/// Start the in-app FTP server rooted at `root`. The server is built per
+/// the supplied `FtpConfig` and spawned on a tokio task; the returned
+/// `AbortHandle` is what `ftp_stop_task` tears the server down with.
+///
+/// We pre-bind the chosen port with a plain `std::net::TcpListener` and
+/// immediately drop it — that surfaces "address already in use" /
+/// permission errors synchronously, before libunftp gets involved. There's
+/// a tiny TOCTOU window between the drop and libunftp re-binding, but
+/// nothing else in our process is racing for the port and a colliding
+/// system service would still produce a runtime error caught later.
+pub fn ftp_start_task(root: PathBuf, cfg: FtpConfig) -> Task<Message> {
+    Task::perform(
+        async move { ftp_start(root, cfg).await },
+        Message::FtpServerStarted,
+    )
+}
+
+async fn ftp_start(
+    root: PathBuf,
+    cfg: FtpConfig,
+) -> std::result::Result<(FtpServerInfo, AbortHandle), String> {
+    let bind_str = format!("{}:{}", cfg.bind, cfg.port);
+    let bind_addr: SocketAddr = bind_str
+        .parse()
+        .map_err(|e| format!("invalid FTP bind address {}: {}", bind_str, e))?;
+
+    // Surface bind errors synchronously. A successful bind here only tells
+    // us the port was free at *this* instant — libunftp will re-bind a few
+    // lines down — but that's the same race the OS has for every server, so
+    // we accept it.
+    match std::net::TcpListener::bind(bind_addr) {
+        Ok(_) => {}
+        Err(e) => return Err(format!("can't bind FTP server to {}: {}", bind_addr, e)),
+    }
+
+    // Build the auth pair the user will see in the modal. For generated
+    // mode we honor whichever of username / password the user pinned in
+    // `~/.rho.yaml` and fill in the gaps: built-in `"rho"` username, fresh
+    // 12-char random password.
+    let (username, password) = match cfg.auth {
+        FtpAuthMode::Generated => {
+            let user = cfg.resolved_username();
+            let pass = cfg.resolved_password().unwrap_or_else(generate_password);
+            (Some(user), Some(pass))
+        }
+        FtpAuthMode::Anonymous => (None, None),
+    };
+
+    // Storage generator: libunftp calls this once per accepted connection.
+    let root_for_gen = root.clone();
+    let perms = cfg.permissions;
+    let sbe_gen: Box<dyn Fn() -> RhoFs + Send + Sync> = Box::new(move || {
+        // Filesystem::new fails only on `cap_std::Dir::open_ambient_dir`
+        // errors (root vanished, EACCES, …). We can't propagate the error
+        // back to the App from inside the generator, so we panic — the
+        // tokio task catches it and the connection drops with a 5xx.
+        RhoFs::new(root_for_gen.clone(), perms)
+            .unwrap_or_else(|e| panic!("ftp rho-fs init failed: {}", e))
+    });
+
+    // Narrow passive-port range — libunftp's default of 49152..=65535 is
+    // far too wide to whitelist on any LAN firewall, which is the #1 cause
+    // of "control connects but transfer hangs" symptoms.
+    let (pmin, pmax) = cfg.resolved_passive_ports();
+    let mut builder = libunftp::ServerBuilder::new(sbe_gen)
+        .greeting("rho FTP server")
+        .passive_ports(pmin..=pmax)
+        .notify_data(FtpEventListener)
+        .notify_presence(FtpEventListener);
+    // Pin the PASV-advertised host when the user supplied one. Empty / blank
+    // values are treated as unset so a typo doesn't break data transfers.
+    if let Some(host) = cfg.passive_host.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        builder = builder.passive_host(host);
+    }
+    if let (Some(u), Some(p)) = (username.clone(), password.clone()) {
+        let auth: Arc<dyn Authenticator + Send + Sync> = Arc::new(StaticAuth::new(u, p));
+        builder = builder.authenticator(auth);
+    } else {
+        let auth: Arc<dyn Authenticator + Send + Sync> = Arc::new(AnonymousAuthenticator {});
+        builder = builder.authenticator(auth);
+    }
+
+    let server = builder
+        .build()
+        .map_err(|e| format!("FTP server build failed: {}", e))?;
+
+    let listen_addr = bind_addr.to_string();
+    let join = tokio::spawn(async move {
+        // Errors from listen() are logged but not propagated back — the
+        // App holds the AbortHandle and stops the task explicitly. A clean
+        // teardown via abort returns a JoinError::Cancelled which we
+        // ignore; any other error means something went wrong mid-flight,
+        // and we also surface it on the log bus so the modal shows it.
+        if let Err(e) = server.listen(listen_addr).await {
+            eprintln!("ftp server: listen exited with: {:?}", e);
+            ftp_log_send(FtpLogLevel::Error, format!("listen exited: {}", e));
+        }
+    });
+    let handle = join.abort_handle();
+
+    ftp_log_send(
+        FtpLogLevel::Info,
+        format!("listening on {} → {}", bind_addr, root.display()),
+    );
+    ftp_log_send(
+        FtpLogLevel::Info,
+        format!(
+            "passive ports: {}-{} (open these in your firewall along with {})",
+            pmin,
+            pmax,
+            bind_addr.port()
+        ),
+    );
+    match cfg.passive_host.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(host) => ftp_log_send(
+            FtpLogLevel::Info,
+            format!("PASV will advertise host: {}", host),
+        ),
+        None => ftp_log_send(
+            FtpLogLevel::Info,
+            "PASV will advertise whichever interface the client connected to (FromConnection)",
+        ),
+    }
+
+    // Best-effort human-readable host. For wildcard binds we ask the
+    // kernel which IPv4 address it would route outbound traffic through;
+    // for specific binds we just show what was configured.
+    let display_host = if bind_addr.ip().is_unspecified() {
+        resolve_local_v4().unwrap_or_else(|| bind_addr.ip().to_string())
+    } else {
+        bind_addr.ip().to_string()
+    };
+
+    Ok((
+        FtpServerInfo {
+            bind: bind_addr,
+            display_host,
+            root,
+            username,
+            password,
+            permissions: perms,
+            started_at: SystemTime::now(),
+        },
+        handle,
+    ))
+}
+
+// Stopping the server is synchronous: the App drops the `FtpRuntime` it
+// holds, the `Drop` impl calls `AbortHandle::abort`, and the listen task
+// unwinds. No `Task<Message>` round-trip is needed, so there's no stop_task
+// here — see `App::update`'s `FtpServerStopRequest` arm.
+
+#[cfg(test)]
+mod ftp_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_rhofs_rejects_writes() {
+        // Drive the wrapper directly: synthesize a RhoFs in read-only mode
+        // and confirm check_writable() returns PermissionDenied. We can't
+        // easily call the async StorageBackend methods without spinning up
+        // a runtime, so we exercise the gate they share.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RhoFs::new(dir.path().to_path_buf(), FtpPerms::ReadOnly).unwrap();
+        let err = fs.check_writable().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn read_write_rhofs_allows_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RhoFs::new(dir.path().to_path_buf(), FtpPerms::ReadWrite).unwrap();
+        assert!(fs.check_writable().is_ok());
+    }
+
+    #[test]
+    fn ct_eq_is_true_for_equal_and_false_for_mismatch() {
+        assert!(ct_eq(b"hello", b"hello"));
+        assert!(!ct_eq(b"hello", b"world"));
+        // Different lengths: still definitively unequal.
+        assert!(!ct_eq(b"hello", b"hello!"));
+        assert!(!ct_eq(b"", b"x"));
+        // Empty equality.
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn format_byte_count_picks_unit_per_bracket() {
+        assert_eq!(format_byte_count(0), "0 B");
+        assert_eq!(format_byte_count(1023), "1023 B");
+        assert_eq!(format_byte_count(1024), "1.0 kB");
+        assert_eq!(format_byte_count(1024 * 1024), "1.0 MB");
+        assert_eq!(format_byte_count(1024u64.pow(3)), "1.0 GB");
+    }
+
+    #[test]
+    fn ftp_log_send_without_subscribers_is_noop() {
+        // Drop any pre-existing subscriber by scoping it; sending into the
+        // bus with zero receivers must not panic or block.
+        let _ = ftp_log_sender(); // ensure init
+        ftp_log_send(FtpLogLevel::Info, "no-listener test");
+    }
+
+    #[test]
+    fn ftp_log_subscriber_receives_pushed_entry() {
+        // A subscribe-then-send-then-recv loop confirms the bus delivers
+        // entries to live subscribers. Uses try_recv with a tiny tokio
+        // runtime so we don't block.
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut rx = ftp_log_sender().subscribe();
+            ftp_log_send(FtpLogLevel::Info, "hello");
+            let entry = rx.recv().await.expect("entry delivered");
+            assert_eq!(entry.message, "hello");
+            assert_eq!(entry.level, FtpLogLevel::Info);
+        });
+    }
+
+    #[test]
+    fn generate_password_is_alphanumeric_and_fixed_length() {
+        let p = generate_password();
+        assert_eq!(p.len(), 12);
+        assert!(p.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 }
 
