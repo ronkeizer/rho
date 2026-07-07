@@ -490,22 +490,15 @@ impl App {
         let side = self.active;
         let pane = self.pane(side);
         if pane.selected == 0 || !pane.location.is_local() {
-            self.quick_view = None;
-            return Task::none();
+            return self.close_quick_view();
         }
         let entry = match pane.entry_at(pane.selected) {
             Some(e) if !e.is_dir => e,
-            _ => {
-                self.quick_view = None;
-                return Task::none();
-            }
+            _ => return self.close_quick_view(),
         };
         let action = match matching_quick_view(&self.config.quick_view, &entry.name) {
             Some(a) => a,
-            None => {
-                self.quick_view = None;
-                return Task::none();
-            }
+            None => return self.close_quick_view(),
         };
         let label = action.label.clone();
         let path = pane.path().join(&entry.name);
@@ -530,6 +523,34 @@ impl App {
         Task::perform(tokio::time::sleep(QUICK_VIEW_DEBOUNCE), move |_| {
             Message::QuickViewDebounceFire(id)
         })
+    }
+
+    /// Clear `self.quick_view`. If a preview was actually showing, also fix
+    /// up the pane it was rendered in — the one *opposite* `source_side`
+    /// (see `view_pane`'s pane-splitting match on `quick_view`).
+    ///
+    /// That pane's listing was squeezed into a `FillPortion(3)` scrollable
+    /// while the preview took the rest; `view_pane` virtualizes rows using
+    /// the *cached* `pane.viewport_height` (only ever updated by a
+    /// `Message::Scrolled` from that scrollable's `on_scroll`), so once the
+    /// split disappears and the container goes back to full height, the
+    /// stale small `viewport_height` still caps how many rows get built —
+    /// the rest of the space renders as blank filler. Clearing it makes the
+    /// very next render fall back to the window-based estimate instead of
+    /// the stale split height, and re-issuing `scroll_to` at the same offset
+    /// forces iced to actually measure the now-full-height viewport and
+    /// report it back via a fresh `Scrolled` message. A no-op call (quick_view
+    /// was already closed) touches nothing, so idle cursor moves that never
+    /// opened a preview don't pay for this on every keypress.
+    fn close_quick_view(&mut self) -> Task<Message> {
+        let Some(qv) = self.quick_view.take() else {
+            return Task::none();
+        };
+        let side = qv.source_side.other();
+        let pane = self.pane_mut(side);
+        pane.viewport_height = None;
+        let y = pane.scroll_y;
+        scrollable::scroll_to(scroll_id(side), scrollable::AbsoluteOffset { x: 0.0, y })
     }
 
     /// Force-scroll `side`'s pane so its selected row sits roughly a third of

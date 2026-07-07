@@ -431,7 +431,7 @@ automatically on every settled cursor move, unattended, so a command that
 hangs (e.g. reads stdin) can't be allowed to block a worker thread
 indefinitely. `fs_ops::run_quick_view_command` instead uses
 `tokio::process::Command` with `kill_on_drop(true)` and races
-`child.wait_with_output()` against a `tokio::time::timeout` (5s); when the
+`child.wait_with_output()` against a `tokio::time::timeout` (10s); when the
 timeout wins, the future carrying `Child` is dropped, which — thanks to
 `kill_on_drop` — kills the process instead of leaking it. Output (command
 stdout/stderr, or the raw file read for the no-`command` case) is capped at
@@ -442,9 +442,31 @@ preview (it just renders as replacement characters).
 **View wiring.** `App::view` computes, per side, whether `self.quick_view`
 belongs to *that* side by checking `qv.source_side.other() == side`, passing
 `Option<&QuickViewState>` into `view_pane`. When `Some`, `view_pane` splits
-its `inner_col` into two `Length::FillPortion(1)` halves via `column!` — the
-existing listing on top, `quick_view_panel` (label bar + scrollable
-monospace body) on the bottom — instead of the usual single-container layout.
+its `inner_col` via `column!` into `Length::FillPortion(3)` (the existing
+listing) on top and `Length::FillPortion(7)` (`quick_view_panel` — label bar
++ scrollable monospace body) on the bottom, instead of the usual
+single-container layout.
+
+**Closing re-measures the pane it was rendered in.** `refresh_quick_view`
+routes every "stop showing a preview" case (cursor left the file, cursor hit
+`..`, active pane went remote, no `quick_view` entry matches) through
+`App::close_quick_view`. The row-virtualization windowing described above
+(`first_row`/`last_row` in `view_pane`) uses the *cached* `pane.
+viewport_height`, which is only ever updated by a `Message::Scrolled` from
+that pane's own `on_scroll`. While the preview is showing, the opposite
+pane's listing is squeezed into a `FillPortion(3)` scrollable, and if a
+scroll happens during that time, `viewport_height` gets cached at that
+squeezed height. When the split then disappears and the container reverts
+to full height, the stale small `viewport_height` keeps capping how many
+rows `view_pane` builds, so the rest of the (now-larger) pane renders as
+blank filler space until something re-measures it. `close_quick_view` clears
+`viewport_height` on the affected pane (`qv.source_side.other()`) — so the
+very next render falls back to the window-based estimate instead of the
+stale value — and re-issues `scrollable::scroll_to` at the pane's current
+scroll offset to force iced to measure the real (now full-height) viewport
+and report it back via a fresh `Scrolled`. A no-op call (quick_view was
+already closed) touches nothing, so idle cursor moves that never opened a
+preview don't pay for this on every keypress.
 
 ## FTP server
 
