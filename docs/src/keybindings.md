@@ -42,7 +42,7 @@ selection just means "this row".
 | `F4` | Edit the cursor row's file in `$VISUAL` / `$EDITOR` (falls back to `open -t` on macOS) |
 | `Space` | Quick Look preview the cursor row's file (macOS only; no-op elsewhere) |
 | `F5` | Open the copy modal (destination defaults to the other pane's directory) |
-| `F6` | Open the move modal (destination defaults to the other pane's directory) |
+| `F6` | Open the move modal (destination defaults to the other pane's directory; with a single item selected, type a new not-yet-existing name to rename it) |
 | `F7` | Open the new-folder modal — type a name to create a directory in the active pane (local panes only) |
 | `F10` | Quit the app immediately. Works even with a modal open — no confirmation. |
 | `F8` / `Delete` | Open the delete-confirm modal for the current mark |
@@ -89,7 +89,7 @@ Inside a modal, the navigation keys behave differently:
 | Modal | Keys |
 |---|---|
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
-| Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. A relative destination (e.g. `test/` for a subfolder) resolves against the active pane's current directory, not just an absolute path or the other pane's location. |
+| Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. A relative destination (e.g. `test/` for a subfolder) resolves against the active pane's current directory, not just an absolute path or the other pane's location. If the destination is an existing directory, sources move *into* it; if exactly one item is selected and the destination doesn't exist yet (e.g. a bare `renamed` or `../renamed`), it's treated as the exact new path — this is how a folder gets renamed. |
 | New folder (text input only) | `Enter` creates the named directory in the active pane (nested names like `a/b` are created in full), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
 | Open file (chooser) | Shown when `Enter` is pressed on a non-archive file. `↑` / `↓` move the highlight, `Enter` or a click runs it, `Esc` cancels. The first row is always "Open with default application"; the rest are [`file_actions`](./configuration.md) whose pattern matched. `Tab` expands the highlighted custom action into an editable command pre-filled with its placeholders already substituted — edit it, then `Enter` runs the edited text verbatim (not the original template); `Tab` again collapses back without running anything. Background actions show "Running…" in the status bar and refresh the panes when done; `terminal: true` actions open a terminal window. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |

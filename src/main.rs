@@ -34,7 +34,7 @@ use fs_ops::{
     apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
     docker_shell, extract_to_temp_task, file_watch_subscription, ftp_log_subscription,
     ftp_start_task, git_branches_task,
-    git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task,
+    git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task, rename_task,
     open_claude_code, open_folder_in_editor, open_terminal,
     pane_watch_subscription, ps_task, quick_view_task, run_file_action_in_terminal, run_file_action_task,
     ssh_connect, ssh_servers_task, uncompress_task,
@@ -1190,14 +1190,21 @@ impl App {
                         Prompt::Move { input } => {
                             let base = self.pane(self.active).path().to_path_buf();
                             let dest = parse_dest_location(&input, &base);
-                            if dest_exists(&dest) {
-                                let srcs = self.pane(self.active).marked_locations();
-                                if !srcs.is_empty() {
-                                    self.move_in_progress = Some((srcs.len(), dest.clone()));
-                                    Some(move_task(srcs, dest))
-                                } else {
-                                    None
-                                }
+                            let srcs = self.pane(self.active).marked_locations();
+                            if srcs.is_empty() {
+                                None
+                            } else if dest_exists(&dest) {
+                                // Destination is an existing directory: move
+                                // every source *into* it.
+                                self.move_in_progress = Some((srcs.len(), dest.clone()));
+                                Some(move_task(srcs, dest))
+                            } else if srcs.len() == 1 && rename_dest_ok(&dest) {
+                                // Single source + a destination that doesn't
+                                // exist yet: treat the path as the exact new
+                                // target — this is how a folder gets renamed.
+                                self.move_in_progress = Some((1, dest.clone()));
+                                let src = srcs.into_iter().next().expect("len checked == 1");
+                                Some(rename_task(src, dest))
                             } else {
                                 None
                             }
@@ -2783,6 +2790,20 @@ fn dest_exists(loc: &Location) -> bool {
     }
 }
 
+/// Validate a single-item rename/move target: the destination must not
+/// already exist, and (for local paths) its parent directory must. This
+/// is the guard that lets the Move modal rename a folder — type a new,
+/// not-yet-existing name — without clobbering anything. Remote targets
+/// are trusted; the backend surfaces a clearer error than we can guess.
+fn rename_dest_ok(loc: &Location) -> bool {
+    match loc {
+        Location::Local(p) => {
+            !p.exists() && p.parent().map(|par| par.is_dir()).unwrap_or(false)
+        }
+        Location::Remote { .. } => true,
+    }
+}
+
 /// True if the path's extension is `zip` (case-insensitive). Used to gate
 /// Enter-on-archive extraction.
 fn is_zip(path: &std::path::Path) -> bool {
@@ -2810,7 +2831,7 @@ fn batch_error_message<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_error_message, is_zip, parse_dest_location, APP_ICON};
+    use super::{batch_error_message, is_zip, parse_dest_location, rename_dest_ok, APP_ICON};
     use crate::domain::Location;
     use std::path::{Path, PathBuf};
 
@@ -2904,5 +2925,36 @@ mod tests {
                 path: PathBuf::from("/var/log"),
             }
         );
+    }
+
+    #[test]
+    fn rename_dest_ok_accepts_new_name_in_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = Location::Local(dir.path().join("brand_new"));
+        assert!(rename_dest_ok(&dest));
+    }
+
+    #[test]
+    fn rename_dest_ok_rejects_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("already_here");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(!rename_dest_ok(&Location::Local(existing)));
+    }
+
+    #[test]
+    fn rename_dest_ok_rejects_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = Location::Local(dir.path().join("no_such_parent").join("child"));
+        assert!(!rename_dest_ok(&dest));
+    }
+
+    #[test]
+    fn rename_dest_ok_trusts_remote() {
+        let dest = Location::Remote {
+            backend: crate::domain::BackendId::new("myhost"),
+            path: PathBuf::from("/var/whatever"),
+        };
+        assert!(rename_dest_ok(&dest));
     }
 }
