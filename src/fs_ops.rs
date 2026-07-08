@@ -634,6 +634,55 @@ fn run_rename(src: Location, dst: Location) -> Vec<(Location, Result<(), String>
     vec![(src, res)]
 }
 
+/// Copy a *single* source to an **exact** destination path, as opposed
+/// to copying it *into* a destination directory the way [`copy_task`]
+/// does. Powers "copy as" (copy + rename in one step) through the Copy
+/// modal — type a new, not-yet-existing path. Reuses
+/// [`Message::CopyFinished`] so the in-flight indicator and per-source
+/// error reporting are shared with copy.
+pub fn copy_as_task(src: Location, dst: Location) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || run_copy_as(src, dst))
+                .await
+                .unwrap_or_default()
+        },
+        Message::CopyFinished,
+    )
+}
+
+fn run_copy_as(src: Location, dst: Location) -> Vec<(Location, Result<(), String>)> {
+    let res = match (&src, &dst) {
+        (Location::Local(s), Location::Local(d)) => {
+            copy_recursive(s, d).map_err(|e| e.to_string())
+        }
+        // Same Dropbox account: copy_v2 to the exact target path.
+        (
+            Location::Remote { backend: sb, path: sp },
+            Location::Remote { backend: db, path: dp },
+        ) if sb == db && sb.is_dropbox() => {
+            let body = serde_json::json!({
+                "from_path": dropbox_api_path(sp),
+                "to_path": dropbox_api_path(dp),
+            })
+            .to_string();
+            dropbox_rpc("files/copy_v2", &body).map(|_| ())
+        }
+        // Same SSH host: `cp -r -- src dst` copies to the exact target.
+        (
+            Location::Remote { backend: sb, path: sp },
+            Location::Remote { backend: db, path: dp },
+        ) if sb == db => {
+            let cmd = format!("cp -r -- {} {}", quote_remote_path(sp), quote_remote_path(dp));
+            run_ssh_command(sb, &cmd)
+        }
+        // Cross-backend copy-to-a-new-name isn't supported: copy into the
+        // destination directory (keeping the name) instead.
+        _ => Err("copy to a new name must stay on the same backend".to_string()),
+    };
+    vec![(src, res)]
+}
+
 fn run_delete(srcs: Vec<Location>) -> Vec<(Location, Result<(), String>)> {
     srcs.into_iter()
         .map(|loc| {
@@ -3798,6 +3847,38 @@ mod tests {
     #[test]
     fn run_rename_cross_backend_is_error() {
         let results = run_rename(
+            Location::Local(PathBuf::from("/tmp/x")),
+            Location::Remote {
+                backend: BackendId::new(BackendId::DROPBOX),
+                path: PathBuf::from("/y"),
+            },
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_err());
+    }
+
+    #[test]
+    fn run_copy_as_local_copies_to_new_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("old_name");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("inner.txt"), b"hi").unwrap();
+        let dst = dir.path().join("new_name");
+
+        let results = run_copy_as(
+            Location::Local(src.clone()),
+            Location::Local(dst.clone()),
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        // Original stays put (copy, not move) and the new name exists.
+        assert!(src.join("inner.txt").exists());
+        assert!(dst.join("inner.txt").exists());
+    }
+
+    #[test]
+    fn run_copy_as_cross_backend_is_error() {
+        let results = run_copy_as(
             Location::Local(PathBuf::from("/tmp/x")),
             Location::Remote {
                 backend: BackendId::new(BackendId::DROPBOX),

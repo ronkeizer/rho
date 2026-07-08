@@ -107,19 +107,21 @@ source-and-destination `Location` combination:
 Deletes route the same way: `delete_one` dispatches local → `delete_path`,
 Dropbox → `files/delete_v2`, SSH → `ssh <alias> rm -rf`.
 
-**Rename vs. move-into-dir.** `move_task` interprets its destination as a
-*container directory* — each source is placed *inside* it (the source's
-own filename is appended). The Move-modal submit handler picks a second
-path when the destination doesn't already exist and exactly one item is
-selected: `rename_task` in `fs_ops` moves that single source to the
-**exact** destination path instead of into it. `rename_dest_ok` (in
-`main.rs`) gates this — a local target must not exist and its parent must
-be a directory; remote targets are trusted. `run_rename` requires source
-and destination to share a backend (a rename never crosses hosts):
-`Local → Local` uses `move_path`, same-host SSH uses `mv -- src dst`,
-same-account Dropbox uses `files/move_v2` to the exact path. It reuses the
-`MoveFinished` message so the in-flight indicator and error reporting are
-shared with move.
+**Rename / copy-as vs. into-dir.** `move_task` / `copy_task` interpret
+their destination as a *container directory* — each source is placed
+*inside* it (the source's own filename is appended). The Move- and
+Copy-modal submit handlers pick a second path when the destination doesn't
+already exist and exactly one item is selected: `rename_task` /
+`copy_as_task` in `fs_ops` move/copy that single source to the **exact**
+destination path instead of into it. `rename_dest_ok` (in `main.rs`) gates
+both — a local target must not exist and its parent must be a directory;
+remote targets are trusted. `run_rename` / `run_copy_as` require source and
+destination to share a backend: `Local → Local` uses `move_path` /
+`copy_recursive`, same-host SSH uses `mv` / `cp -r -- src dst`,
+same-account Dropbox uses `files/move_v2` / `files/copy_v2` to the exact
+path; a cross-backend target errors (for copy, copy into the directory
+instead). They reuse the `MoveFinished` / `CopyFinished` messages so the
+in-flight indicator and error reporting are shared with move/copy.
 
 Mutating ops still gated to local: `compress` / `uncompress` (they
 shell out to local `zip`), `EditFile` and `QuickLook` (they hand the

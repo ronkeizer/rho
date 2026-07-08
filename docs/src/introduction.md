@@ -43,8 +43,9 @@ input device.
 - Copy (`F5`), move (`F6`), and delete (`Delete`) with a confirmation
   modal for delete. Move uses `fs::rename` and falls back to copy +
   delete when the source and destination are on different filesystems.
-  Move also renames: with one item selected, type a new not-yet-existing
-  destination name and it's applied as the exact target path.
+  Move and Copy also rename: with one item selected, type a new
+  not-yet-existing destination name and it's applied as the exact target
+  path (Move renames it, Copy duplicates it under the new name).
 - Compress marked files / folders into a `.zip` (palette → Compress);
   extract `.zip` / `.tar.gz` archives (palette → Uncompress). Both
   default the destination to the other pane.

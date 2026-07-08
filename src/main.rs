@@ -31,7 +31,7 @@ use domain::{
     QuickViewOutput, QuickViewState,
 };
 use fs_ops::{
-    apps_task, compress_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
+    apps_task, compress_task, copy_as_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
     docker_shell, extract_to_temp_task, file_watch_subscription, ftp_log_subscription,
     ftp_start_task, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task, rename_task,
@@ -1175,14 +1175,21 @@ impl App {
                         Prompt::Copy { input } => {
                             let base = self.pane(self.active).path().to_path_buf();
                             let dest = parse_dest_location(&input, &base);
-                            if dest_exists(&dest) {
-                                let srcs = self.pane(self.active).marked_locations();
-                                if !srcs.is_empty() {
-                                    self.copy_in_progress = Some((srcs.len(), dest.clone()));
-                                    Some(copy_task(srcs, dest))
-                                } else {
-                                    None
-                                }
+                            let srcs = self.pane(self.active).marked_locations();
+                            if srcs.is_empty() {
+                                None
+                            } else if dest_exists(&dest) {
+                                // Destination is an existing directory: copy
+                                // every source *into* it.
+                                self.copy_in_progress = Some((srcs.len(), dest.clone()));
+                                Some(copy_task(srcs, dest))
+                            } else if srcs.len() == 1 && rename_dest_ok(&dest) {
+                                // Single source + a destination that doesn't
+                                // exist yet: copy to that exact path — copy
+                                // and rename in one step.
+                                self.copy_in_progress = Some((1, dest.clone()));
+                                let src = srcs.into_iter().next().expect("len checked == 1");
+                                Some(copy_as_task(src, dest))
                             } else {
                                 None
                             }
