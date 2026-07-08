@@ -23,17 +23,20 @@ key the OS treats as the "logo" / Super key. The app reads it through iced's
 
 ## Marking & range selection
 
-A "mark" is a multi-row selection: anchor + cursor define a contiguous
-range. The current cursor row is always part of the range, so a single-row
-selection just means "this row".
+A "mark" is a multi-row selection. `Shift` builds a **contiguous** range
+(anchor + cursor define its endpoints); `⌘ + Click` adds or removes
+**individual** rows, so the selection can be non-contiguous. A plain click
+or arrow-key move collapses the selection back to the single cursor row.
+With nothing else selected, the mark is just the cursor row.
 
 | Key | Action |
 |---|---|
-| `Shift + ↑/↓` | Extend the range one row |
+| `Shift + ↑/↓` | Extend the contiguous range one row |
 | `⌘⇧↑ / ⌘⇧↓` | Extend the range to the top / bottom of the list |
 | `Shift + PageUp/PageDown` | Extend the range by a page |
-| Click | Drop the anchor on the clicked row (single-row selection) |
-| `Shift + Click` | Extend the range from the existing anchor |
+| Click | Select just the clicked row (clears any prior selection) |
+| `Shift + Click` | Extend the contiguous range from the anchor |
+| `⌘ + Click` | Toggle the clicked row in/out of the selection, leaving the rest untouched |
 
 ## File actions
 
@@ -100,6 +103,7 @@ Inside a modal, the navigation keys behave differently:
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
 | Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. A relative destination (e.g. `test/` for a subfolder) resolves against the active pane's current directory, not just an absolute path or the other pane's location. If the destination is an existing directory, sources move/copy *into* it; if exactly one item is selected and the destination doesn't exist yet (e.g. a bare `renamed` or `../renamed`), it's treated as the exact new path — this is how a folder gets renamed (Move) or copied under a new name (Copy). Copy-to-a-new-name only works within the same backend; across backends, copy into the destination directory instead. |
 | New folder (text input only) | `Enter` creates the named directory in the active pane (nested names like `a/b` are created in full), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
+| New file (text input only) | Opened from the command palette (`New file`). Pre-filled with `file.txt`. `Enter` creates the empty file in the active pane (nested names like `a/b.txt` create parents) and opens it in your editor (`$VISUAL` / `$EDITOR`), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
 | Open file (chooser) | Shown when `Enter` is pressed on a non-archive file. `↑` / `↓` move the highlight, `Enter` or a click runs it, `Esc` cancels. The first row is always "Open with default application"; the rest are [`file_actions`](./configuration.md) whose pattern matched. `Tab` expands the highlighted custom action into an editable command pre-filled with its placeholders already substituted — edit it, then `Enter` runs the edited text verbatim (not the original template); `Tab` again collapses back without running anything. Background actions show "Running…" in the status bar and refresh the panes when done; `terminal: true` actions open a terminal window. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |

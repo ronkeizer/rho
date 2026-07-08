@@ -1486,6 +1486,30 @@ pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Create an empty file `name` inside `parent`. Same name rules as
+/// [`make_dir`]: relative, non-empty, whitespace-trimmed, and refuses to
+/// clobber an existing path. Any missing parent directories in a nested name
+/// (`sub/file.txt`) are created first. Returns the created file's path.
+pub fn make_file(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("File name is empty".into());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err("File name must be relative".into());
+    }
+    let target = parent.join(candidate);
+    if target.exists() {
+        return Err(format!("{} already exists", trimmed));
+    }
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Create file failed: {}", e))?;
+    }
+    std::fs::File::create(&target).map_err(|e| format!("Create file failed: {}", e))?;
+    Ok(target)
+}
+
 /// Move `src` to `dst`. Tries `fs::rename` first (atomic on the same
 /// filesystem) and falls back to `copy_recursive` + `delete_path` when
 /// rename fails with EXDEV (Linux/macOS = 18, Windows = 17 / ERROR_NOT_
@@ -3389,6 +3413,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("dup")).unwrap();
         assert!(make_dir(dir.path(), "dup").is_err());
+    }
+
+    #[test]
+    fn make_file_creates_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = make_file(dir.path(), "file.txt").unwrap();
+        assert_eq!(created, dir.path().join("file.txt"));
+        assert!(created.is_file());
+        assert_eq!(std::fs::metadata(&created).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn make_file_trims_and_creates_nested_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = make_file(dir.path(), "  sub/dir/note.md  ").unwrap();
+        assert_eq!(created, dir.path().join("sub/dir/note.md"));
+        assert!(created.is_file());
+    }
+
+    #[test]
+    fn make_file_rejects_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(make_file(dir.path(), "   ").is_err());
+    }
+
+    #[test]
+    fn make_file_rejects_absolute_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("abs.txt");
+        assert!(make_file(dir.path(), abs.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn make_file_refuses_to_clobber_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dup.txt"), b"x").unwrap();
+        assert!(make_file(dir.path(), "dup.txt").is_err());
     }
 
     #[cfg(not(windows))]

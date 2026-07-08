@@ -3,7 +3,7 @@
 //! selection / anchor used by the UI; mutations all go through this module
 //! so the logic can be unit-tested without an iced runtime.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -524,6 +524,12 @@ pub enum Prompt {
     NewFolder {
         input: String,
     },
+    /// `NewFile`: name for an empty file to create inside the active pane's
+    /// current (local) folder. Pre-filled with `file.txt`. Submit runs
+    /// `make_file`, opens the new file in the editor, and reloads.
+    NewFile {
+        input: String,
+    },
     /// `Compress`: pre-filled destination zip path (defaults to other-pane
     /// + first-mark-stem.zip). On submit, runs `zip -r` on the marks.
     Compress {
@@ -875,6 +881,9 @@ pub enum PaletteAction {
     /// present as a variant so `match` arms stay exhaustive, but only listed
     /// in [`PaletteAction::ALL`] on macOS.
     RevealInFinder,
+    /// Prompt for a filename (default `file.txt`), create the empty file in
+    /// the active pane's local folder, and open it in the editor.
+    NewFile,
     KeyboardShortcuts,
     Exit,
 }
@@ -898,6 +907,7 @@ impl PaletteAction {
         PaletteAction::OpenInEditor,
         PaletteAction::FtpServer,
         PaletteAction::RevealInFinder,
+        PaletteAction::NewFile,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -918,6 +928,7 @@ impl PaletteAction {
         PaletteAction::OpenTerminal,
         PaletteAction::OpenInEditor,
         PaletteAction::FtpServer,
+        PaletteAction::NewFile,
         PaletteAction::KeyboardShortcuts,
         PaletteAction::Exit,
     ];
@@ -940,6 +951,7 @@ impl PaletteAction {
             PaletteAction::OpenInEditor => "Open folder in editor",
             PaletteAction::FtpServer => "FTP server",
             PaletteAction::RevealInFinder => "Open folder in Finder",
+            PaletteAction::NewFile => "New file",
             PaletteAction::KeyboardShortcuts => "Keyboard shortcuts",
             PaletteAction::Exit => "Exit",
         }
@@ -1781,6 +1793,14 @@ pub struct Pane {
     pub selected: usize,
     /// Anchor for shift-extended range selection.
     pub anchor: usize,
+    /// The explicit selection set, in *visible* row space (row 0 = ".." is
+    /// never included). This is the single source of truth for what's marked:
+    /// a plain click/arrow collapses it to just the cursor row, `Shift`
+    /// extends it to the contiguous `anchor..=selected` range, and `Cmd+click`
+    /// toggles individual rows in and out without disturbing the rest. The
+    /// cursor (`selected`) may sit on a row that isn't in this set — e.g. right
+    /// after `Cmd+click` deselects the row under it.
+    pub marked: BTreeSet<usize>,
     pub sort_by: SortBy,
     pub sort_dir: SortDir,
     pub scroll_y: f32,
@@ -1818,6 +1838,7 @@ impl Pane {
             filter: String::new(),
             selected: 0,
             anchor: 0,
+            marked: BTreeSet::new(),
             sort_by: SortBy::Name,
             sort_dir: SortDir::Asc,
             scroll_y: 0.0,
@@ -1871,6 +1892,7 @@ impl Pane {
         self.filter.clear();
         self.selected = 0;
         self.anchor = 0;
+        self.marked.clear();
         self.loading = true;
         self.load_generation += 1;
         self.git_info = None;
@@ -1900,6 +1922,7 @@ impl Pane {
         self.visible_indices.clear();
         self.selected = 0;
         self.anchor = 0;
+        self.marked.clear();
         self.loading = true;
         self.load_generation += 1;
         self.git_info = None;
@@ -1984,6 +2007,13 @@ impl Pane {
 
         self.selected = new_selected;
         self.anchor = new_selected;
+        // Visible-row indices are only meaningful within a single listing;
+        // a filter/sort/reload reshuffles them, so any prior multi-selection
+        // is meaningless now. Collapse to the (re-homed) cursor row.
+        self.marked.clear();
+        if new_selected != 0 {
+            self.marked.insert(new_selected);
+        }
     }
 
     pub fn cursor_name(&self) -> Option<String> {
@@ -2008,10 +2038,41 @@ impl Pane {
     pub fn move_to(&mut self, target: i32, extend: bool) {
         let max = self.visible_indices.len() as i32;
         let next = target.clamp(0, max) as usize;
-        if !extend {
-            self.anchor = next;
-        }
         self.selected = next;
+        if extend {
+            // Shift-extend: selection becomes the contiguous range from the
+            // anchor to the new cursor.
+            self.select_range();
+        } else {
+            // Plain move/click: collapse to a single-row selection.
+            self.anchor = next;
+            self.marked.clear();
+            if next != 0 {
+                self.marked.insert(next);
+            }
+        }
+    }
+
+    /// Cmd+click: toggle a single visible row in or out of the selection
+    /// without disturbing the others, and re-home the cursor + shift-anchor
+    /// onto it so a following arrow or `Shift`-extend starts from here. The
+    /// synthetic ".." row (0) is never selectable.
+    pub fn toggle_mark(&mut self, row: usize) {
+        if row == 0 {
+            return;
+        }
+        if !self.marked.remove(&row) {
+            self.marked.insert(row);
+        }
+        self.selected = row;
+        self.anchor = row;
+    }
+
+    /// Rebuild `marked` as the contiguous `anchor..=selected` range, dropping
+    /// the ".." row. Used by shift-extended selection.
+    fn select_range(&mut self) {
+        let (lo, hi) = self.mark_range();
+        self.marked = (lo..=hi).filter(|&i| i != 0).collect();
     }
 
     pub fn move_by(&mut self, delta: i32, extend: bool) {
@@ -2028,14 +2089,13 @@ impl Pane {
     }
 
     pub fn is_marked(&self, row_index: usize) -> bool {
-        let (lo, hi) = self.mark_range();
-        row_index >= lo && row_index <= hi
+        self.marked.contains(&row_index)
     }
 
     pub fn marked_paths(&self) -> Vec<PathBuf> {
-        let (lo, hi) = self.mark_range();
-        (lo..=hi)
-            .filter_map(|i| self.entry_at(i))
+        self.marked
+            .iter()
+            .filter_map(|&i| self.entry_at(i))
             .map(|e| self.path().join(&e.name))
             .collect()
     }
@@ -2045,9 +2105,9 @@ impl Pane {
     /// Use this anywhere the I/O dispatch needs to know whether the
     /// source is local or on a particular remote host.
     pub fn marked_locations(&self) -> Vec<Location> {
-        let (lo, hi) = self.mark_range();
-        (lo..=hi)
-            .filter_map(|i| self.entry_at(i))
+        self.marked
+            .iter()
+            .filter_map(|&i| self.entry_at(i))
             .map(|e| self.location.join(&e.name))
             .collect()
     }
@@ -2876,8 +2936,8 @@ this is not an ls line
     #[test]
     fn is_marked_includes_both_endpoints() {
         let mut p = three_entry_pane();
-        p.anchor = 1;
-        p.selected = 3;
+        p.move_to(1, false);
+        p.move_to(3, true);
         assert!(p.is_marked(1));
         assert!(p.is_marked(2));
         assert!(p.is_marked(3));
@@ -2887,9 +2947,67 @@ this is not an ls line
     #[test]
     fn is_marked_excludes_out_of_range_rows() {
         let mut p = three_entry_pane();
-        p.anchor = 1;
-        p.selected = 2;
+        p.move_to(1, false);
+        p.move_to(2, true);
+        assert!(p.is_marked(1));
+        assert!(p.is_marked(2));
         assert!(!p.is_marked(3));
+    }
+
+    #[test]
+    fn toggle_mark_builds_noncontiguous_selection() {
+        let mut p = three_entry_pane();
+        // Cmd+click rows 1 and 3 — row 2 stays unselected.
+        p.toggle_mark(1);
+        p.toggle_mark(3);
+        assert!(p.is_marked(1));
+        assert!(!p.is_marked(2));
+        assert!(p.is_marked(3));
+        // Cursor and shift-anchor followed the last toggle.
+        assert_eq!(p.selected, 3);
+        assert_eq!(p.anchor, 3);
+    }
+
+    #[test]
+    fn toggle_mark_deselects_on_second_click() {
+        let mut p = three_entry_pane();
+        p.toggle_mark(2);
+        assert!(p.is_marked(2));
+        p.toggle_mark(2);
+        assert!(!p.is_marked(2));
+        // Cursor still sits on the row even though it's no longer selected.
+        assert_eq!(p.selected, 2);
+    }
+
+    #[test]
+    fn toggle_mark_ignores_dotdot_row() {
+        let mut p = three_entry_pane();
+        p.toggle_mark(0);
+        assert!(!p.is_marked(0));
+        assert!(p.marked_paths().is_empty());
+    }
+
+    #[test]
+    fn plain_move_collapses_prior_multiselection() {
+        let mut p = three_entry_pane();
+        p.toggle_mark(1);
+        p.toggle_mark(3);
+        // A plain (non-extend) move clears the Cmd-built selection down to
+        // the single new cursor row.
+        p.move_to(2, false);
+        assert!(!p.is_marked(1));
+        assert!(p.is_marked(2));
+        assert!(!p.is_marked(3));
+    }
+
+    #[test]
+    fn shift_extend_after_toggle_ranges_from_last_toggle() {
+        let mut p = three_entry_pane();
+        p.toggle_mark(1); // cursor + anchor now at row 1
+        p.move_to(3, true); // shift-extend from row 1
+        assert!(p.is_marked(1));
+        assert!(p.is_marked(2));
+        assert!(p.is_marked(3));
     }
 
     fn alpha_pane() -> Pane {
@@ -3148,8 +3266,7 @@ this is not an ls line
     #[test]
     fn marked_paths_for_single_row_returns_one_path() {
         let mut p = alpha_pane();
-        p.selected = 1; // "alpha"
-        p.anchor = 1;
+        p.move_to(1, false); // "alpha"
         let paths = p.marked_paths();
         assert_eq!(paths, vec![PathBuf::from("/p").join("alpha")]);
     }
@@ -3157,8 +3274,8 @@ this is not an ls line
     #[test]
     fn marked_paths_for_range_returns_all_entries_in_range() {
         let mut p = alpha_pane();
-        p.anchor = 1; // alpha
-        p.selected = 3; // beta (after sort: alpha, alphabet, beta, gamma)
+        p.move_to(1, false); // alpha
+        p.move_to(3, true); // beta (after sort: alpha, alphabet, beta, gamma)
         let paths = p.marked_paths();
         assert_eq!(paths.len(), 3);
         assert!(paths.contains(&PathBuf::from("/p").join("alpha")));
@@ -3170,8 +3287,8 @@ this is not an ls line
     fn marked_paths_skips_dotdot_row() {
         let mut p = alpha_pane();
         // Range includes the ".." row at index 0.
-        p.anchor = 0;
-        p.selected = 2;
+        p.move_to(0, false);
+        p.move_to(2, true);
         let paths = p.marked_paths();
         // 2 entries returned (alpha + alphabet), not 3 — the ".." row is dropped.
         assert_eq!(paths.len(), 2);
@@ -3180,16 +3297,15 @@ this is not an ls line
     #[test]
     fn marked_paths_with_only_dotdot_selected_is_empty() {
         let mut p = alpha_pane();
-        p.anchor = 0;
-        p.selected = 0;
+        p.move_to(0, false);
         assert!(p.marked_paths().is_empty());
     }
 
     #[test]
     fn marked_locations_on_local_pane_matches_marked_paths() {
         let mut p = alpha_pane();
-        p.anchor = 1;
-        p.selected = 3;
+        p.move_to(1, false);
+        p.move_to(3, true);
         let paths = p.marked_paths();
         let locs = p.marked_locations();
         assert_eq!(paths.len(), locs.len());
@@ -3210,8 +3326,8 @@ this is not an ls line
         ]);
         sort_entries(&mut p.entries, p.sort_by, p.sort_dir);
         p.recompute_visible(None);
-        p.anchor = 1;
-        p.selected = 2;
+        p.move_to(1, false);
+        p.move_to(2, true);
         let locs = p.marked_locations();
         assert_eq!(locs.len(), 2);
         for loc in &locs {
@@ -3797,6 +3913,15 @@ this is not an ls line
         assert!(available_palette_actions(false).contains(&PaletteAction::OpenInEditor));
         assert!(available_palette_actions(true).contains(&PaletteAction::OpenInEditor));
         assert_eq!(PaletteAction::OpenInEditor.label(), "Open folder in editor");
+    }
+
+    #[test]
+    fn available_palette_actions_always_lists_new_file() {
+        assert!(available_palette_actions(false).contains(&PaletteAction::NewFile));
+        assert!(available_palette_actions(true).contains(&PaletteAction::NewFile));
+        assert_eq!(PaletteAction::NewFile.label(), "New file");
+        // Always activatable — not gated on Dropbox credentials.
+        assert!(palette_action_enabled(PaletteAction::NewFile, false));
     }
 
     #[test]

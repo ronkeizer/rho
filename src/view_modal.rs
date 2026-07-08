@@ -143,6 +143,17 @@ pub fn view_modal<'a>(
             text("Created in the active pane  ·  Enter to create  ·  Esc cancels").size(11),
         ]
         .spacing(10),
+        Prompt::NewFile { input } => column![
+            text("New file").size(15),
+            text_input("file name", input)
+                .id(text_input::Id::new(PROMPT_ID))
+                .on_input(Message::PromptChanged)
+                .on_submit(Message::PromptSubmit)
+                .padding(8),
+            text("Created in the active pane, opens in your editor  ·  Enter to create  ·  Esc cancels")
+                .size(11),
+        ]
+        .spacing(10),
         Prompt::Compress { input } => column![
             text("Compress selected to").size(15),
             text_input("/path/to/output.zip", input)

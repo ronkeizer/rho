@@ -82,6 +82,9 @@ A filterable list of one-shot actions:
 - Open folder in editor — opens the active pane's directory in an
   external editor (uses the `folder_editor` setting, defaults to the VS
   Code CLI).
+- New file — prompts for a name (defaults to `file.txt`), creates the
+  empty file in the active pane, and opens it in your editor
+  (`$VISUAL` / `$EDITOR`).
 - Keyboard shortcuts — same content as the
   [Keybindings](./keybindings.md) chapter, in-app.
 - Exit.

@@ -34,7 +34,7 @@ use fs_ops::{
     apps_task, compress_task, copy_as_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
     docker_shell, drop_flush_task, extract_to_temp_task, file_watch_subscription, ftp_log_subscription,
     ftp_start_task, git_branches_task,
-    git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task, rename_task,
+    git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, make_file, move_task, rename_task,
     open_claude_code, open_folder_in_editor, open_terminal,
     pane_watch_subscription, ps_task, quick_view_task, run_file_action_in_terminal, run_file_action_task,
     ssh_connect, ssh_servers_task, uncompress_task,
@@ -88,7 +88,10 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
-    ShiftChanged(bool),
+    /// Keyboard modifier state changed — `(shift, command)`. Tracked so
+    /// mouse clicks (which don't carry modifiers in iced) can honor Shift and
+    /// ⌘ via `shift_held` / `cmd_held`.
+    ModifiersChanged(bool, bool),
     Activate(Side),
     RowClicked(Side, usize),
     GoUpActive,
@@ -272,6 +275,10 @@ struct App {
     active: Side,
     prompt: Option<Prompt>,
     shift_held: bool,
+    /// Whether ⌘ is currently down — read by `RowClicked` to toggle a single
+    /// row in/out of the selection (Cmd+click) instead of moving the cursor.
+    /// Tracked via the raw `ModifiersChanged` event, same as `shift_held`.
+    cmd_held: bool,
     window_size: Size,
     settings_mtime: Option<SystemTime>,
     /// (count, dest) while a copy task is in flight.
@@ -374,6 +381,7 @@ impl App {
             active,
             prompt: None,
             shift_held: false,
+            cmd_held: false,
             window_size,
             settings_mtime,
             copy_in_progress: None,
@@ -860,8 +868,9 @@ impl App {
         }
 
         match msg {
-            Message::ShiftChanged(state) => {
-                self.shift_held = state;
+            Message::ModifiersChanged(shift, command) => {
+                self.shift_held = shift;
+                self.cmd_held = command;
             }
             Message::Activate(side) => {
                 if self.active != side {
@@ -872,8 +881,14 @@ impl App {
             Message::RowClicked(side, row_index) => {
                 let active_changed = self.active != side;
                 self.active = side;
-                let extend = self.shift_held;
-                self.pane_mut(side).move_to(row_index as i32, extend);
+                if self.cmd_held {
+                    // ⌘+click toggles this row in/out of the selection without
+                    // disturbing the others (non-contiguous multi-select).
+                    self.pane_mut(side).toggle_mark(row_index);
+                } else {
+                    let extend = self.shift_held;
+                    self.pane_mut(side).move_to(row_index as i32, extend);
+                }
                 if active_changed {
                     self.save_state();
                 }
@@ -1085,6 +1100,7 @@ impl App {
                         Prompt::Copy { input }
                         | Prompt::Move { input }
                         | Prompt::NewFolder { input }
+                        | Prompt::NewFile { input }
                         | Prompt::Compress { input }
                         | Prompt::Uncompress { input } => {
                             *input = value;
@@ -1282,6 +1298,39 @@ impl App {
                                 Location::Remote { .. } => {
                                     self.last_error = Some(
                                         "Can't create a folder on a remote location yet".into(),
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Prompt::NewFile { input } => {
+                            // Local panes only — same restriction as NewFolder.
+                            match self.pane(self.active).location.clone() {
+                                Location::Local(dir) => match make_file(&dir, &input) {
+                                    Ok(path) => {
+                                        self.last_error = None;
+                                        // Open the freshly-created file in the
+                                        // editor ($VISUAL/$EDITOR). A launch
+                                        // failure is logged, not fatal — the
+                                        // file still exists and the panes still
+                                        // reload to show it.
+                                        if let Err(e) = open_in_editor(&path) {
+                                            eprintln!(
+                                                "failed to open {} in editor: {}",
+                                                path.display(),
+                                                e
+                                            );
+                                        }
+                                        Some(self.reload_both_panes())
+                                    }
+                                    Err(e) => {
+                                        self.last_error = Some(e);
+                                        None
+                                    }
+                                },
+                                Location::Remote { .. } => {
+                                    self.last_error = Some(
+                                        "Can't create a file on a remote location yet".into(),
                                     );
                                     None
                                 }
@@ -2392,6 +2441,12 @@ impl App {
                 }
                 Task::none()
             }
+            PaletteAction::NewFile => {
+                self.prompt = Some(Prompt::NewFile {
+                    input: "file.txt".into(),
+                });
+                text_input::focus(text_input::Id::new(PROMPT_ID))
+            }
             PaletteAction::FtpServer => self.invoke_ftp_server(),
             PaletteAction::RevealInFinder => {
                 // Fire-and-forget: reveal the active pane's folder in Finder.
@@ -2724,16 +2779,16 @@ impl App {
             }
         });
 
-        // Shift state — tracked via the raw `ModifiersChanged` event so it
+        // Shift/⌘ state — tracked via the raw `ModifiersChanged` event so it
         // fires regardless of widget capture. The earlier `on_key_press` /
         // `on_key_release` based approach only fired on `Status::Ignored`,
-        // which meant a released-after-click shift could be swallowed by
-        // the focused button and leave `shift_held` stuck `true` — causing
-        // the next plain click to extend the selection.
+        // which meant a released-after-click modifier could be swallowed by
+        // the focused button and leave the flag stuck `true` — causing
+        // the next plain click to extend/toggle the selection.
         let mods_listener =
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) => {
-                    Some(Message::ShiftChanged(mods.shift()))
+                    Some(Message::ModifiersChanged(mods.shift(), mods.command()))
                 }
                 _ => None,
             });
