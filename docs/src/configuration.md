@@ -229,6 +229,13 @@ onto a directory or `..`) clears the preview; only local panes are supported.
 | `label` | yes | Text shown above the preview body. |
 | `command` | no | Shell line to run, with the same placeholders as `file_actions.command` (see above), run in the file's own folder. **Omit it** to show the file's raw contents instead of running anything. |
 
+With **multiple files selected** (Shift- or ⌘-click — see
+[Keybindings](./keybindings.md)), the preview keys off the cursor file as
+usual, but `{file}` and `{path}` expand to *every* selected file, each
+shell-quoted and space-joined — so a `command: "shasum {file}"` previews the
+checksums of the whole selection at once. The single-valued placeholders
+(`{stem}`, `{ext}`, `{dir}`) still resolve against the cursor file.
+
 There's no `terminal` option — output is always captured, never interactive.
 A few limits keep an automatic, unattended preview from ever hanging or
 ballooning memory: the cursor must settle for ~150ms before anything runs (so

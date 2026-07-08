@@ -21,7 +21,8 @@ use domain::{
     default_zip_filename, drop_target_side, filtered_actions, filtered_apps,
     filtered_branches, filtered_processes, filtered_recents, filtered_servers, modal_scroll_target,
     sort_apps,
-    sort_containers, sort_entries, sort_processes, substitute_command, Application, AppsState,
+    sort_containers, sort_entries, sort_processes, substitute_command, substitute_command_multi,
+    Application, AppsState,
     BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, FtpAction, FtpInfoFocus,
     FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch, GitBranchesState,
@@ -534,11 +535,18 @@ impl App {
         let path = pane.path().join(&entry.name);
         // Substitute {file}/{stem}/{ext}/{path}/{dir} now, same as
         // run_file_choice does for file_actions — quick_view_task/
-        // run_quick_view_command run the raw shell line as-is.
-        let command = action
-            .command
-            .as_ref()
-            .map(|tpl| substitute_command(tpl, &path));
+        // run_quick_view_command run the raw shell line as-is. With a
+        // multi-selection, {file}/{path} expand to every marked file (space-
+        // joined) so the command runs over the whole selection; a single
+        // selection is just the cursor file, identical to before.
+        let selected = pane.marked_paths();
+        let command = action.command.as_ref().map(|tpl| {
+            if selected.len() > 1 {
+                substitute_command_multi(tpl, &selected, &path)
+            } else {
+                substitute_command(tpl, &path)
+            }
+        });
 
         self.quick_view_seq += 1;
         let id = self.quick_view_seq;

@@ -459,6 +459,56 @@ pub fn substitute_command(template: &str, path: &Path) -> String {
     let path_str = path.to_str().unwrap_or("");
     let dir = path.parent().and_then(|p| p.to_str()).unwrap_or("");
 
+    substitute_tokens(template, |token| match token {
+        "file" => Some(posix_quote(file)),
+        "stem" => Some(posix_quote(stem)),
+        "ext" => Some(posix_quote(ext)),
+        "path" => Some(posix_quote(path_str)),
+        "dir" => Some(posix_quote(dir)),
+        _ => None,
+    })
+}
+
+/// Multi-selection variant of [`substitute_command`]. `{file}` expands to
+/// *every* path in `paths` — each POSIX-shell-quoted, joined by single
+/// spaces — so a `quick_view` command runs against a whole selection
+/// (e.g. `shasum` over three marked files). `{path}` likewise expands to
+/// every absolute path. The single-valued placeholders (`{stem}`, `{ext}`,
+/// `{dir}`) resolve against `primary` — the file under the cursor — since
+/// they have no meaningful multi-file expansion. With one path this behaves
+/// exactly like `substitute_command`.
+pub fn substitute_command_multi(template: &str, paths: &[PathBuf], primary: &Path) -> String {
+    let join_quoted = |f: &dyn Fn(&Path) -> &str| {
+        paths
+            .iter()
+            .map(|p| posix_quote(f(p)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let files = join_quoted(&|p: &Path| p.file_name().and_then(|s| s.to_str()).unwrap_or(""));
+    let full_paths = join_quoted(&|p: &Path| p.to_str().unwrap_or(""));
+    let stem = primary.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = primary.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let dir = primary.parent().and_then(|p| p.to_str()).unwrap_or("");
+
+    substitute_tokens(template, |token| match token {
+        "file" => Some(files.clone()),
+        "path" => Some(full_paths.clone()),
+        "stem" => Some(posix_quote(stem)),
+        "ext" => Some(posix_quote(ext)),
+        "dir" => Some(posix_quote(dir)),
+        _ => None,
+    })
+}
+
+/// Shared brace-scanning core for the `substitute_command*` family. Walks
+/// `template` left-to-right; for each `{token}` it calls `resolve(token)` and
+/// splices in the returned string (which the resolver has already quoted as
+/// needed). `resolve` returning `None` — an unknown token — emits the literal
+/// `{token}` untouched so the user sees their typo rather than a silent
+/// deletion. A single pass means a substituted value that itself contains
+/// `{…}` is never re-expanded; an unterminated `{` is emitted verbatim.
+fn substitute_tokens(template: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(open) = rest.find('{') {
@@ -467,18 +517,8 @@ pub fn substitute_command(template: &str, path: &Path) -> String {
         match rest[open + 1..].find('}') {
             Some(rel_close) => {
                 let token = &rest[open + 1..open + 1 + rel_close];
-                let value = match token {
-                    "file" => Some(file),
-                    "stem" => Some(stem),
-                    "ext" => Some(ext),
-                    "path" => Some(path_str),
-                    "dir" => Some(dir),
-                    _ => None,
-                };
-                match value {
-                    Some(v) => out.push_str(&posix_quote(v)),
-                    // Unknown token — emit it untouched so the user sees their
-                    // literal `{whatever}` rather than a silent deletion.
+                match resolve(token) {
+                    Some(v) => out.push_str(&v),
                     None => {
                         out.push('{');
                         out.push_str(token);
@@ -4543,5 +4583,65 @@ Host work
         );
         // An unterminated brace is emitted verbatim.
         assert_eq!(substitute_command("echo {file", p), "echo {file");
+    }
+
+    #[test]
+    fn substitute_command_multi_joins_files_space_separated() {
+        let paths = vec![
+            PathBuf::from("/p/a.txt"),
+            PathBuf::from("/p/b.txt"),
+            PathBuf::from("/p/c.txt"),
+        ];
+        assert_eq!(
+            substitute_command_multi("shasum {file}", &paths, &paths[0]),
+            "shasum 'a.txt' 'b.txt' 'c.txt'"
+        );
+    }
+
+    #[test]
+    fn substitute_command_multi_expands_path_too() {
+        let paths = vec![PathBuf::from("/p/a.txt"), PathBuf::from("/p/b.txt")];
+        assert_eq!(
+            substitute_command_multi("cat {path}", &paths, &paths[0]),
+            "cat '/p/a.txt' '/p/b.txt'"
+        );
+    }
+
+    #[test]
+    fn substitute_command_multi_single_valued_tokens_use_primary() {
+        // {stem}/{ext}/{dir} have no multi-file meaning — they resolve against
+        // the cursor (primary) file.
+        let paths = vec![PathBuf::from("/docs/a.md"), PathBuf::from("/docs/b.md")];
+        assert_eq!(
+            substitute_command_multi("pandoc -o {stem}.pdf {file}", &paths, &paths[0]),
+            "pandoc -o 'a'.pdf 'a.md' 'b.md'"
+        );
+        assert_eq!(
+            substitute_command_multi("echo {ext} {dir}", &paths, &paths[0]),
+            "echo 'md' '/docs'"
+        );
+    }
+
+    #[test]
+    fn substitute_command_multi_quotes_each_file_independently() {
+        // Spaces / metacharacters in individual names stay isolated — no
+        // injection across the join.
+        let paths = vec![
+            PathBuf::from("/p/my file.txt"),
+            PathBuf::from("/p/$(rm -rf).txt"),
+        ];
+        assert_eq!(
+            substitute_command_multi("wc -l {file}", &paths, &paths[0]),
+            "wc -l 'my file.txt' '$(rm -rf).txt'"
+        );
+    }
+
+    #[test]
+    fn substitute_command_multi_with_single_path_matches_single_variant() {
+        let p = PathBuf::from("/p/only.txt");
+        assert_eq!(
+            substitute_command_multi("tail {file}", std::slice::from_ref(&p), &p),
+            substitute_command("tail {file}", &p)
+        );
     }
 }
