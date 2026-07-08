@@ -228,6 +228,31 @@ based on state. That's why, for example, `Backspace` always emits
 characters, the subscription stays silent — that's why Delete-modal-Enter
 handling needs the explicit redirect described above.
 
+## File drag-and-drop (drop into Rho)
+
+A `dnd_listener` (`event::listen_with`) turns two raw iced events into
+messages: `Mouse(CursorMoved)` → `CursorMoved(Point)`, which just stores the
+latest cursor position on `App`, and `Window(FileDropped(path))` →
+`FileDropped(path)`.
+
+The routing problem is that iced 0.13's `FileDropped` carries **no cursor
+position** and fires **once per file with no terminal marker**. So:
+
+- **Which pane** the drop targets is derived from the last-tracked
+  `cursor_pos` via `domain::drop_target_side(cursor_x, window_width)` — left
+  half → left pane, midpoint-and-right → right pane. (This is why the cursor
+  has to be tracked continuously.)
+- **Batching** a multi-file drop is handled by a debounce: each `FileDropped`
+  pushes onto `App::dropped_files`, bumps `drop_seq`, and schedules
+  `fs_ops::drop_flush_task(drop_seq)` (a ~150 ms sleep → `FlushDrops(seq)`).
+  Only the `FlushDrops` whose `seq` still equals the current `drop_seq`
+  drains the buffer and fires one `copy_task` for the whole batch; earlier
+  ones in the burst see a stale `seq` and no-op.
+
+The destination pane must be local; a drop onto a remote pane sets
+`last_error` instead. Dragging files *out* of Rho isn't supported — iced 0.13
+exposes no drag-source API.
+
 ## Folder watching (two watchers)
 
 Both live in `fs_ops.rs` on top of the `notify` crate, each a

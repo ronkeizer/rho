@@ -217,6 +217,18 @@ impl Side {
     }
 }
 
+/// Which pane an OS file-drop lands in, given the cursor's window-space x and
+/// the window width. Left half → `Left`; the right half and the exact midpoint
+/// → `Right`. iced's `FileDropped` event carries no position, so the drop is
+/// routed by the last-tracked cursor position instead.
+pub fn drop_target_side(cursor_x: f32, window_width: f32) -> Side {
+    if cursor_x < window_width / 2.0 {
+        Side::Left
+    } else {
+        Side::Right
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortBy {
     Name,
@@ -2124,6 +2136,19 @@ pub fn add_recent(recents: &mut Vec<PathBuf>, path: PathBuf, cap: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_target_side_splits_at_midpoint() {
+        // Left half → Left.
+        assert_eq!(drop_target_side(0.0, 1000.0), Side::Left);
+        assert_eq!(drop_target_side(499.0, 1000.0), Side::Left);
+        // Midpoint and right half → Right.
+        assert_eq!(drop_target_side(500.0, 1000.0), Side::Right);
+        assert_eq!(drop_target_side(999.0, 1000.0), Side::Right);
+        // Out-of-bounds x clamps to the nearer side, no panic.
+        assert_eq!(drop_target_side(-50.0, 1000.0), Side::Left);
+        assert_eq!(drop_target_side(5000.0, 1000.0), Side::Right);
+    }
 
     #[test]
     fn sort_dir_toggle_round_trips() {

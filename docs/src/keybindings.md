@@ -50,6 +50,15 @@ selection just means "this row".
 Copy and delete operate on the **mark**, not just the cursor row. With no
 range selected, that's just the row under the cursor.
 
+## Drag & drop
+
+Drag one or more files from another application (Finder, a browser, etc.) and
+drop them onto Rho to copy them in. The target pane is the one under the
+cursor at the moment of the drop — drop on the left half of the window to copy
+into the left pane, the right half for the right pane. Remote panes can't be a
+drop target yet (the status bar says so). Dragging files *out* of Rho into
+another application isn't supported.
+
 ## Filtering
 
 Plain characters (no `⌘` / `Ctrl` / `Alt`) feed a type-to-filter regex on the

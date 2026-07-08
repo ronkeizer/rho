@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, stack, text, text_input};
-use iced::{time, window, Color, Element, Length, Padding, Size, Subscription, Task, Theme};
+use iced::{time, window, Color, Element, Length, Padding, Point, Size, Subscription, Task, Theme};
 use tokio::task::AbortHandle;
 
 mod config;
@@ -18,7 +18,7 @@ use config::{
 };
 use domain::{
     add_recent, available_palette_actions, build_file_choices, decide_ftp_action,
-    default_zip_filename, filtered_actions, filtered_apps,
+    default_zip_filename, drop_target_side, filtered_actions, filtered_apps,
     filtered_branches, filtered_processes, filtered_recents, filtered_servers, modal_scroll_target,
     sort_apps,
     sort_containers, sort_entries, sort_processes, substitute_command, Application, AppsState,
@@ -32,7 +32,7 @@ use domain::{
 };
 use fs_ops::{
     apps_task, compress_task, copy_as_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
-    docker_shell, extract_to_temp_task, file_watch_subscription, ftp_log_subscription,
+    docker_shell, drop_flush_task, extract_to_temp_task, file_watch_subscription, ftp_log_subscription,
     ftp_start_task, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, move_task, rename_task,
     open_claude_code, open_folder_in_editor, open_terminal,
@@ -132,6 +132,13 @@ pub(crate) enum Message {
     /// pane into `dest` so the user can browse the unpacked contents.
     ExtractedToTemp(PathBuf, Result<(), String>),
     Resized(Size),
+    /// Mouse moved — tracked only to know the cursor position at drop time.
+    CursorMoved(Point),
+    /// The OS dropped an external file onto the window (one message per file).
+    FileDropped(PathBuf),
+    /// Debounced flush of `dropped_files`: copy the batch into the pane under
+    /// the cursor. No-op if `seq` is stale (a later file in the burst arrived).
+    FlushDrops(u64),
     /// The watcher subscription noticed new files in `folder`.
     NewFilesDetected(PathBuf, Vec<String>),
     /// The pane-folder watcher coalesced one-or-more filesystem changes in
@@ -311,6 +318,18 @@ struct App {
     /// opposite pane's bottom half. `None` when the cursor isn't on a file
     /// matching any `quick_view` entry. See `refresh_quick_view`.
     quick_view: Option<QuickViewState>,
+    /// Last known cursor position in window coordinates. Tracked because an OS
+    /// file-drop (`window::Event::FileDropped`) carries no position, so the
+    /// drop is routed to the pane under the cursor via `drop_target_side`.
+    cursor_pos: Point,
+    /// External files dropped onto the window, accumulated across the burst of
+    /// per-file `FileDropped` events and copied together on the debounced
+    /// `FlushDrops`. See `drop_seq`.
+    dropped_files: Vec<PathBuf>,
+    /// Debounce generation for `dropped_files`; bumped on each `FileDropped`
+    /// so an earlier file's `FlushDrops` in the same burst is ignored and only
+    /// the last one copies the whole batch.
+    drop_seq: u64,
     /// Monotonic source of `QuickViewState::request_id` / the id threaded
     /// through `QuickViewDebounceFire` / `QuickViewLoaded` — lets a stale
     /// debounce fire or task completion (cursor moved on since) be dropped.
@@ -372,6 +391,9 @@ impl App {
             modal_viewport_h: None,
             modal_row_h: None,
             quick_view: None,
+            cursor_pos: Point::ORIGIN,
+            dropped_files: Vec::new(),
+            drop_seq: 0,
             quick_view_seq: 0,
         };
         // Stat the initial pane paths for the CLAUDE.md / .claude marker so
@@ -1597,6 +1619,40 @@ impl App {
                 self.record_batch_errors("Copy", &results);
                 return self.reload_both_panes();
             }
+            Message::CursorMoved(pos) => {
+                self.cursor_pos = pos;
+            }
+            Message::FileDropped(path) => {
+                self.dropped_files.push(path);
+                self.drop_seq = self.drop_seq.wrapping_add(1);
+                return drop_flush_task(self.drop_seq);
+            }
+            Message::FlushDrops(seq) => {
+                // A newer file in the same burst bumped drop_seq; its own
+                // FlushDrops will copy the whole batch. Bail out of this one.
+                if seq != self.drop_seq {
+                    return Task::none();
+                }
+                let files = std::mem::take(&mut self.dropped_files);
+                if files.is_empty() {
+                    return Task::none();
+                }
+                let side = drop_target_side(self.cursor_pos.x, self.window_size.width);
+                match self.pane(side).location.clone() {
+                    Location::Local(dir) => {
+                        let dest = Location::Local(dir);
+                        let srcs: Vec<Location> =
+                            files.into_iter().map(Location::Local).collect();
+                        self.copy_in_progress = Some((srcs.len(), dest.clone()));
+                        self.last_error = None;
+                        return copy_task(srcs, dest);
+                    }
+                    Location::Remote { .. } => {
+                        self.last_error =
+                            Some("Can't drop files onto a remote pane yet".into());
+                    }
+                }
+            }
             Message::MoveFinished(results) => {
                 self.move_in_progress = None;
                 for (src, res) in &results {
@@ -2698,9 +2754,31 @@ impl App {
 
         let resizes = window::resize_events().map(|(_, size)| Message::Resized(size));
 
+        // Drag-and-drop: track the cursor so an OS file-drop (which carries no
+        // position) can be routed to the pane under it, and turn each dropped
+        // file into a `FileDropped`. iced emits one `FileDropped` per file with
+        // no terminal marker, so the handler debounces the burst.
+        let dnd_listener =
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::CursorMoved(position))
+                }
+                iced::Event::Window(window::Event::FileDropped(path)) => {
+                    Some(Message::FileDropped(path))
+                }
+                _ => None,
+            });
+
         let settings_poll = time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
 
-        let mut subs = vec![key_press, mods_listener, esc_listener, resizes, settings_poll];
+        let mut subs = vec![
+            key_press,
+            mods_listener,
+            esc_listener,
+            resizes,
+            dnd_listener,
+            settings_poll,
+        ];
 
         // Watch folders are read once at startup (same lifecycle as window
         // size). Filter out paths that don't exist so notify::watch() doesn't

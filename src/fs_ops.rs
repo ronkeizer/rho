@@ -452,6 +452,21 @@ pub fn pane_watch_subscription(folders: Vec<PathBuf>) -> Subscription<Message> {
     )
 }
 
+/// Coalesce a burst of OS file-drop events. iced delivers one
+/// `window::Event::FileDropped` per file with no terminal marker, so each drop
+/// bumps a sequence counter and schedules this ~150 ms sleep; only the flush
+/// whose `seq` still matches the latest drop actually performs the copy (see
+/// the `FlushDrops` handler in `main`).
+pub fn drop_flush_task(seq: u64) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            seq
+        },
+        Message::FlushDrops,
+    )
+}
+
 /// Copy a batch of sources into `dst`. By construction the caller pulls
 /// `srcs` from the active pane's `marked_locations`, so every source
 /// shares the same backend (all `Local`, or all `Remote` with the same
