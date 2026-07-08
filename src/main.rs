@@ -2129,6 +2129,10 @@ impl App {
                 }
             }
             Message::FileActionToggleEdit => {
+                // Read the selection before borrowing the prompt mutably; the
+                // editable command is pre-filled with the same multi-file
+                // expansion the action would run with.
+                let sel_paths = self.pane(self.active).marked_paths();
                 if let Some(Prompt::FileActions {
                     path,
                     choices,
@@ -2141,7 +2145,11 @@ impl App {
                     } else if let Some(FileChoice::Custom { command, .. }) =
                         choices.get(*selected)
                     {
-                        *edit = Some(substitute_command(command, path));
+                        *edit = Some(if sel_paths.len() > 1 {
+                            substitute_command_multi(command, &sel_paths, path)
+                        } else {
+                            substitute_command(command, path)
+                        });
                         return text_input::focus(text_input::Id::new(PROMPT_ID));
                     }
                 }
@@ -2554,6 +2562,11 @@ impl App {
         choice: &FileChoice,
         edit: Option<String>,
     ) -> Task<Message> {
+        // With a multi-selection the action runs over every marked file:
+        // {file}/{path} expand to all of them (space-joined). The modal freezes
+        // the pane while open, so reading the selection live here matches what
+        // was selected when the chooser opened. See `substitute_command_multi`.
+        let sel_paths = self.pane(self.active).marked_paths();
         match choice {
             FileChoice::OpenDefault => {
                 if let Err(e) = open::that_detached(path) {
@@ -2570,7 +2583,13 @@ impl App {
                 // Run with the file's folder as the working directory, so bare
                 // {file}/{stem} placeholders resolve relative to it.
                 let cwd = path.parent().unwrap_or(path).to_path_buf();
-                let cmd = edit.unwrap_or_else(|| substitute_command(command, path));
+                let cmd = edit.unwrap_or_else(|| {
+                    if sel_paths.len() > 1 {
+                        substitute_command_multi(command, &sel_paths, path)
+                    } else {
+                        substitute_command(command, path)
+                    }
+                });
                 if *terminal {
                     if let Err(e) = run_file_action_in_terminal(
                         &cmd,

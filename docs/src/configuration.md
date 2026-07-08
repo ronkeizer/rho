@@ -203,6 +203,13 @@ lot of output or never exits (`tail -f`) should use `terminal: true`. On macOS
 the `terminal: true` variant honors the `terminal_app` setting; only local
 panes are supported (the action no-ops on a remote pane).
 
+With **multiple files selected** (Shift- or ⌘-click — see
+[Keybindings](./keybindings.md)), the chooser still opens against the cursor
+file, but `{file}` and `{path}` expand to *every* selected file, each
+shell-quoted and space-joined — so `command: "wc -l {file}"` runs once over
+the whole selection. `{stem}`/`{ext}`/`{dir}` stay tied to the cursor file.
+`Tab`-to-edit pre-fills the editable command with the same expansion.
+
 ```yaml
 file_actions:
   - pattern: "*.md"
