@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, stack, text, text_input};
@@ -25,11 +25,11 @@ use domain::{
     Application, AppsState,
     BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, FtpAction, FtpInfoFocus,
-    FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch, GitBranchesState,
+    double_click_hit, FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch, GitBranchesState,
     GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
     ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState, matching_quick_view,
-    QuickViewOutput, QuickViewState,
+    push_capped, QuickViewOutput, QuickViewState, StatSample,
 };
 use fs_ops::{
     apps_task, compress_task, copy_as_task, copy_task, delete_task, docker_kill_task, docker_ps_task,
@@ -38,6 +38,7 @@ use fs_ops::{
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, make_file, move_task, rename_task,
     open_claude_code, open_folder_in_editor, open_terminal,
     pane_watch_subscription, ps_task, quick_view_task, run_file_action_in_terminal, run_file_action_task,
+    sample_stats_task,
     ssh_connect, ssh_servers_task, uncompress_task,
 };
 #[cfg(target_os = "macos")]
@@ -173,6 +174,11 @@ pub(crate) enum Message {
     ProcessKill(u32),
     /// `kill <pid>` completed.
     ProcessKillFinished(u32, Result<(), String>),
+    /// Background-sampler tick (from the always-on `stats_interval_secs`
+    /// subscription) — kick off one CPU/memory reading.
+    SampleStats,
+    /// A CPU/memory reading completed — append it to `stats_history`.
+    SystemStatsSampled(StatSample),
     /// User clicked a Docker column header — toggle / switch the sort.
     DockerToggleSort(DockerSortBy),
     /// User clicked a Processes column header — toggle / switch the sort.
@@ -261,6 +267,8 @@ const FTP_LOG_BUFFER_CAP: usize = 200;
 /// command/read actually firing — holding an arrow key must not spawn a
 /// subprocess per row scrolled past.
 const QUICK_VIEW_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Max gap between two clicks on the same row to count as a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl Drop for FtpRuntime {
     fn drop(&mut self) {
@@ -280,6 +288,10 @@ struct App {
     /// row in/out of the selection (Cmd+click) instead of moving the cursor.
     /// Tracked via the raw `ModifiersChanged` event, same as `shift_held`.
     cmd_held: bool,
+    /// (side, row, time) of the last `RowClicked`. A second click on the same
+    /// row within `DOUBLE_CLICK` counts as a double-click and activates the row
+    /// (folder → enter, file → file-actions modal), same as pressing Enter.
+    last_click: Option<(Side, usize, Instant)>,
     window_size: Size,
     settings_mtime: Option<SystemTime>,
     /// (count, dest) while a copy task is in flight.
@@ -342,7 +354,17 @@ struct App {
     /// through `QuickViewDebounceFire` / `QuickViewLoaded` — lets a stale
     /// debounce fire or task completion (cursor moved on since) be dropped.
     quick_view_seq: u64,
+    /// Rolling CPU/memory samples for the System monitor graph, oldest-first.
+    /// Fed by the always-on background sampler (`SampleStats` tick →
+    /// `sample_stats_task`), bounded to [`STATS_HISTORY_CAP`] via
+    /// [`push_capped`]. Lives on `App` (not the modal) so the graph is
+    /// already populated when the modal opens.
+    stats_history: std::collections::VecDeque<StatSample>,
 }
+
+/// How many CPU/memory samples the System monitor keeps. At the default 2s
+/// cadence this is ~6 minutes of history.
+const STATS_HISTORY_CAP: usize = 180;
 
 impl App {
     fn new(config: Config) -> (Self, Task<Message>) {
@@ -383,6 +405,7 @@ impl App {
             prompt: None,
             shift_held: false,
             cmd_held: false,
+            last_click: None,
             window_size,
             settings_mtime,
             copy_in_progress: None,
@@ -404,6 +427,7 @@ impl App {
             dropped_files: Vec::new(),
             drop_seq: 0,
             quick_view_seq: 0,
+            stats_history: std::collections::VecDeque::new(),
         };
         // Stat the initial pane paths for the CLAUDE.md / .claude marker so
         // the info bar shows on startup, not just after the first navigate.
@@ -742,6 +766,58 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// Open whatever the active pane's cursor is on: `..`/folder → navigate,
+    /// zip → extract (or confirm if large), any other file → file-actions modal.
+    /// Shared by the Enter key (`ActivateSelection`) and mouse double-click.
+    fn activate_selection(&mut self) -> Task<Message> {
+        let side = self.active;
+        if self.pane(side).selected == 0 {
+            if let Some(parent) = self.pane(side).location.parent() {
+                return self.navigate(side, parent);
+            }
+            return Task::none();
+        }
+        let pane = self.pane(side);
+        if let Some(entry) = pane.entry_at(pane.selected) {
+            if entry.is_dir {
+                return self.navigate(side, pane.location.join(&entry.name));
+            }
+            // Files: every action below (zip extract, open in
+            // default app) is local-only. Phase 2 lists remote
+            // panes but can't yet pull a remote file down to
+            // open it — bail quietly.
+            if !pane.location.is_local() {
+                return Task::none();
+            }
+            let path = pane.path().join(&entry.name);
+            if is_zip(&path) {
+                let size = entry.size.unwrap_or(0);
+                if size > LARGE_ARCHIVE_THRESHOLD {
+                    self.prompt = Some(Prompt::ConfirmLargeExtract {
+                        archive_path: path,
+                        size_bytes: size,
+                        focus: DeleteFocus::Cancel,
+                    });
+                    return Task::none();
+                }
+                self.last_error = None;
+                self.extract_in_progress = Some(path.clone());
+                return extract_to_temp_task(path);
+            }
+            // Every other file opens the chooser modal: the default-open
+            // option plus any configured file_actions matching the name.
+            let choices = build_file_choices(&self.config.file_actions, &entry.name);
+            self.reset_modal_scroll();
+            self.prompt = Some(Prompt::FileActions {
+                path,
+                choices,
+                selected: 0,
+                edit: None,
+            });
+        }
+        Task::none()
+    }
+
     fn update(&mut self, msg: Message) -> Task<Message> {
         // Modals without a text_input let navigation keys fall through to
         // top-level messages. Rewrite them to focus-aware actions so the user
@@ -889,6 +965,14 @@ impl App {
             Message::RowClicked(side, row_index) => {
                 let active_changed = self.active != side;
                 self.active = side;
+                // A second plain click on the same row within DOUBLE_CLICK is a
+                // double-click → activate (same as Enter). ⌘/⇧ clicks are
+                // multi-select gestures, never a double-click.
+                let now = Instant::now();
+                let double = !self.cmd_held
+                    && !self.shift_held
+                    && double_click_hit(self.last_click, side, row_index, now, DOUBLE_CLICK);
+                self.last_click = Some((side, row_index, now));
                 if self.cmd_held {
                     // ⌘+click toggles this row in/out of the selection without
                     // disturbing the others (non-contiguous multi-select).
@@ -899,6 +983,10 @@ impl App {
                 }
                 if active_changed {
                     self.save_state();
+                }
+                if double {
+                    self.last_click = None;
+                    return self.activate_selection();
                 }
                 return self.ensure_active_visible();
             }
@@ -956,51 +1044,7 @@ impl App {
                 return self.ensure_active_visible();
             }
             Message::ActivateSelection => {
-                let side = self.active;
-                if self.pane(side).selected == 0 {
-                    if let Some(parent) = self.pane(side).location.parent() {
-                        return self.navigate(side, parent);
-                    }
-                    return Task::none();
-                }
-                let pane = self.pane(side);
-                if let Some(entry) = pane.entry_at(pane.selected) {
-                    if entry.is_dir {
-                        return self.navigate(side, pane.location.join(&entry.name));
-                    }
-                    // Files: every action below (zip extract, open in
-                    // default app) is local-only. Phase 2 lists remote
-                    // panes but can't yet pull a remote file down to
-                    // open it — bail quietly.
-                    if !pane.location.is_local() {
-                        return Task::none();
-                    }
-                    let path = pane.path().join(&entry.name);
-                    if is_zip(&path) {
-                        let size = entry.size.unwrap_or(0);
-                        if size > LARGE_ARCHIVE_THRESHOLD {
-                            self.prompt = Some(Prompt::ConfirmLargeExtract {
-                                archive_path: path,
-                                size_bytes: size,
-                                focus: DeleteFocus::Cancel,
-                            });
-                            return Task::none();
-                        }
-                        self.last_error = None;
-                        self.extract_in_progress = Some(path.clone());
-                        return extract_to_temp_task(path);
-                    }
-                    // Every other file opens the chooser modal: the default-open
-                    // option plus any configured file_actions matching the name.
-                    let choices = build_file_choices(&self.config.file_actions, &entry.name);
-                    self.reset_modal_scroll();
-                    self.prompt = Some(Prompt::FileActions {
-                        path,
-                        choices,
-                        selected: 0,
-                        edit: None,
-                    });
-                }
+                return self.activate_selection();
             }
             Message::ToggleSort(side, by) => {
                 self.active = side;
@@ -1184,7 +1228,8 @@ impl App {
                         | Prompt::NewFiles { .. }
                         | Prompt::FtpInfo { .. }
                         | Prompt::FtpReplace { .. }
-                        | Prompt::KeyboardShortcuts => {}
+                        | Prompt::KeyboardShortcuts
+                        | Prompt::SystemMonitor => {}
                     }
                     // Filtering shifts which row the (clamped) cursor points at,
                     // so re-follow it — e.g. typing to a single match should
@@ -1488,6 +1533,12 @@ impl App {
                         // prompt back so the modal doesn't close.
                         Prompt::KeyboardShortcuts => {
                             self.prompt = Some(Prompt::KeyboardShortcuts);
+                            None
+                        }
+                        // System monitor has no submit action — Enter is a
+                        // no-op; the modal stays open until Esc.
+                        Prompt::SystemMonitor => {
+                            self.prompt = Some(Prompt::SystemMonitor);
                             None
                         }
                         // SshServers: Enter connects to the highlighted row.
@@ -2005,6 +2056,12 @@ impl App {
                     return ps_task();
                 }
             }
+            Message::SampleStats => {
+                return sample_stats_task();
+            }
+            Message::SystemStatsSampled(sample) => {
+                push_capped(&mut self.stats_history, sample, STATS_HISTORY_CAP);
+            }
             Message::DockerToggleSort(column) => {
                 if let Some(Prompt::Docker {
                     state,
@@ -2360,6 +2417,13 @@ impl App {
                     ps_task(),
                     text_input::focus(text_input::Id::new(PROMPT_ID)),
                 ])
+            }
+            PaletteAction::SystemMonitor => {
+                self.prompt = Some(Prompt::SystemMonitor);
+                // History is already populated by the background sampler; kick
+                // one immediate reading so a freshly-opened modal shows the
+                // latest values without waiting a full interval.
+                sample_stats_task()
             }
             PaletteAction::LaunchApplication => {
                 self.reset_modal_scroll();
@@ -2743,7 +2807,11 @@ impl App {
                 (Prompt::FtpInfo { .. }, Some(rt)) => &rt.log,
                 _ => empty,
             };
-            stack![base, view_modal(prompt, colors, ftp_log)].into()
+            stack![
+                base,
+                view_modal(prompt, colors, ftp_log, &self.stats_history, self.config.stats_interval_secs)
+            ]
+            .into()
         } else {
             base
         }
@@ -2853,6 +2921,14 @@ impl App {
 
         let settings_poll = time::every(Duration::from_secs(1)).map(|_| Message::CheckSettings);
 
+        // Always-on system sampler — runs from startup (not just while the
+        // modal is open) so the graph is pre-filled. Clamp to ≥1s so a
+        // mis-set `stats_interval_secs: 0` can't busy-poll.
+        let stats_poll = time::every(Duration::from_secs(
+            self.config.stats_interval_secs.max(1),
+        ))
+        .map(|_| Message::SampleStats);
+
         let mut subs = vec![
             key_press,
             mods_listener,
@@ -2860,6 +2936,7 @@ impl App {
             resizes,
             dnd_listener,
             settings_poll,
+            stats_poll,
         ];
 
         // Watch folders are read once at startup (same lifecycle as window

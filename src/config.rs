@@ -71,6 +71,17 @@ pub struct Config {
     /// here.
     #[serde(default)]
     pub ftp: FtpConfig,
+    /// Interval (seconds) between background CPU/memory samples feeding the
+    /// System monitor modal. The sampler runs from app start so the graph is
+    /// pre-filled on open. Hot-reloaded via the settings subscription.
+    #[serde(default = "default_stats_interval_secs")]
+    pub stats_interval_secs: u64,
+}
+
+/// Default sampling cadence for the System monitor. 2s balances a responsive
+/// graph against the cost of an always-on `sysinfo` refresh.
+fn default_stats_interval_secs() -> u64 {
+    2
 }
 
 impl Default for Config {
@@ -86,6 +97,7 @@ impl Default for Config {
             folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
             dropbox: DropboxConfig::default(),
             ftp: FtpConfig::default(),
+            stats_interval_secs: default_stats_interval_secs(),
         }
     }
 }
@@ -612,7 +624,12 @@ fn default_template_yaml() -> &'static str {
      #   # Hostname / IPv4 the server advertises in PASV responses. Unset\n\
      #   # means \"echo whichever interface the client connected to\" —\n\
      #   # set this when you're behind NAT or on a multi-homed box.\n\
-     #   passive_host: \"192.168.1.42\"\n"
+     #   passive_host: \"192.168.1.42\"\n\
+     # System monitor (Command Palette → \"System monitor\"). Seconds between\n\
+     # background CPU/memory samples. The sampler runs from app start so the\n\
+     # graph is already populated when you open the modal. Lower = smoother\n\
+     # graph but more frequent polling. Hot-reloaded.\n\
+     # stats_interval_secs: 2\n"
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -728,6 +745,19 @@ mod tests {
     #[test]
     fn parse_hex_color_rejects_empty() {
         assert!(parse_hex_color("").is_none());
+    }
+
+    #[test]
+    fn default_stats_interval_is_two_secs() {
+        assert_eq!(Config::default().stats_interval_secs, 2);
+    }
+
+    #[test]
+    fn missing_stats_interval_falls_back_to_default() {
+        // A config with no `stats_interval_secs:` key should deserialize to
+        // the 2s default rather than 0 (which would busy-poll).
+        let cfg: Config = serde_yaml::from_str("watch_folders: []\n").unwrap();
+        assert_eq!(cfg.stats_interval_secs, 2);
     }
 
     #[test]

@@ -70,6 +70,9 @@ A filterable list of one-shot actions:
   Kill and Shell buttons, sortable columns, filter.
 - Processes — `ps -axo …` output, per-row Kill (SIGTERM), sortable
   by Name / PID / CPU / MEM, filter.
+- System monitor — live CPU and memory graph. A background sampler runs
+  from app start (every `stats_interval_secs`, default 2s), so the
+  sparklines are already populated when the modal opens.
 - Launch Application (macOS) — lists `.app` bundles under
   `/Applications`, `/Applications/Utilities`, and `~/Applications`;
   Enter or click to `open` the bundle.

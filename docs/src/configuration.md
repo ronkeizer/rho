@@ -44,6 +44,7 @@ its default.
 | `dropbox.app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
 | `dropbox.refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox.app_key` to unlock the **Open Dropbox** command. |
 | `ftp` | section | _(defaults)_ | Settings for the in-app FTP server (Command Palette → **FTP server**). See [FTP server](#ftp-server) below. An absent section applies the defaults; a partial section fills in missing fields per field. |
+| `stats_interval_secs` | int | `2` | Seconds between background CPU/memory samples feeding the **System monitor** modal. The sampler runs from app start (not just while the modal is open) so the graph is pre-filled. Clamped to a 1s minimum. Hot-reloaded. |
 
 ## Colors
 

@@ -12,13 +12,13 @@ use iced::{Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector}
 use crate::config::{blend, dim, RowColors};
 use crate::config::FtpPerms;
 use crate::domain::{
-    filtered_actions, filtered_apps, filtered_branches, filtered_containers, filtered_processes,
-    filtered_recents, filtered_servers, format_log_timestamp, keyboard_shortcuts,
-    palette_action_enabled, AppsState,
+    bar_glyph, filtered_actions, filtered_apps, filtered_branches, filtered_containers,
+    filtered_processes, filtered_recents, filtered_servers, format_log_timestamp,
+    keyboard_shortcuts, palette_action_enabled, AppsState,
     DeleteFocus, DockerSortBy,
     DockerState, FileChoice, FtpInfoFocus, FtpLogEntry, FtpLogLevel, FtpReplaceFocus,
     FtpServerInfo, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
-    Prompt, Side, SortDir, SshServersState,
+    Prompt, Side, SortDir, SshServersState, StatSample,
 };
 use crate::view_pane::format_size;
 use crate::{Message, MODAL_LIST_ID, PROMPT_ID};
@@ -27,6 +27,8 @@ pub fn view_modal<'a>(
     prompt: &'a Prompt,
     colors: RowColors,
     ftp_log: &'a std::collections::VecDeque<FtpLogEntry>,
+    stats: &'a std::collections::VecDeque<StatSample>,
+    stats_interval: u64,
 ) -> Element<'a, Message> {
     // Docker / Processes / Apps / GitBranches are wider so the list rows
     // have room. KeyboardShortcuts is two-column text — wider than the
@@ -37,7 +39,8 @@ pub fn view_modal<'a>(
         | Prompt::Processes { .. }
         | Prompt::Apps { .. }
         | Prompt::GitBranches { .. }
-        | Prompt::SshServers { .. } => 720.0,
+        | Prompt::SshServers { .. }
+        | Prompt::SystemMonitor => 720.0,
         Prompt::KeyboardShortcuts => 600.0,
         Prompt::FtpInfo { .. } => 640.0,
         Prompt::FileActions { .. } => 520.0,
@@ -1163,6 +1166,72 @@ pub fn view_modal<'a>(
                 text("Esc dismisses").size(11),
             ]
             .spacing(8)
+        }
+        Prompt::SystemMonitor => {
+            // Two unicode-block sparklines (CPU on top, memory below) fed by
+            // the always-on background sampler. Only the tail that fits the
+            // modal width is drawn; the numeric current/peak read-outs above
+            // each line cover the exact values.
+            const MAX_BARS: usize = 64;
+            const CPU_COLOR: Color = Color::from_rgb(0.40, 0.80, 0.45);
+            const MEM_COLOR: Color = Color::from_rgb(0.42, 0.62, 1.0);
+
+            let cadence = stats_interval.max(1);
+
+            let sparkline = |pick: fn(&StatSample) -> f32| -> String {
+                let n = stats.len();
+                let start = n.saturating_sub(MAX_BARS);
+                stats.iter().skip(start).map(|s| bar_glyph(pick(s))).collect()
+            };
+            let peak = |pick: fn(&StatSample) -> f32| -> f32 {
+                stats.iter().map(pick).fold(0.0_f32, f32::max)
+            };
+            let cur = |pick: fn(&StatSample) -> f32| -> f32 {
+                stats.back().map(pick).unwrap_or(0.0)
+            };
+
+            let metric = |label: &str,
+                          color: Color,
+                          pick: fn(&StatSample) -> f32|
+             -> Element<'a, Message> {
+                let header = text(format!(
+                    "{}   {:>5.1}%   (peak {:>5.1}%)",
+                    label,
+                    cur(pick),
+                    peak(pick)
+                ))
+                .font(Font::MONOSPACE)
+                .size(12);
+                let line = text(sparkline(pick))
+                    .font(Font::MONOSPACE)
+                    .size(15)
+                    .color(color)
+                    .width(Length::Fill);
+                column![header, line].spacing(4).into()
+            };
+
+            let graphs: Element<'a, Message> = if stats.is_empty() {
+                text("Collecting samples…").size(12).into()
+            } else {
+                column![
+                    metric("CPU", CPU_COLOR, |s| s.cpu),
+                    metric("Memory", MEM_COLOR, |s| s.mem),
+                ]
+                .spacing(14)
+                .into()
+            };
+
+            column![
+                text("System monitor").size(15),
+                graphs,
+                text(format!(
+                    "sampling every {}s · {} samples · Esc to close",
+                    cadence,
+                    stats.len()
+                ))
+                .size(11),
+            ]
+            .spacing(12)
         }
         Prompt::FileActions {
             path,

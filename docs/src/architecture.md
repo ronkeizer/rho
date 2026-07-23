@@ -388,8 +388,11 @@ Two subprocess interactions, both in `fs_ops.rs`:
   **last** because Mac-style command names (`Google Chrome Helper
   (Renderer)`) can contain spaces. The parser in `domain.rs`
   (`parse_ps_output`) splits the first three tokens on whitespace and
-  keeps everything after the third boundary as the name. Results are
-  sorted by CPU descending before they're handed back to the App.
+  keeps everything after the third boundary as the name, then reduces it to
+  the bare executable via `process_basename` — on macOS `comm` is the full
+  path (`/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`), so
+  only the leaf after the last `/` is shown. Results are sorted by CPU
+  descending before they're handed back to the App.
 - `kill_process_task` runs `kill <pid>` (SIGTERM, deliberately polite).
   On completion the App re-issues `ps_task` so the killed process
   disappears.
@@ -401,6 +404,35 @@ Arrow keys are redirected to `PromptMove` (like the other navigable
 modals) so they move the highlight, and `selected` is clamped back into
 range by `PromptChanged` (filtering) and `ProcessesListLoaded` (the
 post-kill reload) so it never points past the end of the list.
+
+## System monitor
+
+The "System monitor" palette action opens `Prompt::SystemMonitor`, a live
+CPU/memory graph. Unlike every other modal it carries **no state of its
+own** — the sample history lives on `App::stats_history` (a
+`VecDeque<StatSample>`), so the graph is already populated the moment the
+modal opens and keeps updating while it's open.
+
+The sampler is **always on**, independent of the modal. `subscription()`
+adds a second `time::every` tick (alongside the settings poll) at
+`config.stats_interval_secs` (clamped to ≥1s) that emits `SampleStats`.
+That kicks `fs_ops::sample_stats_task`, which reads a system-wide CPU/memory
+snapshot via the `sysinfo` crate on a `spawn_blocking` thread — `sysinfo`
+needs two CPU refreshes spaced by `MINIMUM_CPU_UPDATE_INTERVAL` to compute a
+usage delta, and `global_cpu_usage()` is already averaged across all logical
+cores so it stays in `0..=100`. The resulting `SystemStatsSampled(StatSample)`
+appends to the history via `domain::push_capped`, bounded to
+`STATS_HISTORY_CAP` (180 samples ≈ 6 minutes at the default cadence).
+
+`sysinfo` is the codebase's **first native system dependency** — everything
+else (git, docker, ps) shells out. It's used here because there's no portable
+shell command for an accurate averaged CPU-usage delta.
+
+The view (`view_modal`) renders two unicode-block sparklines
+(`domain::bar_glyph` maps `0..=100` → `▁`…`█`, clamping out-of-band values)
+plus numeric current/peak read-outs. The modal has no `text_input`, so `Enter`
+(`ActivateSelection`) is swallowed by the modal-open suppression guard and
+`Esc` (`PromptCancel`) closes it.
 
 ## File actions
 

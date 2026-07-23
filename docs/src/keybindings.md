@@ -2,7 +2,8 @@
 
 The keyboard is the primary input device. Mouse clicks work for activating
 panes, selecting rows, sorting columns, and dismissing modals, but every
-action also has a key.
+action also has a key. A double-click activates a row (folder → enter,
+file → file-action chooser), the mouse equivalent of `Enter`.
 
 `⌘` is the Command modifier on macOS; on Linux and Windows that's the same
 key the OS treats as the "logo" / Super key. The app reads it through iced's
@@ -35,6 +36,7 @@ With nothing else selected, the mark is just the cursor row.
 | `⌘⇧↑ / ⌘⇧↓` | Extend the range to the top / bottom of the list |
 | `Shift + PageUp/PageDown` | Extend the range by a page |
 | Click | Select just the clicked row (clears any prior selection) |
+| Double-click | Activate the row — same as `Enter`: a folder is entered, a file opens the file-action chooser (a `.zip` extracts). Only a plain double-click counts; `⌘`/`Shift` clicks are selection gestures. |
 | `Shift + Click` | Extend the contiguous range from the anchor |
 | `⌘ + Click` | Toggle the clicked row in/out of the selection, leaving the rest untouched |
 

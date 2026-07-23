@@ -641,6 +641,11 @@ pub enum Prompt {
         sort_dir: SortDir,
         selected: usize,
     },
+    /// "System monitor" — a live CPU/memory graph. Carries no state of its
+    /// own: the sample history lives on `App` (populated by the always-on
+    /// background sampler), so the graph is already filled when the modal
+    /// opens and keeps updating as new samples arrive.
+    SystemMonitor,
     /// "Launch Application" action (macOS only). Lists `.app` bundles under
     /// `/Applications` (+ Utilities + `~/Applications`). `selected` is the
     /// keyboard-navigable highlight, used by ↑/↓ + Enter to launch.
@@ -892,6 +897,10 @@ pub enum PaletteAction {
     Uncompress,
     DockerContainers,
     Processes,
+    /// "System monitor" — opens [`Prompt::SystemMonitor`], a live CPU/memory
+    /// graph fed by the always-on background sampler. Listed on every platform
+    /// (`sysinfo` is cross-platform).
+    SystemMonitor,
     /// Always present as a variant so `match` arms stay exhaustive without
     /// `cfg` noise, but only listed in [`PaletteAction::ALL`] on macOS — on
     /// other platforms the palette never offers it.
@@ -938,6 +947,7 @@ impl PaletteAction {
         PaletteAction::Uncompress,
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
+        PaletteAction::SystemMonitor,
         PaletteAction::LaunchApplication,
         PaletteAction::GitBranch,
         PaletteAction::SshConnect,
@@ -961,6 +971,7 @@ impl PaletteAction {
         PaletteAction::Uncompress,
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
+        PaletteAction::SystemMonitor,
         PaletteAction::GitBranch,
         PaletteAction::SshConnect,
         PaletteAction::OpenDropbox,
@@ -982,6 +993,7 @@ impl PaletteAction {
             PaletteAction::Uncompress => "Uncompress",
             PaletteAction::DockerContainers => "Docker containers",
             PaletteAction::Processes => "Processes",
+            PaletteAction::SystemMonitor => "System monitor",
             PaletteAction::LaunchApplication => "Launch Application",
             PaletteAction::GitBranch => "Git: branch",
             PaletteAction::SshConnect => "Connect to SSH server",
@@ -1241,6 +1253,44 @@ pub enum ProcessesState {
     Error(String),
 }
 
+/// One system-wide CPU/memory reading, taken by the background sampler
+/// (`fs_ops::sample_stats_task`). Both are percentages in `0..=100`
+/// (`cpu` is the load averaged across all logical cores). `Copy` so the
+/// ring buffer and view can pass it around cheaply.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StatSample {
+    pub cpu: f32,
+    pub mem: f32,
+}
+
+/// Append `sample` to a bounded history, evicting the oldest reading once
+/// `cap` is reached. The choke point for growing `App::stats_history` so the
+/// buffer never grows without bound. A `cap` of 0 keeps the history empty.
+pub fn push_capped(history: &mut VecDeque<StatSample>, sample: StatSample, cap: usize) {
+    if cap == 0 {
+        history.clear();
+        return;
+    }
+    history.push_back(sample);
+    while history.len() > cap {
+        history.pop_front();
+    }
+}
+
+/// Vertical block glyphs used to render the CPU/memory sparklines, from
+/// shortest to tallest. Index 0 is the baseline (`▁`), index 7 is full (`█`).
+pub const BAR_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Map a `0..=100` percentage to one of [`BAR_GLYPHS`]. Values outside the
+/// range are clamped, so an out-of-band reading (float jitter, or a future
+/// switch to per-core summing) renders as full/empty rather than panicking on
+/// an out-of-bounds index.
+pub fn bar_glyph(pct: f32) -> char {
+    let p = pct.clamp(0.0, 100.0);
+    let idx = ((p / 100.0) * (BAR_GLYPHS.len() as f32 - 1.0)).round() as usize;
+    BAR_GLYPHS[idx.min(BAR_GLYPHS.len() - 1)]
+}
+
 /// macOS `.app` bundle discovered under one of the application directories.
 /// `icon` is reserved for a future change — v1 leaves it `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1378,6 +1428,29 @@ pub fn parse_docker_ps(stdout: &str) -> Vec<DockerContainer> {
         .collect()
 }
 
+/// Reduce a `ps` `comm` value to the bare executable name. On macOS `comm`
+/// is the full path (`/Applications/Google Chrome.app/Contents/MacOS/Google
+/// Chrome`), so we keep only the part after the last `/`. Names may contain
+/// spaces, so we split on `/` — never whitespace. A value with no `/` (kernel
+/// threads like `kernel_task`) is returned unchanged.
+pub fn process_basename(comm: &str) -> String {
+    comm.rsplit('/').next().unwrap_or(comm).trim().to_string()
+}
+
+/// Decide whether the current click continues a double-click of the previous
+/// one. `last` is the prior click's `(side, row, time)`; a hit requires the
+/// same pane and row and a gap no larger than `within`. Gesture modifiers
+/// (⌘/⇧) are the caller's concern — this is only the same-target timing test.
+pub fn double_click_hit(
+    last: Option<(Side, usize, std::time::Instant)>,
+    side: Side,
+    row: usize,
+    now: std::time::Instant,
+    within: std::time::Duration,
+) -> bool {
+    last.is_some_and(|(s, r, t)| s == side && r == row && now.duration_since(t) <= within)
+}
+
 /// Parse output of `ps -axo pid=,pcpu=,pmem=,comm=`. The command name is the
 /// last column so anything past the third whitespace block is treated as
 /// the name, even if it contains spaces (Mac process names sometimes do).
@@ -1395,7 +1468,7 @@ pub fn parse_ps_output(stdout: &str) -> Vec<Process> {
             let pid: u32 = pid_str.parse().ok()?;
             let cpu_percent: f32 = cpu_str.parse().ok()?;
             let mem_percent: f32 = mem_str.parse().ok()?;
-            let name = name.trim().to_string();
+            let name = process_basename(name.trim());
             if name.is_empty() {
                 return None;
             }
@@ -3593,6 +3666,48 @@ this is not an ls line
     }
 
     #[test]
+    fn parse_ps_output_strips_path_to_basename() {
+        // macOS `comm` is the full executable path — the modal should show
+        // just the leaf, spaces and all.
+        let stdout =
+            "  100 1.0 2.0 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n";
+        let out = parse_ps_output(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "Google Chrome");
+    }
+
+    #[test]
+    fn process_basename_leaves_bare_names_untouched() {
+        assert_eq!(process_basename("kernel_task"), "kernel_task");
+        assert_eq!(process_basename("/usr/sbin/cfprefsd"), "cfprefsd");
+        assert_eq!(process_basename("/bin/bash"), "bash");
+    }
+
+    #[test]
+    fn double_click_hit_same_row_within_window() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_millis(200);
+        let within = std::time::Duration::from_millis(400);
+        assert!(double_click_hit(Some((Side::Left, 3, t0)), Side::Left, 3, now, within));
+    }
+
+    #[test]
+    fn double_click_hit_rejects_other_row_side_or_stale() {
+        let t0 = std::time::Instant::now();
+        let within = std::time::Duration::from_millis(400);
+        let soon = t0 + std::time::Duration::from_millis(100);
+        // Different row.
+        assert!(!double_click_hit(Some((Side::Left, 3, t0)), Side::Left, 4, soon, within));
+        // Different pane.
+        assert!(!double_click_hit(Some((Side::Left, 3, t0)), Side::Right, 3, soon, within));
+        // Too slow.
+        let late = t0 + std::time::Duration::from_millis(500);
+        assert!(!double_click_hit(Some((Side::Left, 3, t0)), Side::Left, 3, late, within));
+        // No prior click.
+        assert!(!double_click_hit(None, Side::Left, 3, soon, within));
+    }
+
+    #[test]
     fn parse_ps_output_skips_malformed_lines() {
         let stdout = "garbage\n  100 1.0 2.0 valid\nnotanint x x x\n";
         let out = parse_ps_output(stdout);
@@ -3946,6 +4061,50 @@ this is not an ls line
         assert!(available_palette_actions(false).contains(&PaletteAction::OpenTerminal));
         assert!(available_palette_actions(true).contains(&PaletteAction::OpenTerminal));
         assert_eq!(PaletteAction::OpenTerminal.label(), "Open Terminal in this folder");
+    }
+
+    #[test]
+    fn available_palette_actions_always_lists_system_monitor() {
+        assert!(available_palette_actions(false).contains(&PaletteAction::SystemMonitor));
+        assert!(available_palette_actions(true).contains(&PaletteAction::SystemMonitor));
+        assert_eq!(PaletteAction::SystemMonitor.label(), "System monitor");
+    }
+
+    #[test]
+    fn push_capped_evicts_oldest_past_cap() {
+        let mut h = VecDeque::new();
+        for i in 0..5 {
+            push_capped(&mut h, StatSample { cpu: i as f32, mem: 0.0 }, 3);
+        }
+        assert_eq!(h.len(), 3);
+        // Oldest (0.0, 1.0) evicted; newest three remain in order.
+        let cpus: Vec<f32> = h.iter().map(|s| s.cpu).collect();
+        assert_eq!(cpus, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn push_capped_zero_cap_stays_empty() {
+        let mut h = VecDeque::new();
+        push_capped(&mut h, StatSample { cpu: 50.0, mem: 50.0 }, 0);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn bar_glyph_maps_range_ends() {
+        assert_eq!(bar_glyph(0.0), '▁');
+        assert_eq!(bar_glyph(100.0), '█');
+    }
+
+    #[test]
+    fn bar_glyph_clamps_out_of_band() {
+        assert_eq!(bar_glyph(-10.0), '▁');
+        assert_eq!(bar_glyph(150.0), '█');
+    }
+
+    #[test]
+    fn bar_glyph_mid_is_middle_block() {
+        // ~50% lands in the middle of the 8-glyph ramp.
+        assert_eq!(bar_glyph(50.0), '▅');
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::domain::{
     parse_dropbox_token, parse_git_branches, parse_ls_la, parse_ps_output, parse_ssh_config,
     posix_quote, Application, ArchiveFormat,
     BackendId, DockerContainer, Entry, FtpLogEntry, FtpLogLevel, FtpServerInfo, GitBranch,
-    GitInfo, Location, Process, Side, SshServer,
+    GitInfo, Location, Process, Side, SshServer, StatSample,
 };
 use crate::Message;
 
@@ -2057,6 +2057,45 @@ fn run_ps() -> Result<Vec<Process>, String> {
 #[cfg(not(unix))]
 fn run_ps() -> Result<Vec<Process>, String> {
     Err("Process listing isn't supported on this platform yet (needs tasklist/WMIC plumbing).".to_string())
+}
+
+/// Take one system-wide CPU/memory sample for the System monitor graph.
+///
+/// `sysinfo` needs two CPU refreshes spaced by at least
+/// [`sysinfo::MINIMUM_CPU_UPDATE_INTERVAL`] to compute a usage delta, so the
+/// work runs on a `spawn_blocking` thread (the short sleep must not park the
+/// async runtime). `global_cpu_usage()` is already averaged across all logical
+/// cores, so it stays in `0..=100` — no per-core normalization needed.
+pub fn sample_stats_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(sample_stats)
+                .await
+                .unwrap_or(StatSample { cpu: 0.0, mem: 0.0 })
+        },
+        Message::SystemStatsSampled,
+    )
+}
+
+fn sample_stats() -> StatSample {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    // First reading primes the per-core baseline; the delta is only meaningful
+    // after a second refresh a short interval later.
+    sys.refresh_cpu_usage();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+
+    let cpu = sys.global_cpu_usage();
+    let total = sys.total_memory();
+    let mem = if total == 0 {
+        0.0
+    } else {
+        (sys.used_memory() as f64 / total as f64 * 100.0) as f32
+    };
+    StatSample { cpu, mem }
 }
 
 /// Send SIGTERM (`kill <pid>`) to the given process. Unix-only.
