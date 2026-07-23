@@ -49,6 +49,7 @@ With nothing else selected, the mark is just the cursor row.
 | `F5` | Open the copy modal (destination defaults to the other pane's directory; with a single item selected, type a new not-yet-existing name to copy it under that name) |
 | `F6` | Open the move modal (destination defaults to the other pane's directory; with a single item selected, type a new not-yet-existing name to rename it) |
 | `F7` | Open the new-folder modal — type a name to create a directory in the active pane (local panes only) |
+| `⌘⇧N` | Open the new-file modal (pre-filled with `file.txt`) — same as the `New file` palette action |
 | `F10` | Quit the app immediately. Works even with a modal open — no confirmation. |
 | `F8` / `Delete` | Open the delete-confirm modal for the current mark |
 
@@ -94,7 +95,7 @@ Directories always cluster before files regardless of sort column.
 | Key | Action |
 |---|---|
 | `⌘P` | "Go to folder" prompt — blank text input over a filterable list of [recent locations](./session-state.md). Type to filter, ↑/↓ to pick a recent, Enter to open. Typing a fresh path and pressing Enter opens it even if it isn't in recents (typed path wins when it's a real directory). |
-| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / FTP server / Open folder in Finder (macOS) / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
+| `⌘⇧P` | Command palette — text input over a filterable list of actions (Copy / Move / Delete / Copy name to clipboard / Copy full path to clipboard / Compress / Uncompress / Docker containers / Processes / Launch Application (macOS) / Git: branch (when in a repo) / Connect to SSH server / Open Dropbox (greyed out until configured) / Open Claude Code in this folder / Open Terminal in this folder / Open folder in editor / FTP server / Open folder in Finder (macOS) / Keyboard shortcuts / Exit). Same controls as `⌘P`. |
 | `⌘,` | Open `~/.rho.yaml` in the OS default editor (creates the file if missing) |
 | `Esc` | Cancel the current modal, or clear the filter if no modal is open |
 
@@ -105,7 +106,7 @@ Inside a modal, the navigation keys behave differently:
 | Open / Command palette (text input + list) | Type to filter; `↑` / `↓` / `Tab` move the highlight, `PageUp` / `PageDown` jump 5 rows, `Enter` activates the highlight (Open also accepts a typed path), `Esc` cancels. |
 | Copy / Move (text input only) | `Enter` submit, `Esc` cancel. Move uses `fs::rename` and falls back to copy+delete when the source and destination are on different filesystems. A relative destination (e.g. `test/` for a subfolder) resolves against the active pane's current directory, not just an absolute path or the other pane's location. If the destination is an existing directory, sources move/copy *into* it; if exactly one item is selected and the destination doesn't exist yet (e.g. a bare `renamed` or `../renamed`), it's treated as the exact new path — this is how a folder gets renamed (Move) or copied under a new name (Copy). Copy-to-a-new-name only works within the same backend; across backends, copy into the destination directory instead. |
 | New folder (text input only) | `Enter` creates the named directory in the active pane (nested names like `a/b` are created in full), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
-| New file (text input only) | Opened from the command palette (`New file`). Pre-filled with `file.txt`. `Enter` creates the empty file in the active pane (nested names like `a/b.txt` create parents) and opens it in your editor (`$VISUAL` / `$EDITOR`), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
+| New file (text input only) | Opened from the command palette (`New file`) or with `⌘⇧N`. Pre-filled with `file.txt`. `Enter` creates the empty file in the active pane (nested names like `a/b.txt` create parents) and opens it in your editor (`$VISUAL` / `$EDITOR`), `Esc` cancels. Refuses to clobber an existing path; remote panes aren't supported yet. |
 | Open file (chooser) | Shown when `Enter` is pressed on a non-archive file. `↑` / `↓` move the highlight, `Enter` or a click runs it, `Esc` cancels. The first row is always "Open with default application"; the rest are [`file_actions`](./configuration.md) whose pattern matched. `Tab` expands the highlighted custom action into an editable command pre-filled with its placeholders already substituted — edit it, then `Enter` runs the edited text verbatim (not the original template); `Tab` again collapses back without running anything. Background actions show "Running…" in the status bar and refresh the panes when done; `terminal: true` actions open a terminal window. |
 | Compress / Uncompress (text input only) | `Enter` submit, `Esc` cancel. Compress runs `zip -r` with the active pane as the working directory, so paths inside the archive are relative. Uncompress recognises `.zip` (→ `unzip -d`) and `.tar.gz` / `.tgz` (→ `tar -xzf -C`). |
 | Delete confirm | `Tab` / `←` / `→` toggle Cancel ↔ Delete focus, `Enter` activates focused button, `Esc` cancel |
@@ -114,7 +115,7 @@ Inside a modal, the navigation keys behave differently:
 | FTP replace confirm | Shown when the FTP-server action fires while a server is already running on a **different** folder. Lists both roots. `Tab` / `←` / `→` toggle Cancel ↔ Stop-and-restart focus, `Enter` activates focused button, `Esc` cancel. Default focus is Cancel (tearing down a live server drops connections). |
 | New-files prompt | `Tab` cycles No / Left / Right, `Enter` activates, `Esc` dismisses |
 | Docker containers | Type to filter (substring against name + image). Click a column header (Name / Image / Status) to sort — clicking the active column flips direction. Click `Kill` or `Shell` per row; `Esc` dismisses. The list refreshes automatically after a kill. |
-| Processes | Type to filter (substring against name). `↑`/`↓` move the highlighted row; `Enter` kills it (SIGTERM). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (also sends SIGTERM); `Esc` dismisses. The list refreshes automatically after a kill. |
+| Processes | Type to filter (substring against name). `↑`/`↓` move the highlighted row; `Enter` kills it (SIGTERM). Click a column header (Name / PID / CPU / MEM) to sort — clicking the active column flips direction. Defaults to CPU descending. Click `Kill` per row (also sends SIGTERM); `Esc` dismisses. The list re-runs `ps` every 2 seconds while open (so the CPU / MEM columns stay live) and also refreshes immediately after a kill; your filter, sort, and highlighted row are preserved across each refresh. |
 | Launch Application (macOS) | Type to filter (substring against name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Launch` opens the app via `open`. `Esc` dismisses. |
 | Git: branch | Type to filter (substring against branch name). `↑`/`↓`/`Tab` move the highlight; `Enter` or clicking `Checkout` runs `git checkout`. On success the modal closes and both panes reload; on failure the error is shown in the modal. `Esc` dismisses. |
 | Keyboard shortcuts | Read-only modal — scrollable list of all bindings grouped by section. `Esc` dismisses. Same content as this page, available in-app via `⌘⇧P → "Keyboard shortcuts"`. |
@@ -209,8 +210,11 @@ keyboard equivalent of clicking its **Kill** button.
   you target (by click or `Enter`), especially with system processes.
   Users who want SIGKILL should run `kill -9` from a real terminal.
 
-The CPU% / MEM% values are snapshots from the moment of the `ps` call —
-they don't auto-refresh. Dismiss and reopen the modal to refresh.
+While the modal is open the list re-runs `ps` every 2 seconds, so the
+CPU% / MEM% values stay live. Each refresh keeps your filter text, sort
+order, and highlighted row position (clamped if the list shrank). The
+polling subscription is only active while the modal is open — closing it
+stops the `ps` calls.
 
 The modal is Unix-only in v1 (macOS + Linux). On other platforms it
 displays an explanatory message instead of a list — wiring up `tasklist`

@@ -397,6 +397,15 @@ Two subprocess interactions, both in `fs_ops.rs`:
   On completion the App re-issues `ps_task` so the killed process
   disappears.
 
+While the modal is open a `time::every(2s)` subscription (added in
+`subscription()` only when `self.prompt` is `Prompt::Processes`) emits
+`RefreshProcesses`, whose handler re-issues `ps_task` — the same reload
+path as post-kill — so the CPU/MEM columns stay live instead of showing a
+stale one-shot snapshot. `ProcessesListLoaded` re-applies the current
+sort and clamps `selected`, so filter/sort/highlight survive each tick.
+The subscription is gated on the prompt, so no `ps` runs once the modal
+closes.
+
 Both functions are `#[cfg(unix)]`. On Windows the stubs return a
 "not supported on this platform" string that the modal surfaces in place
 of the list — wiring up `tasklist` and `taskkill` is left for later.

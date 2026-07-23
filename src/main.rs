@@ -3,7 +3,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, stack, text, text_input};
-use iced::{time, window, Color, Element, Length, Padding, Point, Size, Subscription, Task, Theme};
+use iced::{
+    clipboard, time, window, Color, Element, Length, Padding, Point, Size, Subscription, Task, Theme,
+};
 use tokio::task::AbortHandle;
 
 mod config;
@@ -25,8 +27,8 @@ use domain::{
     Application, AppsState,
     BackendId, DeleteFocus,
     DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, FtpAction, FtpInfoFocus,
-    double_click_hit, FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch, GitBranchesState,
-    GitInfo,
+    clipboard_targets, double_click_hit, FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch,
+    GitBranchesState, GitInfo,
     Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
     ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState, matching_quick_view,
     push_capped, QuickViewOutput, QuickViewState, StatSample,
@@ -113,6 +115,8 @@ pub(crate) enum Message {
     OpenCopyPrompt,
     OpenMovePrompt,
     OpenNewFolderPrompt,
+    /// Open the "New file" prompt (⌘⇧N, or the palette action).
+    OpenNewFilePrompt,
     OpenDeletePrompt,
     SwitchPromptFocus,
     OpenSettingsFile,
@@ -174,6 +178,9 @@ pub(crate) enum Message {
     ProcessKill(u32),
     /// `kill <pid>` completed.
     ProcessKillFinished(u32, Result<(), String>),
+    /// Periodic tick while the Processes modal is open — re-run `ps` so the
+    /// CPU/MEM percentages stay live. Only subscribed when the modal is up.
+    RefreshProcesses,
     /// Background-sampler tick (from the always-on `stats_interval_secs`
     /// subscription) — kick off one CPU/memory reading.
     SampleStats,
@@ -313,6 +320,10 @@ struct App {
     /// extract task, shown in red in the status bar until the next such
     /// action starts. `None` once an operation completes cleanly.
     last_error: Option<String>,
+    /// Transient non-error confirmation (e.g. "Copied name: …"), shown in the
+    /// normal status color. Set by the clipboard palette actions and cleared on
+    /// the next `navigate()` so it doesn't linger across directories.
+    last_status: Option<String>,
     /// The currently-running in-app FTP server, if any. Singleton — set by
     /// `FtpServerStarted(Ok(..))`, cleared by `FtpServerStopped`. The
     /// `FtpRuntime` Drop impl aborts the listen task, so quitting the app
@@ -416,6 +427,7 @@ impl App {
             extract_in_progress: None,
             file_action_in_progress: None,
             last_error: None,
+            last_status: None,
             ftp_server: None,
             pending_new_files: std::collections::VecDeque::new(),
             recent_locations,
@@ -481,6 +493,7 @@ impl App {
     }
 
     fn navigate(&mut self, side: Side, location: Location) -> Task<Message> {
+        self.last_status = None;
         let generation = self.pane_mut(side).navigate(location.clone());
         refresh_claude_marker(self.pane_mut(side));
         // The "Go to folder" recents list stays PathBuf-shaped, so
@@ -944,6 +957,7 @@ impl App {
                 | Message::OpenCopyPrompt
                 | Message::OpenMovePrompt
                 | Message::OpenNewFolderPrompt
+                | Message::OpenNewFilePrompt
                 | Message::OpenDeletePrompt
                 | Message::OpenCommandPalette
                 | Message::FilterAppend(..) => return Task::none(),
@@ -1092,6 +1106,13 @@ impl App {
             Message::OpenNewFolderPrompt => {
                 self.prompt = Some(Prompt::NewFolder {
                     input: String::new(),
+                });
+                return text_input::focus(text_input::Id::new(PROMPT_ID));
+            }
+            Message::OpenNewFilePrompt => {
+                // Same as the "New file" palette action — pre-fill file.txt.
+                self.prompt = Some(Prompt::NewFile {
+                    input: "file.txt".into(),
                 });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
@@ -2056,6 +2077,14 @@ impl App {
                     return ps_task();
                 }
             }
+            Message::RefreshProcesses => {
+                // Re-fetch only while the modal is still open. The
+                // ProcessesListLoaded handler preserves filter / sort /
+                // selection, so the live refresh doesn't disturb the user.
+                if let Some(Prompt::Processes { .. }) = &self.prompt {
+                    return ps_task();
+                }
+            }
             Message::SampleStats => {
                 return sample_stats_task();
             }
@@ -2363,6 +2392,20 @@ impl App {
                     });
                 }
                 Task::none()
+            }
+            PaletteAction::CopyName => {
+                let pane = self.pane(self.active);
+                let (name, _) = clipboard_targets(pane.path(), pane.cursor_name().as_deref());
+                self.last_error = None;
+                self.last_status = Some(format!("Copied name: {name}"));
+                clipboard::write(name)
+            }
+            PaletteAction::CopyPath => {
+                let pane = self.pane(self.active);
+                let (_, path) = clipboard_targets(pane.path(), pane.cursor_name().as_deref());
+                self.last_error = None;
+                self.last_status = Some(format!("Copied path: {path}"));
+                clipboard::write(path)
             }
             PaletteAction::Compress => {
                 if !self.both_panes_local() {
@@ -2672,6 +2715,11 @@ impl App {
     }
 
     fn status_text(&self) -> Option<String> {
+        // Clipboard confirmations win until the next real activity replaces
+        // them (an in-progress op below, or navigation clearing the field).
+        if let Some(msg) = &self.last_status {
+            return Some(msg.clone());
+        }
         if let Some((count, dest)) = &self.copy_in_progress {
             let noun = if *count == 1 { "file" } else { "files" };
             return Some(format!("Copying {} {} to {}…", count, noun, dest));
@@ -2825,6 +2873,11 @@ impl App {
                 {
                     Some(Message::OpenCommandPalette)
                 }
+                Key::Character(ref c)
+                    if mods.command() && mods.shift() && c.eq_ignore_ascii_case("n") =>
+                {
+                    Some(Message::OpenNewFilePrompt)
+                }
                 Key::Character(ref c) if mods.command() && c.eq_ignore_ascii_case("p") => {
                     Some(Message::OpenPrompt)
                 }
@@ -2951,6 +3004,13 @@ impl App {
             .collect();
         if !watched.is_empty() {
             subs.push(file_watch_subscription(watched));
+        }
+
+        // While the Processes modal is open, re-run `ps` every 2s so the
+        // CPU/MEM columns stay live (a one-shot `ps` snapshot otherwise goes
+        // stale the moment it loads).
+        if let Some(Prompt::Processes { .. }) = &self.prompt {
+            subs.push(time::every(Duration::from_secs(2)).map(|_| Message::RefreshProcesses));
         }
 
         // Watch the panes' own open directories and auto-refresh on change.

@@ -893,6 +893,13 @@ pub enum PaletteAction {
     Copy,
     Move,
     Delete,
+    /// Copy the bare name of the item under the cursor (a file or folder name,
+    /// no path) to the system clipboard. On the `..` row, copies the pane's own
+    /// directory name. See [`clipboard_targets`].
+    CopyName,
+    /// Copy the absolute path of the item under the cursor to the system
+    /// clipboard. On the `..` row, copies the pane's own directory path.
+    CopyPath,
     Compress,
     Uncompress,
     DockerContainers,
@@ -943,6 +950,8 @@ impl PaletteAction {
         PaletteAction::Copy,
         PaletteAction::Move,
         PaletteAction::Delete,
+        PaletteAction::CopyName,
+        PaletteAction::CopyPath,
         PaletteAction::Compress,
         PaletteAction::Uncompress,
         PaletteAction::DockerContainers,
@@ -967,6 +976,8 @@ impl PaletteAction {
         PaletteAction::Copy,
         PaletteAction::Move,
         PaletteAction::Delete,
+        PaletteAction::CopyName,
+        PaletteAction::CopyPath,
         PaletteAction::Compress,
         PaletteAction::Uncompress,
         PaletteAction::DockerContainers,
@@ -989,6 +1000,8 @@ impl PaletteAction {
             PaletteAction::Copy => "Copy",
             PaletteAction::Move => "Move",
             PaletteAction::Delete => "Delete",
+            PaletteAction::CopyName => "Copy name to clipboard",
+            PaletteAction::CopyPath => "Copy full path to clipboard",
             PaletteAction::Compress => "Compress",
             PaletteAction::Uncompress => "Uncompress",
             PaletteAction::DockerContainers => "Docker containers",
@@ -1092,6 +1105,7 @@ pub fn keyboard_shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static st
                 ("F5", "Open the copy modal"),
                 ("F6", "Open the move modal"),
                 ("F7", "Create a new folder in the active pane"),
+                ("⌘⇧N", "Open the new-file modal (pre-filled file.txt)"),
                 ("F8 / Delete", "Open the delete-confirm modal"),
                 ("F10", "Quit the app immediately"),
             ],
@@ -1449,6 +1463,29 @@ pub fn double_click_hit(
     within: std::time::Duration,
 ) -> bool {
     last.is_some_and(|(s, r, t)| s == side && r == row && now.duration_since(t) <= within)
+}
+
+/// Resolve the `(name, full_path)` clipboard strings for the Copy-name /
+/// Copy-path palette actions. `dir` is the active pane's directory and
+/// `cursor_name` is the item under the cursor, or `None` when the cursor sits
+/// on the `..` row — in which case the pane's own directory is the target
+/// (its leaf name, and its full path). A root directory with no leaf name
+/// (`/`) falls back to the full path for both fields.
+pub fn clipboard_targets(dir: &Path, cursor_name: Option<&str>) -> (String, String) {
+    match cursor_name {
+        Some(name) => (
+            name.to_string(),
+            dir.join(name).to_string_lossy().into_owned(),
+        ),
+        None => {
+            let full = dir.to_string_lossy().into_owned();
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| full.clone());
+            (name, full)
+        }
+    }
 }
 
 /// Parse output of `ps -axo pid=,pcpu=,pmem=,comm=`. The command name is the
@@ -3504,7 +3541,14 @@ this is not an ls line
     #[test]
     fn filtered_actions_substring_matches_label() {
         let out = filtered_actions(PaletteAction::ALL, "cop");
-        assert_eq!(out, vec![PaletteAction::Copy]);
+        assert_eq!(
+            out,
+            vec![
+                PaletteAction::Copy,
+                PaletteAction::CopyName,
+                PaletteAction::CopyPath,
+            ]
+        );
     }
 
     #[test]
@@ -3705,6 +3749,27 @@ this is not an ls line
         assert!(!double_click_hit(Some((Side::Left, 3, t0)), Side::Left, 3, late, within));
         // No prior click.
         assert!(!double_click_hit(None, Side::Left, 3, soon, within));
+    }
+
+    #[test]
+    fn clipboard_targets_uses_cursor_entry() {
+        let (name, path) = clipboard_targets(Path::new("/home/ron/rho"), Some("main.rs"));
+        assert_eq!(name, "main.rs");
+        assert_eq!(path, "/home/ron/rho/main.rs");
+    }
+
+    #[test]
+    fn clipboard_targets_falls_back_to_dir_on_dotdot() {
+        let (name, path) = clipboard_targets(Path::new("/home/ron/rho"), None);
+        assert_eq!(name, "rho");
+        assert_eq!(path, "/home/ron/rho");
+    }
+
+    #[test]
+    fn clipboard_targets_root_dir_has_no_leaf() {
+        let (name, path) = clipboard_targets(Path::new("/"), None);
+        assert_eq!(name, "/");
+        assert_eq!(path, "/");
     }
 
     #[test]
@@ -4326,7 +4391,7 @@ this is not an ls line
             .flat_map(|(_, b)| b.into_iter().map(|(k, _)| k))
             .collect::<Vec<_>>()
             .join(" | ");
-        for needle in ["⌘P", "⌘⇧P", "F4", "F5", "F7", "F8", "F10", "Tab", "Esc"] {
+        for needle in ["⌘P", "⌘⇧P", "⌘⇧N", "F4", "F5", "F7", "F8", "F10", "Tab", "Esc"] {
             assert!(joined.contains(needle), "missing binding: {}", needle);
         }
     }

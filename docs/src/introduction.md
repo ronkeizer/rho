@@ -66,6 +66,10 @@ input device.
 A filterable list of one-shot actions:
 
 - Copy / Delete (same as the keyboard shortcuts).
+- Copy name to clipboard / Copy full path to clipboard — copies the
+  item under the cursor (a file or folder). On the `..` row, copies the
+  current directory's own name / path. A confirmation shows in the
+  status bar.
 - Docker containers — modal with each running container, per-row
   Kill and Shell buttons, sortable columns, filter.
 - Processes — `ps -axo …` output, per-row Kill (SIGTERM), sortable
