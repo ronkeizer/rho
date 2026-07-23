@@ -71,6 +71,10 @@ pub struct Config {
     /// here.
     #[serde(default)]
     pub ftp: FtpConfig,
+    /// paperless-ngx connection for the "Paperless documents" palette action.
+    /// Absent (the default) leaves the action listed but disabled.
+    #[serde(default)]
+    pub paperless: PaperlessConfig,
     /// Interval (seconds) between background CPU/memory samples feeding the
     /// System monitor modal. The sampler runs from app start so the graph is
     /// pre-filled on open. Hot-reloaded via the settings subscription.
@@ -97,6 +101,7 @@ impl Default for Config {
             folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
             dropbox: DropboxConfig::default(),
             ftp: FtpConfig::default(),
+            paperless: PaperlessConfig::default(),
             stats_interval_secs: default_stats_interval_secs(),
         }
     }
@@ -191,6 +196,32 @@ pub struct DropboxConfig {
     /// authorize flow with `token_access_type=offline`). Exchanged for a
     /// short-lived access token on demand — see `fs_ops::dropbox_access_token`.
     pub refresh_token: Option<String>,
+}
+
+/// paperless-ngx connection, surfaced under the `paperless:` key. Both fields
+/// must be set for the "Paperless documents" palette action to activate. `url`
+/// is the server base (e.g. `http://localhost:9000`, no trailing `/api`);
+/// `token` is a paperless API token (Settings → "API Token" in the web UI).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PaperlessConfig {
+    pub url: Option<String>,
+    pub token: Option<String>,
+}
+
+impl PaperlessConfig {
+    /// `(base_url, token)` with the base trimmed of any trailing `/`, or `None`
+    /// when either field is missing/blank. This is the single gate the palette
+    /// and tasks check before talking to the server.
+    pub fn creds(&self) -> Option<(String, String)> {
+        let url = self.url.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+        let token = self
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        Some((url.trim_end_matches('/').to_string(), token.to_string()))
+    }
 }
 
 /// Settings for the in-app FTP server. Surfaced under the `ftp:` key in
@@ -629,7 +660,13 @@ fn default_template_yaml() -> &'static str {
      # background CPU/memory samples. The sampler runs from app start so the\n\
      # graph is already populated when you open the modal. Lower = smoother\n\
      # graph but more frequent polling. Hot-reloaded.\n\
-     # stats_interval_secs: 2\n"
+     # stats_interval_secs: 2\n\
+     # paperless-ngx (Command Palette → \"Paperless documents\"). Set both\n\
+     # fields to enable the action. url is the server base (no /api suffix);\n\
+     # token is an API token from the paperless web UI (per-user settings).\n\
+     # paperless:\n\
+     #   url: \"http://localhost:9000\"\n\
+     #   token: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"
 }
 
 #[derive(Debug, Clone, Copy)]

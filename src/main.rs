@@ -21,7 +21,8 @@ use config::{
 use domain::{
     add_recent, available_palette_actions, build_file_choices, decide_ftp_action,
     default_zip_filename, drop_target_side, filtered_actions, filtered_apps,
-    filtered_branches, filtered_processes, filtered_recents, filtered_servers, modal_scroll_target,
+    filtered_branches, filtered_paperless, filtered_processes, filtered_recents, filtered_servers,
+    modal_scroll_target,
     sort_apps,
     sort_containers, sort_entries, sort_processes, substitute_command, substitute_command_multi,
     Application, AppsState,
@@ -29,7 +30,8 @@ use domain::{
     DockerContainer, DockerSortBy, DockerState, Entry, FileChoice, FtpAction, FtpInfoFocus,
     clipboard_targets, double_click_hit, FtpLogEntry, FtpReplaceFocus, FtpServerInfo, GitBranch,
     GitBranchesState, GitInfo,
-    Location, NewFilesFocus, PaletteAction, palette_action_enabled, Pane, Process, ProcessSortBy,
+    Location, NewFilesFocus, PaletteAction, palette_action_enabled, PaperlessDoc, PaperlessState,
+    Pane, Process, ProcessSortBy,
     ProcessesState, Prompt, Side, SortBy, SortDir, SshServer, SshServersState, matching_quick_view,
     push_capped, QuickViewOutput, QuickViewState, StatSample,
 };
@@ -39,6 +41,7 @@ use fs_ops::{
     ftp_start_task, git_branches_task,
     git_checkout_task, kill_process_task, launch_app, loading_tasks, make_dir, make_file, move_task, rename_task,
     open_claude_code, open_folder_in_editor, open_terminal,
+    paperless_download_task, paperless_search_task,
     pane_watch_subscription, ps_task, quick_view_task, run_file_action_in_terminal, run_file_action_task,
     sample_stats_task,
     ssh_connect, ssh_servers_task, uncompress_task,
@@ -186,6 +189,17 @@ pub(crate) enum Message {
     SampleStats,
     /// A CPU/memory reading completed — append it to `stats_history`.
     SystemStatsSampled(StatSample),
+    /// A paperless search/list completed. The `u64` is the request generation;
+    /// the handler drops results whose generation is stale (a later search
+    /// already fired).
+    PaperlessListLoaded(u64, Result<Vec<PaperlessDoc>, String>),
+    /// User clicked Open on a document row — open its paperless web page.
+    PaperlessOpen(u32),
+    /// User clicked Download on a document row — save the PDF to the active
+    /// pane's folder.
+    PaperlessDownload(u32),
+    /// A document download finished — `Ok(path)` is where it landed.
+    PaperlessDownloaded(Result<PathBuf, String>),
     /// User clicked a Docker column header — toggle / switch the sort.
     DockerToggleSort(DockerSortBy),
     /// User clicked a Processes column header — toggle / switch the sort.
@@ -299,6 +313,10 @@ struct App {
     /// row within `DOUBLE_CLICK` counts as a double-click and activates the row
     /// (folder → enter, file → file-actions modal), same as pressing Enter.
     last_click: Option<(Side, usize, Instant)>,
+    /// Monotonic tag for paperless searches. Bumped on every search; the
+    /// `PaperlessListLoaded` handler drops results tagged with an older value
+    /// so a slow earlier query can't overwrite a newer one.
+    paperless_gen: u64,
     window_size: Size,
     settings_mtime: Option<SystemTime>,
     /// (count, dest) while a copy task is in flight.
@@ -417,6 +435,7 @@ impl App {
             shift_held: false,
             cmd_held: false,
             last_click: None,
+            paperless_gen: 0,
             window_size,
             settings_mtime,
             copy_in_progress: None,
@@ -692,6 +711,15 @@ impl App {
                 let n = filtered_processes(list, input).len();
                 (n > 0).then_some((*selected, n))
             }
+            Some(Prompt::Paperless {
+                state: PaperlessState::Loaded(list),
+                input,
+                selected,
+                ..
+            }) => {
+                let n = filtered_paperless(list, input).len();
+                (n > 0).then_some((*selected, n))
+            }
             Some(Prompt::FileActions {
                 choices, selected, ..
             }) => {
@@ -931,7 +959,8 @@ impl App {
                 | Some(Prompt::Apps { .. })
                 | Some(Prompt::GitBranches { .. })
                 | Some(Prompt::SshServers { .. })
-                | Some(Prompt::Processes { .. }),
+                | Some(Prompt::Processes { .. })
+                | Some(Prompt::Paperless { .. }),
                 m,
             ) => match m {
                 Message::MoveSelection(delta, _) => Message::PromptMove(delta),
@@ -1203,6 +1232,20 @@ impl App {
                                 *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
                             }
                         }
+                        Prompt::Paperless {
+                            input,
+                            state,
+                            selected,
+                            ..
+                        } => {
+                            // Typing filters the loaded batch client-side; the
+                            // server full-text search fires on Enter instead.
+                            *input = value;
+                            if let PaperlessState::Loaded(list) = state {
+                                let n = filtered_paperless(list, input).len();
+                                *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                            }
+                        }
                         Prompt::Apps {
                             input,
                             state,
@@ -1430,11 +1473,16 @@ impl App {
                             selected,
                             actions,
                             dropbox_configured,
+                            paperless_configured,
                         } => {
                             let filtered = filtered_actions(&actions, &input);
                             match filtered.get(selected).copied() {
                                 Some(action)
-                                    if palette_action_enabled(action, dropbox_configured) =>
+                                    if palette_action_enabled(
+                                        action,
+                                        dropbox_configured,
+                                        paperless_configured,
+                                    ) =>
                                 {
                                     return self.execute_palette_action(action);
                                 }
@@ -1448,6 +1496,7 @@ impl App {
                                         selected,
                                         actions,
                                         dropbox_configured,
+                                        paperless_configured,
                                     });
                                     None
                                 }
@@ -1494,6 +1543,40 @@ impl App {
                                 selected,
                             });
                             pid.map(kill_process_task)
+                        }
+                        // Paperless: Enter runs a server-side full-text search
+                        // with the current input, replacing the list. The input
+                        // is moved into `query` (for display) and cleared, so
+                        // the client-side title filter doesn't then re-narrow
+                        // the server results back down to title matches — that
+                        // was the bug where full-text search == filename search.
+                        // Keeps the modal open. Requires configured creds.
+                        Prompt::Paperless { input, .. } => {
+                            if let Some((base, token)) = self.config.paperless.creds() {
+                                self.paperless_gen += 1;
+                                self.prompt = Some(Prompt::Paperless {
+                                    state: PaperlessState::Loading,
+                                    input: String::new(),
+                                    query: input.clone(),
+                                    selected: 0,
+                                });
+                                Some(paperless_search_task(
+                                    base,
+                                    token,
+                                    input,
+                                    self.paperless_gen,
+                                ))
+                            } else {
+                                self.prompt = Some(Prompt::Paperless {
+                                    state: PaperlessState::Error(
+                                        "paperless not configured".into(),
+                                    ),
+                                    query: input.clone(),
+                                    input,
+                                    selected: 0,
+                                });
+                                None
+                            }
                         }
                         // Apps modal: Enter launches the highlighted row.
                         // If no row is selectable (empty / loading / error),
@@ -1901,6 +1984,7 @@ impl App {
                     selected: 0,
                     actions,
                     dropbox_configured: self.config.dropbox_auth().is_some(),
+                    paperless_configured: self.config.paperless.creds().is_some(),
                 });
                 return text_input::focus(text_input::Id::new(PROMPT_ID));
             }
@@ -1972,6 +2056,19 @@ impl App {
                 }) => {
                     if let ProcessesState::Loaded(list) = state {
                         let n = filtered_processes(list, input).len() as i32;
+                        if n > 0 {
+                            *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+                        }
+                    }
+                }
+                Some(Prompt::Paperless {
+                    state,
+                    input,
+                    selected,
+                    ..
+                }) => {
+                    if let PaperlessState::Loaded(list) = state {
+                        let n = filtered_paperless(list, input).len() as i32;
                         if n > 0 {
                             *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
                         }
@@ -2091,6 +2188,83 @@ impl App {
             Message::SystemStatsSampled(sample) => {
                 push_capped(&mut self.stats_history, sample, STATS_HISTORY_CAP);
             }
+            Message::PaperlessListLoaded(generation, result) => {
+                // Drop stale responses (a newer search already fired) and any
+                // response arriving after the modal was closed.
+                if generation != self.paperless_gen {
+                    return Task::none();
+                }
+                if let Some(Prompt::Paperless {
+                    state,
+                    input,
+                    selected,
+                    ..
+                }) = self.prompt.as_mut()
+                {
+                    *state = match result {
+                        Ok(docs) => PaperlessState::Loaded(docs),
+                        Err(msg) => PaperlessState::Error(msg),
+                    };
+                    if let PaperlessState::Loaded(list) = state {
+                        let n = filtered_paperless(list, input).len();
+                        *selected = if n == 0 { 0 } else { (*selected).min(n - 1) };
+                    }
+                }
+            }
+            Message::PaperlessOpen(id) => {
+                // Open the document's paperless web page in the default browser.
+                if let Some((base, _)) = self.config.paperless.creds() {
+                    let url = format!("{}/documents/{}", base, id);
+                    if let Err(e) = open::that_detached(&url) {
+                        self.last_error = Some(format!("Open {} failed: {}", url, e));
+                    }
+                }
+            }
+            Message::PaperlessDownload(id) => {
+                // Save the PDF into the active pane's local folder.
+                let Some((base, token)) = self.config.paperless.creds() else {
+                    return Task::none();
+                };
+                let pane = self.pane(self.active);
+                if !pane.location.is_local() {
+                    self.last_error =
+                        Some("Can't download into a remote pane".to_string());
+                    return Task::none();
+                }
+                let dest_dir = pane.path().to_path_buf();
+                // Look up the filename from the loaded list so the saved file
+                // keeps its original name.
+                let filename = if let Some(Prompt::Paperless {
+                    state: PaperlessState::Loaded(list),
+                    ..
+                }) = &self.prompt
+                {
+                    list.iter()
+                        .find(|d| d.id == id)
+                        .map(|d| d.filename.clone())
+                        .unwrap_or_else(|| format!("paperless-{}.pdf", id))
+                } else {
+                    format!("paperless-{}.pdf", id)
+                };
+                self.last_error = None;
+                self.last_status = Some(format!("Downloading {}…", filename));
+                return paperless_download_task(base, token, id, filename, dest_dir);
+            }
+            Message::PaperlessDownloaded(result) => match result {
+                Ok(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.last_status = Some(format!("Downloaded {}", name));
+                    // Refresh panes so the new file shows up.
+                    return self.reload_both_panes();
+                }
+                Err(e) => {
+                    self.last_status = None;
+                    self.last_error = Some(format!("Download failed: {}", e));
+                }
+            },
             Message::DockerToggleSort(column) => {
                 if let Some(Prompt::Docker {
                     state,
@@ -2467,6 +2641,28 @@ impl App {
                 // one immediate reading so a freshly-opened modal shows the
                 // latest values without waiting a full interval.
                 sample_stats_task()
+            }
+            PaletteAction::Paperless => {
+                // Gate on config — the action is listed but disabled when
+                // creds are missing, so this is the belt-and-suspenders check.
+                let Some((base, token)) = self.config.paperless.creds() else {
+                    self.last_error = Some(
+                        "Set paperless.url + paperless.token in ~/.rho.yaml".to_string(),
+                    );
+                    return Task::none();
+                };
+                self.reset_modal_scroll();
+                self.paperless_gen += 1;
+                self.prompt = Some(Prompt::Paperless {
+                    state: PaperlessState::Loading,
+                    input: String::new(),
+                    query: String::new(),
+                    selected: 0,
+                });
+                Task::batch([
+                    paperless_search_task(base, token, String::new(), self.paperless_gen),
+                    text_input::focus(text_input::Id::new(PROMPT_ID)),
+                ])
             }
             PaletteAction::LaunchApplication => {
                 self.reset_modal_scroll();

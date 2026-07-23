@@ -414,6 +414,47 @@ modals) so they move the highlight, and `selected` is clamped back into
 range by `PromptChanged` (filtering) and `ProcessesListLoaded` (the
 post-kill reload) so it never points past the end of the list.
 
+## Paperless
+
+The "Paperless documents" palette action opens `Prompt::Paperless`, a
+list modal shaped like Processes (`PaperlessState::Loading | Loaded(Vec<PaperlessDoc>)
+| Error(String)`, a filter `text_input`, a `selected` highlight). It's the
+first modal to reach a **third-party HTTP service**, but it reuses the
+Dropbox backend's transport rather than adding an HTTP client: every call
+shells out to `curl` via the existing `run_curl` helper in `fs_ops.rs`.
+
+Two `Task`s in `fs_ops.rs`:
+
+- `paperless_search_task(base, token, query, generation)` runs
+  `curl -G … /api/documents/` with `--data-urlencode` params (so curl does
+  the percent-encoding). An empty query lists recent docs
+  (`ordering=-created`); a non-empty one is a server-side full-text search
+  (`query=…`). `fields=id,title,created,original_file_name` trims the
+  payload (the default response embeds each document's full OCR `content`).
+  The JSON is parsed by `domain::parse_paperless_list` (unit-tested;
+  ignores the `__search_hit__` sibling paperless adds to search results).
+  Emits `PaperlessListLoaded(generation, …)`.
+- `paperless_download_task(base, token, id, filename, dest_dir)` runs
+  `curl -f -o …/api/documents/<id>/download/`, writing the PDF straight to
+  disk (binary body never routed through a `String`). `unique_path`
+  de-duplicates against an existing file. Emits `PaperlessDownloaded`.
+
+**Search generations.** Typing filters the loaded batch client-side
+(`filtered_paperless`, exactly like `filtered_processes`); pressing Enter
+(`PromptSubmit`) fires a server search. Because searches race, each is
+tagged with `App::paperless_gen` (bumped per search) and
+`PaperlessListLoaded` drops any result whose tag is stale — the same
+generation guard the async dir loads use, but on the App rather than the
+pane.
+
+**Config + gating.** `config::PaperlessConfig { url, token }` under the
+`paperless:` key; `PaperlessConfig::creds()` returns `Some((base, token))`
+only when both are set (and trims a trailing `/` off the base). That gate
+feeds `palette_action_enabled` — the action is always listed but disabled
+(greyed, non-clickable) until configured, mirroring `OpenDropbox`. Opening
+a document uses the `open` crate on `<base>/documents/<id>`; downloads go
+into the active pane and require it to be local.
+
 ## System monitor
 
 The "System monitor" palette action opens `Prompt::SystemMonitor`, a live

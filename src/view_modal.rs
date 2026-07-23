@@ -13,11 +13,12 @@ use crate::config::{blend, dim, RowColors};
 use crate::config::FtpPerms;
 use crate::domain::{
     bar_glyph, filtered_actions, filtered_apps, filtered_branches, filtered_containers,
-    filtered_processes, filtered_recents, filtered_servers, format_log_timestamp,
+    filtered_paperless, filtered_processes, filtered_recents, filtered_servers,
+    format_log_timestamp,
     keyboard_shortcuts, palette_action_enabled, AppsState,
     DeleteFocus, DockerSortBy,
     DockerState, FileChoice, FtpInfoFocus, FtpLogEntry, FtpLogLevel, FtpReplaceFocus,
-    FtpServerInfo, GitBranchesState, NewFilesFocus, ProcessSortBy, ProcessesState,
+    FtpServerInfo, GitBranchesState, NewFilesFocus, PaperlessState, ProcessSortBy, ProcessesState,
     Prompt, Side, SortDir, SshServersState, StatSample,
 };
 use crate::view_pane::format_size;
@@ -40,6 +41,7 @@ pub fn view_modal<'a>(
         | Prompt::Apps { .. }
         | Prompt::GitBranches { .. }
         | Prompt::SshServers { .. }
+        | Prompt::Paperless { .. }
         | Prompt::SystemMonitor => 720.0,
         Prompt::KeyboardShortcuts => 600.0,
         Prompt::FtpInfo { .. } => 640.0,
@@ -188,6 +190,7 @@ pub fn view_modal<'a>(
             selected,
             actions,
             dropbox_configured,
+            paperless_configured,
         } => {
             let filtered = filtered_actions(actions, input);
             let input_widget = text_input("filter actions…", input)
@@ -204,7 +207,11 @@ pub fn view_modal<'a>(
                 let actions_col = filtered.iter().enumerate().fold(
                     column![].spacing(2),
                     |col, (i, action)| {
-                        let enabled = palette_action_enabled(*action, *dropbox_configured);
+                        let enabled = palette_action_enabled(
+                            *action,
+                            *dropbox_configured,
+                            *paperless_configured,
+                        );
                         // Same idea as the Open modal: highlight only the
                         // active row; the rest inherit the modal background.
                         // Disabled rows (e.g. Open Dropbox with no creds) stay
@@ -765,6 +772,161 @@ pub fn view_modal<'a>(
                 header_row,
                 body,
                 text("Type to filter  ·  click a header to sort  ·  click Kill (SIGTERM)  ·  Esc dismisses").size(11),
+            ]
+            .spacing(6)
+        }
+        Prompt::Paperless {
+            state,
+            input,
+            query,
+            selected,
+        } => {
+            let filter_widget =
+                text_input("filter titles · Enter = full-text search…", input)
+                    .id(text_input::Id::new(PROMPT_ID))
+                    .on_input(Message::PromptChanged)
+                    .on_submit(Message::PromptSubmit)
+                    .padding(8);
+            // Static header (no sortable columns — order comes from the server:
+            // recent-first, or by search score). Widths mirror the body rows.
+            let header_row = container(
+                row![
+                    text("Title").size(11).width(Length::Fill),
+                    text("Created").size(11).width(Length::Fixed(96.0)),
+                    Space::with_width(Length::Fixed(158.0)),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(Padding::from([3, 8]))
+            .style(|_theme: &Theme| container::Style {
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            });
+            let body: Element<'_, Message> = match state {
+                PaperlessState::Loading => container(text("Loading…").size(12))
+                    .padding(Padding::from([8, 8]))
+                    .into(),
+                PaperlessState::Error(msg) => container(
+                    text(msg.clone())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .style(|theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.extended_palette().danger.base.color),
+                        }),
+                )
+                .padding(Padding::from([8, 8]))
+                .into(),
+                PaperlessState::Loaded(docs) if docs.is_empty() => {
+                    container(text("No documents.").size(12))
+                        .padding(Padding::from([8, 8]))
+                        .into()
+                }
+                PaperlessState::Loaded(docs) => {
+                    let filtered = filtered_paperless(docs, input);
+                    if filtered.is_empty() {
+                        container(text("No documents match.").size(12))
+                            .padding(Padding::from([8, 8]))
+                            .into()
+                    } else {
+                        let list_col = filtered.iter().enumerate().fold(
+                            column![],
+                            |col, (row_index, d)| {
+                            let id = d.id;
+                            let is_selected = row_index == *selected;
+                            let created_style = move |theme: &Theme| iced::widget::text::Style {
+                                color: Some(if is_selected {
+                                    cursor_fill(theme, colors).1
+                                } else {
+                                    dim(theme.extended_palette().background.base.text)
+                                }),
+                            };
+                            let title_style = move |theme: &Theme| iced::widget::text::Style {
+                                color: Some(if is_selected {
+                                    cursor_fill(theme, colors).1
+                                } else {
+                                    theme.extended_palette().background.base.text
+                                }),
+                            };
+                            let title_cell = text(d.title.clone())
+                                .size(11)
+                                .width(Length::Fill)
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .style(title_style);
+                            let created_cell = text(d.created.clone())
+                                .font(Font::MONOSPACE)
+                                .size(11)
+                                .width(Length::Fixed(96.0))
+                                .style(created_style);
+                            let row_widget = row![
+                                title_cell,
+                                created_cell,
+                                button(
+                                    text("Open")
+                                        .size(10)
+                                        .align_x(Horizontal::Center)
+                                        .width(Length::Fill),
+                                )
+                                .on_press(Message::PaperlessOpen(id))
+                                .padding(Padding::from([2, 0]))
+                                .width(Length::Fixed(60.0))
+                                .style(button::primary),
+                                button(
+                                    text("Download")
+                                        .size(10)
+                                        .align_x(Horizontal::Center)
+                                        .width(Length::Fill),
+                                )
+                                .on_press(Message::PaperlessDownload(id))
+                                .padding(Padding::from([2, 0]))
+                                .width(Length::Fixed(90.0))
+                                .style(button::secondary),
+                            ]
+                            .spacing(8)
+                            .align_y(iced::Alignment::Center);
+                            col.push(
+                                container(row_widget)
+                                    .padding(Padding::from([3, 8]))
+                                    .style(move |theme: &Theme| container::Style {
+                                        background: if is_selected {
+                                            Some(cursor_fill(theme, colors).0.into())
+                                        } else {
+                                            process_stripe(theme, colors, row_index)
+                                        },
+                                        ..Default::default()
+                                    }),
+                            )
+                        });
+                        scrollable(list_col)
+                            .id(scrollable::Id::new(MODAL_LIST_ID))
+                            .on_scroll(|v| {
+                                Message::ModalScrolled(
+                                    v.absolute_offset().y,
+                                    v.bounds().height,
+                                    v.content_bounds().height,
+                                )
+                            })
+                            .height(Length::Fixed(360.0))
+                            .into()
+                    }
+                }
+            };
+
+            let title = if query.trim().is_empty() {
+                "Paperless documents".to_string()
+            } else {
+                format!("Paperless documents  ·  full-text: “{}”", query.trim())
+            };
+            column![
+                text(title).size(15),
+                filter_widget,
+                header_row,
+                body,
+                text("Type to filter loaded docs  ·  Enter = full-text search  ·  Open (browser) / Download  ·  Esc dismisses").size(11),
             ]
             .spacing(6)
         }

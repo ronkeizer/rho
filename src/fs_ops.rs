@@ -12,10 +12,10 @@ use iced::{Subscription, Task};
 use crate::config::{Config, DropboxAuth, FtpAuthMode, FtpConfig, FtpPerms};
 use crate::domain::{
     detect_archive_format, dropbox_api_path, parse_docker_ps, parse_dropbox_list,
-    parse_dropbox_token, parse_git_branches, parse_ls_la, parse_ps_output, parse_ssh_config,
-    posix_quote, Application, ArchiveFormat,
+    parse_dropbox_token, parse_git_branches, parse_ls_la, parse_paperless_list, parse_ps_output,
+    parse_ssh_config, posix_quote, Application, ArchiveFormat,
     BackendId, DockerContainer, Entry, FtpLogEntry, FtpLogLevel, FtpServerInfo, GitBranch,
-    GitInfo, Location, Process, Side, SshServer, StatSample,
+    GitInfo, Location, PaperlessDoc, Process, Side, SshServer, StatSample,
 };
 use crate::Message;
 
@@ -2131,6 +2131,161 @@ fn run_kill(pid: u32) -> Result<(), String> {
 #[cfg(not(unix))]
 fn run_kill(_pid: u32) -> Result<(), String> {
     Err("Killing processes isn't supported on this platform yet.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// paperless-ngx (HTTP API via curl — same transport as the Dropbox backend)
+// ---------------------------------------------------------------------------
+
+/// Fetch a page of documents from paperless-ngx. An empty `query` lists the
+/// most-recent documents (`ordering=-created`); a non-empty one runs a
+/// server-side full-text search (`query=…`). `generation` is echoed back in
+/// the message so the App can discard results from a superseded search.
+pub fn paperless_search_task(
+    base: String,
+    token: String,
+    query: String,
+    generation: u64,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let res =
+                tokio::task::spawn_blocking(move || run_paperless_search(&base, &token, &query))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("paperless task panicked: {}", e)));
+            (generation, res)
+        },
+        |(generation, res)| Message::PaperlessListLoaded(generation, res),
+    )
+}
+
+fn run_paperless_search(
+    base: &str,
+    token: &str,
+    query: &str,
+) -> Result<Vec<PaperlessDoc>, String> {
+    let auth = format!("Authorization: Token {}", token);
+    let endpoint = format!("{}/api/documents/", base);
+    // `-G` folds every `--data-urlencode` into the query string, so curl does
+    // the percent-encoding (titles / queries carry spaces and accents).
+    let mut args: Vec<String> = vec!["-G".into(), "-H".into(), auth];
+    if query.trim().is_empty() {
+        args.push("--data-urlencode".into());
+        args.push("ordering=-created".into());
+    } else {
+        args.push("--data-urlencode".into());
+        args.push(format!("query={}", query.trim()));
+    }
+    args.push("--data-urlencode".into());
+    args.push("page_size=100".into());
+    args.push("--data-urlencode".into());
+    args.push("fields=id,title,created,original_file_name".into());
+    args.push(endpoint);
+
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = run_curl(&borrowed)?;
+    if !(200..300).contains(&result.status) {
+        return Err(paperless_error(&result.body, result.status));
+    }
+    parse_paperless_list(&result.body)
+}
+
+/// Download a document's PDF into `dest_dir`, named after its original upload
+/// filename (deduplicated so an existing file isn't clobbered). Uses curl's
+/// `-o` so the binary body is written straight to disk rather than routed
+/// through a `String`.
+pub fn paperless_download_task(
+    base: String,
+    token: String,
+    id: u32,
+    filename: String,
+    dest_dir: PathBuf,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                run_paperless_download(&base, &token, id, &filename, &dest_dir)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("download task panicked: {}", e)))
+        },
+        Message::PaperlessDownloaded,
+    )
+}
+
+fn run_paperless_download(
+    base: &str,
+    token: &str,
+    id: u32,
+    filename: &str,
+    dest_dir: &Path,
+) -> Result<PathBuf, String> {
+    // Keep only the leaf so a server-sent name can't escape dest_dir.
+    let leaf = Path::new(filename)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("paperless-{}.pdf", id));
+    let dest = unique_path(dest_dir, &leaf);
+    let auth = format!("Authorization: Token {}", token);
+    let url = format!("{}/api/documents/{}/download/", base, id);
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| "destination path is not valid UTF-8".to_string())?;
+    // `-f` makes curl exit non-zero on an HTTP error instead of writing the
+    // error body into the file.
+    let output = std::process::Command::new("curl")
+        .args(["-s", "-S", "-f", "-H", &auth, "-o", dest_str, &url])
+        .output()
+        .map_err(|e| format!("failed to spawn curl: {}", e))?;
+    if !output.status.success() {
+        // curl may have created a partial/empty file — clean it up.
+        let _ = std::fs::remove_file(&dest);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "download failed".to_string()
+        } else {
+            stderr
+        });
+    }
+    Ok(dest)
+}
+
+/// Build a non-clobbering path inside `dir` for `name`: returns `dir/name` if
+/// free, else `dir/name (1)`, `dir/name (2)`, … keeping the extension.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 1.. {
+        let fname = match &ext {
+            Some(ext) => format!("{} ({}).{}", stem, n, ext),
+            None => format!("{} ({})", stem, n),
+        };
+        let candidate = dir.join(fname);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Turn a paperless error body + status into a short message. paperless
+/// returns `{"detail":"…"}` for most auth/permission failures.
+fn paperless_error(body: &str, status: u16) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(detail) = v.get("detail").and_then(|d| d.as_str()) {
+            return format!("paperless: {} (HTTP {})", detail, status);
+        }
+    }
+    format!("paperless returned HTTP {}", status)
 }
 
 // ---------------------------------------------------------------------------

@@ -77,6 +77,12 @@ A filterable list of one-shot actions:
 - System monitor — live CPU and memory graph. A background sampler runs
   from app start (every `stats_interval_secs`, default 2s), so the
   sparklines are already populated when the modal opens.
+- Paperless documents — lists and searches PDFs from a
+  [paperless-ngx](https://docs.paperless-ngx.com/) server (set
+  `paperless.url` + `paperless.token` in `~/.rho.yaml`). Type to filter
+  the loaded batch by title; press Enter to run a server-side full-text
+  search. Per-row **Open** (opens the document's paperless web page in
+  the browser) and **Download** (saves the PDF into the active pane).
 - Launch Application (macOS) — lists `.app` bundles under
   `/Applications`, `/Applications/Utilities`, and `~/Applications`;
   Enter or click to `open` the bundle.

@@ -44,6 +44,8 @@ its default.
 | `dropbox.app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
 | `dropbox.refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox.app_key` to unlock the **Open Dropbox** command. |
 | `ftp` | section | _(defaults)_ | Settings for the in-app FTP server (Command Palette → **FTP server**). See [FTP server](#ftp-server) below. An absent section applies the defaults; a partial section fills in missing fields per field. |
+| `paperless.url` | string | _(unset)_ | Base URL of a [paperless-ngx](https://docs.paperless-ngx.com/) server, e.g. `"http://localhost:9000"` (no trailing `/api`). Set together with `paperless.token` to enable the **Paperless documents** command. |
+| `paperless.token` | string | _(unset)_ | A paperless API token (paperless web UI → your user → **API Token**). Sent as `Authorization: Token …`. `~/.rho.yaml` is plain text — treat it as readable to anyone with access to your home directory. |
 | `stats_interval_secs` | int | `2` | Seconds between background CPU/memory samples feeding the **System monitor** modal. The sampler runs from app start (not just while the modal is open) so the graph is pre-filled. Clamped to a 1s minimum. Hot-reloaded. |
 
 ## Colors
@@ -150,6 +152,30 @@ into `~/.rho.yaml` alongside the key and secret, and restart rho.
 
 > **Note**: single-shot upload is used for files, so files over Dropbox's
 > 150 MB single-request limit aren't supported yet.
+
+## Paperless
+
+The **Paperless documents** command (Command Palette → *Paperless
+documents*) lists and searches PDFs on a
+[paperless-ngx](https://docs.paperless-ngx.com/) server. It's always
+listed but greyed out until both fields are set:
+
+```yaml
+paperless:
+  url: "http://localhost:9000"      # server base, no /api suffix
+  token: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+Get the token from the paperless web UI: your user's settings →
+**API Token**. Rho sends it as `Authorization: Token <token>` on every
+request; nothing is written back to the server.
+
+In the modal, typing filters the currently-loaded batch by title
+(instant, client-side); pressing **Enter** runs a server-side full-text
+search (paperless's `?query=`) that replaces the list. Each row has
+**Open** (opens `<url>/documents/<id>` in your browser) and **Download**
+(saves the PDF into the active pane's folder, keeping its original
+filename and de-duplicating on collision). Both fields are hot-reloaded.
 
 ## Watch folders
 

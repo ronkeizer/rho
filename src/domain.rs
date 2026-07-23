@@ -618,6 +618,7 @@ pub enum Prompt {
         selected: usize,
         actions: Vec<PaletteAction>,
         dropbox_configured: bool,
+        paperless_configured: bool,
     },
     /// "Docker containers" action. Shows the currently-running containers
     /// from `docker ps`, each with Kill and Shell buttons. The state goes
@@ -646,6 +647,20 @@ pub enum Prompt {
     /// background sampler), so the graph is already filled when the modal
     /// opens and keeps updating as new samples arrive.
     SystemMonitor,
+    /// "Paperless documents" action. Lists documents from a paperless-ngx
+    /// server (configured via `paperless.url` + `paperless.token`). `input`
+    /// filters the *loaded batch* by title (client-side, instant); pressing
+    /// Enter (`PromptSubmit`) runs a server-side full-text search over the
+    /// document contents and replaces the list — and clears `input` so the
+    /// full server result is shown rather than being re-narrowed by the title
+    /// filter. `query` holds the last executed search term, for display only.
+    /// `selected` is the ↑/↓ highlight. Per-row: Open (browser) + Download.
+    Paperless {
+        state: PaperlessState,
+        input: String,
+        query: String,
+        selected: usize,
+    },
     /// "Launch Application" action (macOS only). Lists `.app` bundles under
     /// `/Applications` (+ Utilities + `~/Applications`). `selected` is the
     /// keyboard-navigable highlight, used by ↑/↓ + Enter to launch.
@@ -908,6 +923,10 @@ pub enum PaletteAction {
     /// graph fed by the always-on background sampler. Listed on every platform
     /// (`sysinfo` is cross-platform).
     SystemMonitor,
+    /// "Paperless documents" — opens [`Prompt::Paperless`]. Always listed but
+    /// only activatable once `paperless.url` + `paperless.token` are set in
+    /// `~/.rho.yaml` (see [`palette_action_enabled`]).
+    Paperless,
     /// Always present as a variant so `match` arms stay exhaustive without
     /// `cfg` noise, but only listed in [`PaletteAction::ALL`] on macOS — on
     /// other platforms the palette never offers it.
@@ -957,6 +976,7 @@ impl PaletteAction {
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
         PaletteAction::SystemMonitor,
+        PaletteAction::Paperless,
         PaletteAction::LaunchApplication,
         PaletteAction::GitBranch,
         PaletteAction::SshConnect,
@@ -983,6 +1003,7 @@ impl PaletteAction {
         PaletteAction::DockerContainers,
         PaletteAction::Processes,
         PaletteAction::SystemMonitor,
+        PaletteAction::Paperless,
         PaletteAction::GitBranch,
         PaletteAction::SshConnect,
         PaletteAction::OpenDropbox,
@@ -1007,6 +1028,7 @@ impl PaletteAction {
             PaletteAction::DockerContainers => "Docker containers",
             PaletteAction::Processes => "Processes",
             PaletteAction::SystemMonitor => "System monitor",
+            PaletteAction::Paperless => "Paperless documents",
             PaletteAction::LaunchApplication => "Launch Application",
             PaletteAction::GitBranch => "Git: branch",
             PaletteAction::SshConnect => "Connect to SSH server",
@@ -1153,9 +1175,14 @@ pub fn available_palette_actions(in_git_repo: bool) -> Vec<PaletteAction> {
 /// `OpenDropbox` is always listed but only activatable once Dropbox
 /// credentials are present in `~/.rho.yaml`. Everything else is always
 /// enabled once listed.
-pub fn palette_action_enabled(action: PaletteAction, dropbox_configured: bool) -> bool {
+pub fn palette_action_enabled(
+    action: PaletteAction,
+    dropbox_configured: bool,
+    paperless_configured: bool,
+) -> bool {
     match action {
         PaletteAction::OpenDropbox => dropbox_configured,
+        PaletteAction::Paperless => paperless_configured,
         _ => true,
     }
 }
@@ -1265,6 +1292,84 @@ pub enum ProcessesState {
     Loading,
     Loaded(Vec<Process>),
     Error(String),
+}
+
+/// One paperless-ngx document, as shown in the Paperless modal. `created` is
+/// the ISO date string (`YYYY-MM-DD`) from the API; `filename` is the original
+/// upload name (used as the save name on download). Parsed by
+/// [`parse_paperless_list`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaperlessDoc {
+    pub id: u32,
+    pub title: String,
+    pub created: String,
+    pub filename: String,
+}
+
+/// Lifecycle of the Paperless modal. Same shape as [`ProcessesState`].
+#[derive(Debug, Clone)]
+pub enum PaperlessState {
+    Loading,
+    Loaded(Vec<PaperlessDoc>),
+    Error(String),
+}
+
+/// Parse a paperless-ngx `/api/documents/` JSON response into our doc list.
+/// Only the `results[]` array is read; each entry needs `id` + `title`, with
+/// `created` and `original_file_name` optional (a doc with no stored original
+/// falls back to `paperless-<id>.pdf` for its download name). Order is
+/// preserved as the server returned it (recent-first, or by search score).
+pub fn parse_paperless_list(json: &str) -> Result<Vec<PaperlessDoc>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid JSON: {}", e))?;
+    let results = v
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "response has no `results` array".to_string())?;
+    let mut docs = Vec::with_capacity(results.len());
+    for item in results {
+        let Some(id) = item.get("id").and_then(|x| x.as_u64()) else {
+            continue;
+        };
+        let id = id as u32;
+        let title = item
+            .get("title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(untitled)")
+            .to_string();
+        let created = item
+            .get("created")
+            .and_then(|x| x.as_str())
+            .map(|s| s.chars().take(10).collect::<String>())
+            .unwrap_or_default();
+        let filename = item
+            .get("original_file_name")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("paperless-{}.pdf", id));
+        docs.push(PaperlessDoc {
+            id,
+            title,
+            created,
+            filename,
+        });
+    }
+    Ok(docs)
+}
+
+/// Client-side title filter for the Paperless modal — case-insensitive
+/// substring over the document title, mirroring [`filtered_processes`]. The
+/// deeper full-text search happens server-side (on Enter); this just narrows
+/// the already-loaded batch as you type.
+pub fn filtered_paperless<'a>(docs: &'a [PaperlessDoc], input: &str) -> Vec<&'a PaperlessDoc> {
+    let needle = input.trim().to_lowercase();
+    if needle.is_empty() {
+        return docs.iter().collect();
+    }
+    docs.iter()
+        .filter(|d| d.title.to_lowercase().contains(&needle))
+        .collect()
 }
 
 /// One system-wide CPU/memory reading, taken by the background sampler
@@ -2479,7 +2584,7 @@ mod tests {
         // Always listed in ALL.
         assert!(PaletteAction::ALL.contains(&PaletteAction::FtpServer));
         // Always enabled (no Dropbox gating).
-        assert!(palette_action_enabled(PaletteAction::FtpServer, false));
+        assert!(palette_action_enabled(PaletteAction::FtpServer, false, false));
         // Surfaces under "ftp" in the palette filter.
         let out = filtered_actions(PaletteAction::ALL, "ftp");
         assert_eq!(out, vec![PaletteAction::FtpServer]);
@@ -3773,6 +3878,63 @@ this is not an ls line
     }
 
     #[test]
+    fn parse_paperless_list_reads_results() {
+        let json = r#"{"count":2,"results":[
+            {"id":13,"title":"Dividend 2025","created":"2026-07-22T00:00:00Z","original_file_name":"div.pdf"},
+            {"id":7,"title":"Invoice","created":"2026-01-03","original_file_name":"invoice.pdf"}
+        ]}"#;
+        let docs = parse_paperless_list(json).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].id, 13);
+        assert_eq!(docs[0].title, "Dividend 2025");
+        // `created` is truncated to the ISO date (first 10 chars).
+        assert_eq!(docs[0].created, "2026-07-22");
+        assert_eq!(docs[0].filename, "div.pdf");
+        assert_eq!(docs[1].created, "2026-01-03");
+    }
+
+    #[test]
+    fn parse_paperless_list_falls_back_for_missing_fields() {
+        // No title / created / original_file_name — defaults kick in.
+        let json = r#"{"results":[{"id":5}]}"#;
+        let docs = parse_paperless_list(json).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].title, "(untitled)");
+        assert_eq!(docs[0].created, "");
+        assert_eq!(docs[0].filename, "paperless-5.pdf");
+    }
+
+    #[test]
+    fn parse_paperless_list_ignores_search_hit_and_bad_rows() {
+        // A `__search_hit__` sibling (present on ?query= responses) is ignored;
+        // a row without an id is skipped rather than erroring.
+        let json = r#"{"results":[
+            {"id":1,"title":"Hit","created":"2026-05-01","__search_hit__":{"score":1.0}},
+            {"title":"no id here"}
+        ]}"#;
+        let docs = parse_paperless_list(json).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, 1);
+    }
+
+    #[test]
+    fn parse_paperless_list_rejects_non_json_and_missing_results() {
+        assert!(parse_paperless_list("not json").is_err());
+        assert!(parse_paperless_list(r#"{"count":0}"#).is_err());
+    }
+
+    #[test]
+    fn filtered_paperless_substring_case_insensitive() {
+        let docs = vec![
+            PaperlessDoc { id: 1, title: "Tax Return 2025".into(), created: "2026-01-01".into(), filename: "a.pdf".into() },
+            PaperlessDoc { id: 2, title: "Grocery receipt".into(), created: "2026-02-01".into(), filename: "b.pdf".into() },
+        ];
+        assert_eq!(filtered_paperless(&docs, "TAX").len(), 1);
+        assert_eq!(filtered_paperless(&docs, "").len(), 2);
+        assert!(filtered_paperless(&docs, "zzz").is_empty());
+    }
+
+    #[test]
     fn parse_ps_output_skips_malformed_lines() {
         let stdout = "garbage\n  100 1.0 2.0 valid\nnotanint x x x\n";
         let out = parse_ps_output(stdout);
@@ -4185,16 +4347,24 @@ this is not an ls line
         assert!(available_palette_actions(true).contains(&PaletteAction::NewFile));
         assert_eq!(PaletteAction::NewFile.label(), "New file");
         // Always activatable — not gated on Dropbox credentials.
-        assert!(palette_action_enabled(PaletteAction::NewFile, false));
+        assert!(palette_action_enabled(PaletteAction::NewFile, false, false));
     }
 
     #[test]
     fn palette_action_enabled_gates_dropbox_on_credentials() {
-        assert!(!palette_action_enabled(PaletteAction::OpenDropbox, false));
-        assert!(palette_action_enabled(PaletteAction::OpenDropbox, true));
+        assert!(!palette_action_enabled(PaletteAction::OpenDropbox, false, false));
+        assert!(palette_action_enabled(PaletteAction::OpenDropbox, true, false));
         // Non-Dropbox actions are enabled regardless of the flag.
-        assert!(palette_action_enabled(PaletteAction::Copy, false));
-        assert!(palette_action_enabled(PaletteAction::GitBranch, false));
+        assert!(palette_action_enabled(PaletteAction::Copy, false, false));
+        assert!(palette_action_enabled(PaletteAction::GitBranch, false, false));
+    }
+
+    #[test]
+    fn palette_action_enabled_gates_paperless_on_config() {
+        assert!(!palette_action_enabled(PaletteAction::Paperless, false, false));
+        assert!(palette_action_enabled(PaletteAction::Paperless, false, true));
+        // The dropbox flag doesn't affect paperless and vice versa.
+        assert!(!palette_action_enabled(PaletteAction::OpenDropbox, false, true));
     }
 
     #[test]
