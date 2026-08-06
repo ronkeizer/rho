@@ -237,6 +237,13 @@ shell-quoted and space-joined — so `command: "wc -l {file}"` runs once over
 the whole selection. `{stem}`/`{ext}`/`{dir}` stay tied to the cursor file.
 `Tab`-to-edit pre-fills the editable command with the same expansion.
 
+Because `{file}`/`{path}` expand to a space-joined *list*, write the command
+so it stays valid with more than one file. A placeholder that names a single
+destination breaks under multi-selection: `mv {file} /archive/{file}` becomes
+`mv 'a.pdf' 'b.pdf' /archive/'a.pdf' 'b.pdf'`, and `mv` then treats the last
+word as the destination and errors. Move-into-a-directory instead — `mv {file}
+/archive/` — which is valid for one file or many.
+
 ```yaml
 file_actions:
   - pattern: "*.md"
