@@ -230,6 +230,17 @@ lot of output or never exits (`tail -f`) should use `terminal: true`. On macOS
 the `terminal: true` variant honors the `terminal_app` setting; only local
 panes are supported (the action no-ops on a remote pane).
 
+`terminal: true` commands run through your **login + interactive shell**
+(`$SHELL -lic`), so your `~/.zprofile` / `~/.zshrc` (or bash equivalents) are
+sourced first and `PATH` additions — Homebrew, `~/bin`, custom tools — resolve
+just like they do in a normal terminal. rho itself is a GUI process that
+inherits only the system `path_helper` `PATH`, so a binary found by an
+interactive shell but not `/usr/bin:/bin` still works there. `terminal: false`
+(background) commands run non-interactively via `sh -c` and get **only** that
+GUI `PATH` — use absolute paths, or wrap the command yourself
+(`$SHELL -lc '…'`), if a background action needs a tool outside the system
+paths.
+
 With **multiple files selected** (Shift- or ⌘-click — see
 [Keybindings](./keybindings.md)), the chooser still opens against the cursor
 file, but `{file}` and `{path}` expand to *every* selected file, each

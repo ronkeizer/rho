@@ -2717,6 +2717,13 @@ fn run_file_action(command: &str, cwd: &Path) -> Result<(), String> {
     };
     #[cfg(not(windows))]
     let mut cmd = {
+        // Background actions run non-interactively, so we deliberately do NOT
+        // use an interactive login shell here: an interactive bash/zsh with no
+        // controlling tty prints job-control noise to stderr, which would
+        // pollute the error we surface. A `terminal: true` action that needs
+        // the user's full PATH gets a login+interactive shell instead (see
+        // `macos_terminal_run_apple_script`); background actions should use
+        // absolute paths or `command: "$SHELL -lc '…'"` if they need it.
         let mut c = std::process::Command::new("sh");
         c.args(["-c", command]);
         c
@@ -2756,7 +2763,9 @@ pub fn run_file_action_in_terminal(
     #[cfg(target_os = "macos")]
     {
         let app = resolve_macos_terminal_app(terminal_app);
-        let script = macos_terminal_run_apple_script(&app, &cwd.display().to_string(), command);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let script =
+            macos_terminal_run_apple_script(&app, &cwd.display().to_string(), command, &shell);
         std::process::Command::new("osascript")
             .args(["-e", &script])
             .spawn()
@@ -2796,23 +2805,37 @@ pub fn run_file_action_in_terminal(
 /// Like [`macos_terminal_cwd_apple_script`] but with the user's command
 /// appended; iTerm re-execs a login shell afterwards so the window stays open
 /// once the command exits (Terminal's `do script` shell stays open on its own).
+///
+/// `shell` is the user's login shell (`$SHELL`, resolved by the caller). It's
+/// named as the literal argv[0] the terminal execs so the command runs in a
+/// login + interactive shell — sourcing the user's `~/.zprofile` / `~/.zshrc`
+/// PATH additions, which rho (a GUI process on path_helper's PATH only) doesn't
+/// otherwise have.
 #[cfg(target_os = "macos")]
-fn macos_terminal_run_apple_script(app: &str, cwd: &str, command: &str) -> String {
+fn macos_terminal_run_apple_script(app: &str, cwd: &str, command: &str, shell: &str) -> String {
     let lowered = app.to_ascii_lowercase();
     if lowered == "iterm" || lowered == "iterm2" {
-        // iTerm runs `command` through shell-style word splitting, so the
-        // whole `sh -c <arg>` line must be quote-safe. We single-quote the
-        // entire shell line (posix_quote) instead of wrapping it in double
-        // quotes — that way any `"`, `$`, backtick or space inside the user's
-        // command can't terminate the argument. Only the trailing AppleScript
-        // `\`/`"` escaping remains.
-        let shell_cmd = format!(
+        // iTerm tokenizes the `command` string with its OWN parser (not a real
+        // shell), and that parser doesn't handle nested single-quote escaping
+        // (`'\''`). So we keep to a SINGLE level of single-quoting — the same
+        // depth as a plain `sh -c '<script>'` — and let that one shell BE the
+        // user's login+interactive shell. `shell` is named literally (not
+        // `${SHELL}`, which iTerm wouldn't expand) as argv[0]; `-lic` sources
+        // the user's rc/profile so custom binaries (Homebrew, ~/bin, …)
+        // resolve, and the trailing `exec <shell> -l` keeps the window open
+        // after the command exits.
+        // The trailing keep-open exec stays a literal `${SHELL:-/bin/sh}` (not
+        // the resolved path): it runs *inside* the login shell, which expands
+        // it fine, and leaving it unquoted keeps `script` to a single level of
+        // single-quoting (only the cwd's `'\''`) that iTerm's tokenizer copes
+        // with. `shell` is only named literally for argv[0], outside the quotes.
+        let script = format!(
             "cd {} && {} ; exec ${{SHELL:-/bin/sh}} -l",
             posix_quote(cwd),
-            command
+            command,
         );
-        let sh_c = format!("sh -c {}", posix_quote(&shell_cmd));
-        let escaped = sh_c.replace('\\', "\\\\").replace('"', "\\\"");
+        let line = format!("{} -lic {}", posix_quote(shell), posix_quote(&script));
+        let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
         format!(
             "tell application \"{app}\"\n    \
                  activate\n    \
@@ -3675,6 +3698,7 @@ mod tests {
             "Terminal",
             "/Users/me/project",
             "pandoc -o out.pdf in.md",
+            "/bin/zsh",
         );
         assert_eq!(
             script,
@@ -3686,22 +3710,29 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_terminal_run_script_iterm_keeps_window_open() {
-        let script = macos_terminal_run_apple_script("iTerm", "/Users/me/p", "tar tzvf a.tgz");
+        let script =
+            macos_terminal_run_apple_script("iTerm", "/Users/me/p", "tar tzvf a.tgz", "/bin/zsh");
         assert!(script.contains("create window with default profile command"));
-        // The sh -c argument is single-quoted (not the old double-quote form),
-        // and $SHELL stays live inside it.
-        assert!(script.contains("command \"sh -c '"));
-        assert!(!script.contains("sh -c \\\""));
+        // The user's shell is named literally as argv[0] and invoked with
+        // `-lic` so their profile/rc (PATH additions) are sourced first.
+        assert!(script.contains("'/bin/zsh' -lic '"));
+        // Only a SINGLE level of single-quoting — iTerm's own tokenizer can't
+        // parse nested `'\''`, so we must never emit the doubly-escaped form.
+        assert!(!script.contains(r"'\\''\\'"));
+        // The trailing exec keeps the window open after the command exits and
+        // stays a literal ${SHELL} (expanded by the login shell), not a nested
+        // quoted path.
         assert!(script.contains("exec ${SHELL:-/bin/sh} -l"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_terminal_run_script_iterm_quotes_double_quotes_safely() {
-        // A command containing `"` must stay inside the single-quoted sh -c
+        // A command containing `"` must stay inside the single-quoted shell
         // argument (AppleScript-escaped) rather than terminating it.
-        let script = macos_terminal_run_apple_script("iTerm", "/tmp", "echo \"hi there\"");
-        assert!(script.contains("sh -c '"));
+        let script =
+            macos_terminal_run_apple_script("iTerm", "/tmp", "echo \"hi there\"", "/bin/zsh");
+        assert!(script.contains("'/bin/zsh' -lic '"));
         assert!(script.contains("echo \\\"hi there\\\""));
     }
 
@@ -3712,7 +3743,7 @@ mod tests {
         // and the backslash is then AppleScript-escaped (\ → \\), so the
         // literal in the script is `'\\''`. After osascript parses the string
         // the shell sees the correct `cd '/Users/me/it'\''s' && ls`.
-        let script = macos_terminal_run_apple_script("Terminal", "/Users/me/it's", "ls");
+        let script = macos_terminal_run_apple_script("Terminal", "/Users/me/it's", "ls", "/bin/zsh");
         assert!(script.contains(r"cd '/Users/me/it'\\''s' && ls"));
     }
 
