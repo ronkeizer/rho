@@ -10,8 +10,11 @@ Hot-reload covers everything **except** the `window` section, which iced
 sets once at startup — change `window.width` / `window.rows` and you need
 to restart to see it.
 
-`⌘,` from inside the app opens this file in your OS default editor
-(creating it from the template if it doesn't exist).
+`⌘,` from inside the app opens this file (creating it from the template if it
+doesn't exist) in the [`editor`](#fields) you configure, or — when that's
+unset — `$VISUAL` / `$EDITOR`, falling back to `open -t` on macOS. Note that
+`open -t` uses whatever app owns the plain-text role, which is often **Xcode**
+when it's installed; set `editor` to pin a real text editor.
 
 Related settings are grouped into sections (`window`, `layout`, `theme`,
 `dropbox`, `ftp`); everything else stays top-level. Every section is
@@ -40,6 +43,7 @@ its default.
 | `watch_folders` | list of strings | `["~/Downloads"]` | Folders to watch for new files. Read once at startup; restart to apply changes. |
 | `terminal_app` | string | _(auto)_ | macOS only. Which terminal app to launch for the SSH `Connect`, Docker `Shell`, `Open Claude Code in this folder`, and `Open Terminal in this folder` actions. Common values: `"iTerm"`, `"Terminal"`. Omit (or leave `None`) to auto-pick: `iTerm` when `/Applications/iTerm.app` exists, otherwise `Terminal`. Ignored on Linux / Windows. |
 | `folder_editor` | string | `/usr/local/bin/code` | Editor binary for the **Open folder in editor** action, invoked as `<folder_editor> <folder>`. Defaults to the VS Code CLI. Point it at any editor that opens a directory argument (Sublime's `subl`, a `code` under `/opt/homebrew/bin`, an editor wrapper script, etc.). A blank value falls back to the default. |
+| `editor` | string | _(unset)_ | Editor for opening a **file**: the settings file (`⌘,`), a newly created file, and **edit selected file**. Invoked as `<editor> <file>`; the value is split on whitespace, so `"code -n"` passes `-n` too. When unset, rho uses `$VISUAL` / `$EDITOR`, then the platform default (`open -t` on macOS — often Xcode). Set this to pin a real editor. |
 | `dropbox.app_key` | string | _(unset)_ | Dropbox app key (client ID) from the [App Console](https://www.dropbox.com/developers/apps). Required to enable the Dropbox backend. |
 | `dropbox.app_secret` | string | _(unset)_ | Dropbox app secret. Required only for "full" (non-PKCE) apps; PKCE apps can omit it. |
 | `dropbox.refresh_token` | string | _(unset)_ | Long-lived OAuth2 refresh token, exchanged on demand for short-lived access tokens. Set this together with `dropbox.app_key` to unlock the **Open Dropbox** command. |

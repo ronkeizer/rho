@@ -1172,7 +1172,10 @@ impl App {
             Message::OpenSettingsFile => {
                 ensure_settings_file();
                 let path = settings_path();
-                if let Err(e) = open::that_detached(&path) {
+                // Open through `open_in_editor` (config `editor:` → $VISUAL/
+                // $EDITOR → `open -t`) rather than `open <path>`, which would
+                // hand the `.yaml` to whatever app owns that extension (Xcode).
+                if let Err(e) = open_in_editor(&path, self.config.editor()) {
                     eprintln!("failed to open {}: {}", path.display(), e);
                 }
             }
@@ -1431,7 +1434,9 @@ impl App {
                                         // failure is logged, not fatal — the
                                         // file still exists and the panes still
                                         // reload to show it.
-                                        if let Err(e) = open_in_editor(&path) {
+                                        if let Err(e) =
+                                            open_in_editor(&path, self.config.editor())
+                                        {
                                             eprintln!(
                                                 "failed to open {} in editor: {}",
                                                 path.display(),
@@ -1804,7 +1809,7 @@ impl App {
                         return Task::none();
                     }
                     let path = pane.path().join(&entry.name);
-                    if let Err(e) = open_in_editor(&path) {
+                    if let Err(e) = open_in_editor(&path, self.config.editor()) {
                         eprintln!("failed to edit {}: {}", path.display(), e);
                     }
                 }

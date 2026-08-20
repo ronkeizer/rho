@@ -61,6 +61,15 @@ pub struct Config {
     /// the default rather than trying to spawn `""`.
     #[serde(default)]
     pub folder_editor: Option<String>,
+    /// Editor used to open a *file* — the settings file (`Cmd+,`), a freshly
+    /// created file, and the "edit selected file" action. Invoked as
+    /// `<editor> <file-path>` (the value is split on whitespace, so
+    /// `"code -n"` works). When unset, rho falls back to `$VISUAL` / `$EDITOR`
+    /// and finally the platform default (`open -t` on macOS — which is
+    /// whatever app owns the plain-text role, often Xcode). Set this to pin a
+    /// real editor. Resolve via [`Config::editor`].
+    #[serde(default)]
+    pub editor: Option<String>,
     /// Dropbox app credentials for the `dropbox:` remote backend. Absent
     /// (the default) hides the "Open Dropbox" palette action.
     #[serde(default)]
@@ -99,6 +108,7 @@ impl Default for Config {
             watch_folders: vec!["~/Downloads".to_string()],
             terminal_app: None,
             folder_editor: Some(DEFAULT_FOLDER_EDITOR.to_string()),
+            editor: None,
             dropbox: DropboxConfig::default(),
             ftp: FtpConfig::default(),
             paperless: PaperlessConfig::default(),
@@ -437,6 +447,16 @@ impl Config {
             .unwrap_or(DEFAULT_FOLDER_EDITOR)
     }
 
+    /// The configured file editor (`editor:`), or `None` when unset / blank —
+    /// in which case [`open_in_editor`] falls through to `$VISUAL` / `$EDITOR`
+    /// and then the platform default.
+    pub fn editor(&self) -> Option<&str> {
+        self.editor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn row_padding_y(&self) -> u16 {
         let text_h = self.layout.row_font_size as f32 * 1.3;
         let pad = ((self.layout.row_height_px - text_h) / 2.0).max(0.0);
@@ -506,21 +526,18 @@ pub fn ensure_settings_file() {
 
 /// Open `path` in a code editor. Honors `$VISUAL` then `$EDITOR`; otherwise
 /// uses the platform's default text-editor opener (`open -t` on macOS).
-pub fn open_in_editor(path: &Path) -> std::io::Result<()> {
-    let env_editor = std::env::var_os("VISUAL")
-        .or_else(|| std::env::var_os("EDITOR"))
-        .filter(|s| !s.is_empty());
-    if let Some(editor) = env_editor {
-        let editor = editor.to_string_lossy().into_owned();
-        let mut parts = editor.split_whitespace();
-        if let Some(prog) = parts.next() {
-            let args: Vec<&str> = parts.collect();
-            return std::process::Command::new(prog)
-                .args(args)
-                .arg(path)
-                .spawn()
-                .map(|_| ());
-        }
+pub fn open_in_editor(path: &Path, configured: Option<&str>) -> std::io::Result<()> {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    if let Some(argv) = editor_argv(path, configured, visual.as_deref(), editor.as_deref()) {
+        let mut it = argv.iter();
+        // `editor_argv` only ever returns a non-empty argv, so the program
+        // name is present; the trailing element is always the path.
+        let prog = it.next().expect("editor_argv returns a non-empty argv");
+        return std::process::Command::new(prog)
+            .args(it)
+            .spawn()
+            .map(|_| ());
     }
     #[cfg(target_os = "macos")]
     {
@@ -534,6 +551,28 @@ pub fn open_in_editor(path: &Path) -> std::io::Result<()> {
     {
         open::that_detached(path).map(|_| ())
     }
+}
+
+/// Decide the argv for opening `path` in an editor. The first non-blank of
+/// `configured` (the `editor:` setting), then `$VISUAL`, then `$EDITOR` wins;
+/// its value is split on whitespace (so `"code -n"` becomes two args) and the
+/// path is appended as the final argument. Returns `None` when none is set —
+/// the caller then uses the platform default (`open -t` on macOS). The
+/// returned vector is always non-empty (program name + … + path).
+pub fn editor_argv(
+    path: &Path,
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> Option<Vec<String>> {
+    let chosen = [configured, visual, editor]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())?;
+    let mut argv: Vec<String> = chosen.split_whitespace().map(String::from).collect();
+    argv.push(path.to_string_lossy().into_owned());
+    Some(argv)
 }
 
 /// Spawn a Quick Look preview window for `path` (macOS only; no-op elsewhere).
@@ -588,6 +627,11 @@ fn default_template_yaml() -> &'static str {
      # Editor launched by \"Open folder in editor\" (run as `<editor> <folder>`).\n\
      # Defaults to the VS Code CLI; point it at any editor that opens a folder.\n\
      # folder_editor: \"/usr/local/bin/code\"\n\
+     # Editor for opening a FILE: the settings file (Cmd+,), a newly created\n\
+     # file, and \"edit selected file\". Run as `<editor> <file>` (split on\n\
+     # spaces, so \"code -n\" works). Unset -> $VISUAL/$EDITOR, then `open -t`\n\
+     # (macOS), which may hand .yaml to Xcode. Set this to pin a real editor.\n\
+     # editor: \"/usr/local/bin/code\"\n\
      # Custom \"open with…\" actions. Pressing Enter on a file shows a chooser:\n\
      # \"Open with default application\" plus every action whose pattern (a\n\
      # *.glob, case-insensitive) matches the file name. command placeholders:\n\
@@ -910,6 +954,63 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(unset.folder_editor(), DEFAULT_FOLDER_EDITOR);
+    }
+
+    #[test]
+    fn editor_accessor_trims_and_treats_blank_as_unset() {
+        assert_eq!(Config::default().editor(), None);
+        let set = Config {
+            editor: Some("  code -n  ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(set.editor(), Some("code -n"));
+        let blank = Config {
+            editor: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(blank.editor(), None);
+    }
+
+    #[test]
+    fn editor_argv_prefers_configured_then_visual_then_editor() {
+        let p = Path::new("/tmp/f.yaml");
+        // Configured wins over the environment values.
+        assert_eq!(
+            editor_argv(p, Some("code"), Some("vim"), Some("nano")),
+            Some(vec!["code".to_string(), "/tmp/f.yaml".to_string()])
+        );
+        // Falls to $VISUAL, then $EDITOR.
+        assert_eq!(
+            editor_argv(p, None, Some("vim"), Some("nano")),
+            Some(vec!["vim".to_string(), "/tmp/f.yaml".to_string()])
+        );
+        assert_eq!(
+            editor_argv(p, None, None, Some("nano")),
+            Some(vec!["nano".to_string(), "/tmp/f.yaml".to_string()])
+        );
+    }
+
+    #[test]
+    fn editor_argv_splits_args_skips_blanks_and_none_means_default() {
+        let p = Path::new("/tmp/f.yaml");
+        // Multi-word editor splits into program + args, path last.
+        assert_eq!(
+            editor_argv(p, Some("code -n -w"), None, None),
+            Some(vec![
+                "code".to_string(),
+                "-n".to_string(),
+                "-w".to_string(),
+                "/tmp/f.yaml".to_string()
+            ])
+        );
+        // A blank configured value is skipped in favour of the next source.
+        assert_eq!(
+            editor_argv(p, Some("   "), Some("vim"), None),
+            Some(vec!["vim".to_string(), "/tmp/f.yaml".to_string()])
+        );
+        // Nothing set → None → caller uses the platform default.
+        assert_eq!(editor_argv(p, None, None, None), None);
+        assert_eq!(editor_argv(p, Some(""), Some("  "), Some("")), None);
     }
 
     #[test]
